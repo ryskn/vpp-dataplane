@@ -34,29 +34,29 @@ items:
 - apiVersion: crd.projectcalico.org/v1
   kind: IPPool
   metadata:
-    name: sr-localsids-pool-master
+    name: sr-localsids-pool-master-1.ryskn.k8s
   spec:
     cidr: fcff:0:0:00AA::/64
     ipipMode: Never
-    nodeSelector: kubernetes.io/hostname == 'master'
+    nodeSelector: kubernetes.io/hostname == 'master-1.ryskn.k8s'
     vxlanMode: Never
 - apiVersion: crd.projectcalico.org/v1
   kind: IPPool
   metadata:
-    name: sr-localsids-pool-node1
+    name: sr-localsids-pool-worker-1.ryskn.k8s
   spec:
     cidr: fcff:0:0:11AA::/64
     ipipMode: Never
-    nodeSelector: kubernetes.io/hostname == 'node1'
+    nodeSelector: kubernetes.io/hostname == 'worker-1.ryskn.k8s'
     vxlanMode: Never
 - apiVersion: crd.projectcalico.org/v1
   kind: IPPool
   metadata:
-    name: sr-localsids-pool-node2
+    name: sr-localsids-pool-worker-2.ryskn.k8s
   spec:
     cidr: fcff:0:0:12AA::/64
     ipipMode: Never
-    nodeSelector: kubernetes.io/hostname == 'node2'
+    nodeSelector: kubernetes.io/hostname == 'worker-2.ryskn.k8s'
     vxlanMode: Never
 kind: List
 metadata:
