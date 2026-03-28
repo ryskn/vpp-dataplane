@@ -8,5 +8,5 @@ data:
     {
       "vppStartupSleepSeconds": 1,
       "corePattern": "/var/lib/vpp/vppcore.%e.%p",
-      "defaultGWs": "192.168.0.1"
+      "defaultGWs": "192.168.1.1"
     }

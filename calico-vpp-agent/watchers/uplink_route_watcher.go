@@ -163,11 +163,12 @@ func (r *RouteWatcher) getNetworkRoute(network string, physicalNet string) (rout
 				priority = order
 			}
 			routes = append(routes, &netlink.Route{
-				Dst:      cidr,
-				Gw:       gw,
-				Protocol: syscall.RTPROT_STATIC,
-				MTU:      GetUplinkMtu(),
-				Priority: priority,
+				LinkIndex: uplinkStatus.LinkIndex,
+				Dst:       cidr,
+				Gw:        gw,
+				Protocol:  syscall.RTPROT_STATIC,
+				MTU:       GetUplinkMtu(),
+				Priority:  priority,
 			})
 		}
 	}
@@ -197,11 +198,12 @@ func (r *RouteWatcher) WatchRoutes(t *tomb.Tomb) error {
 				priority = order
 			}
 			err := r.AddRoute(&netlink.Route{
-				Dst:      serviceCIDR,
-				Gw:       gw,
-				Protocol: syscall.RTPROT_STATIC,
-				MTU:      GetUplinkMtu(),
-				Priority: priority,
+				LinkIndex: uplinkStatus.LinkIndex,
+				Dst:       serviceCIDR,
+				Gw:        gw,
+				Protocol:  syscall.RTPROT_STATIC,
+				MTU:       GetUplinkMtu(),
+				Priority:  priority,
 			})
 			if err != nil {
 				r.log.Error(err, "cannot add route through vpp tap for service CIDR: %s", serviceCIDR.String())
