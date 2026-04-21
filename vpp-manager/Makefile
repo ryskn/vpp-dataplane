@@ -21,6 +21,16 @@ VERSION_FILE=$(VPP_DIR)/calicovppversion
 BASE ?=
 MOCK_POD_IMAGE ?= calicovpp/vpp-test-pod-mock:latest
 
+# Debian multiarch triplet (x86_64-linux-gnu on amd64, aarch64-linux-gnu on arm64, ...).
+# Autodetect from the host; override with `make DEB_HOST_MULTIARCH=... vpp` if needed.
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || \
+	( uname_m=$$(uname -m); \
+	  case $$uname_m in \
+	    x86_64)  echo x86_64-linux-gnu ;; \
+	    aarch64) echo aarch64-linux-gnu ;; \
+	    *)       echo $$uname_m-linux-gnu ;; \
+	  esac ))
+
 VPP_REL_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/release/vpp_*.deb \
 	$(VPP_DIR)/build-root/debs/release/vpp-plugin-core_*.deb \
@@ -28,12 +38,12 @@ VPP_REL_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/release/libvppinfra_*.deb \
 	$(VPP_DIR)/build-root/debs/release/vpp-dbg_*.deb \
 	$(VPP_DIR)/build-root/debs/release/vpp-plugin-devtools_*.deb \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvcl_ldpreload.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libsvm.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvppcom.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvlibapi.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvppinfra.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvlibmemoryclient.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvcl_ldpreload.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/${DEB_HOST_MULTIARCH}/libsvm.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvppcom.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvlibapi.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvppinfra.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvlibmemoryclient.so* \
 	${VPP_DIR}/extras/libmemif/release/install/lib/libmemif.so \
 
 VPP_DBG_DEB_LIST = \
@@ -43,12 +53,12 @@ VPP_DBG_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/debug/libvppinfra_*.deb \
 	$(VPP_DIR)/build-root/debs/debug/vpp-dbg_*.deb \
 	$(VPP_DIR)/build-root/debs/debug/vpp-plugin-devtools_*.deb \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvcl_ldpreload.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libsvm.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvppcom.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvlibapi.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvppinfra.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvlibmemoryclient.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvcl_ldpreload.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/${DEB_HOST_MULTIARCH}/libsvm.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvppcom.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvlibapi.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvppinfra.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/${DEB_HOST_MULTIARCH}/libvlibmemoryclient.so* \
 	${VPP_DIR}/extras/libmemif/debug/install/lib/libmemif.so \
 
 PATCHES = $(sort $(wildcard $(VPPLINK_DIR)/generated/patches/*.patch))
