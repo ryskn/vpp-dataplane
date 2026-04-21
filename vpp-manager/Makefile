@@ -23,13 +23,14 @@ MOCK_POD_IMAGE ?= calicovpp/vpp-test-pod-mock:latest
 
 # Debian multiarch triplet (x86_64-linux-gnu on amd64, aarch64-linux-gnu on arm64, ...).
 # Autodetect from the host; override with `make DEB_HOST_MULTIARCH=... vpp` if needed.
-DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || \
-	( uname_m=$$(uname -m); \
-	  case $$uname_m in \
-	    x86_64)  echo x86_64-linux-gnu ;; \
-	    aarch64) echo aarch64-linux-gnu ;; \
-	    *)       echo $$uname_m-linux-gnu ;; \
-	  esac ))
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),x86_64)
+    DEB_HOST_MULTIARCH ?= x86_64-linux-gnu
+else ifeq ($(UNAME_M),aarch64)
+    DEB_HOST_MULTIARCH ?= aarch64-linux-gnu
+else
+    DEB_HOST_MULTIARCH ?= $(UNAME_M)-linux-gnu
+endif
 
 VPP_REL_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/release/vpp_*.deb \
