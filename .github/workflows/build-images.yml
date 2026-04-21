@@ -70,6 +70,12 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Tag: ${TAG}"
 
+      - name: Configure git identity
+        # vpp_clone_current.sh が git cherry-pick するため user.name/email が必要。
+        run: |
+          git config --global user.email "ci@local"
+          git config --global user.name "CI Runner"
+
       - name: Build VPP tarball (from source)
         # vpp-manager/Makefile の image target は VPP の tarball を要求する。
         # 本家 CI は S3 キャッシュから取るが、ここでは源からビルドする。
