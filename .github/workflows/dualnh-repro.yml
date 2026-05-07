@@ -34,19 +34,33 @@ jobs:
         continue-on-error: true
         run: go test -count=1 -v -run TestDualNexthopReproduction ./routing/
 
-      - name: Verify fixed behavior — expect child clean exit (skipped if buggy step crashed)
-        if: steps.buggy.outcome == 'success'
+      - name: Verify fixed behavior — expect child clean exit
+        id: fixed
         working-directory: calico-vpp-agent
+        continue-on-error: true
         env:
           WANT_FIXED: "1"
         run: go test -count=1 -v -run TestDualNexthopReproduction ./routing/
 
       - name: Outcome summary
         if: always()
+        env:
+          BUGGY: ${{ steps.buggy.outcome }}
+          FIXED: ${{ steps.fixed.outcome }}
         run: |
-          echo "buggy step outcome: ${{ steps.buggy.outcome }}"
-          if [ "${{ steps.buggy.outcome }}" = "success" ]; then
-            echo "→ Repro test passed in current-behavior mode: bug is present and the diagnostic was observed."
-          else
-            echo "→ Repro test failed: either bug is already fixed, or the test setup broke. Check logs above."
+          echo "buggy-mode step: $BUGGY"
+          echo "fixed-mode step: $FIXED"
+          if [ "$BUGGY" = "success" ] && [ "$FIXED" = "failure" ]; then
+            echo "→ Bug is present and reproducible. Fix is not yet applied."
+            exit 0
           fi
+          if [ "$BUGGY" = "failure" ] && [ "$FIXED" = "success" ]; then
+            echo "→ Fix is applied and verified. Bug repro test now (correctly) reports the bug as gone."
+            exit 0
+          fi
+          if [ "$BUGGY" = "success" ] && [ "$FIXED" = "success" ]; then
+            echo "→ Inconsistent: both modes passed. Test logic likely needs updating."
+            exit 1
+          fi
+          echo "→ Both modes failed: investigate (test setup, dependency drift, or unexpected behavior)."
+          exit 1
