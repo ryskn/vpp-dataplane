@@ -1,0 +1,52 @@
+# Reproduces Finding #1 (BGP MP_REACH_NLRI dual-nexthop -> calico-vpp-agent
+# os.Exit) on Linux. Runs both the "current behavior" assertion (must crash)
+# and the "fixed behavior" assertion (must succeed) so the same workflow
+# clearly reports before/after a fix.
+name: dualnh-repro
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "calico-vpp-agent/routing/**"
+      - ".github/workflows/dualnh-repro.yml"
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build (sanity)
+        working-directory: calico-vpp-agent
+        run: go build ./routing/...
+
+      - name: Reproduce current (buggy) behavior — expect child crash
+        id: buggy
+        working-directory: calico-vpp-agent
+        continue-on-error: true
+        run: go test -count=1 -v -run TestDualNexthopReproduction ./routing/
+
+      - name: Verify fixed behavior — expect child clean exit (skipped if buggy step crashed)
+        if: steps.buggy.outcome == 'success'
+        working-directory: calico-vpp-agent
+        env:
+          WANT_FIXED: "1"
+        run: go test -count=1 -v -run TestDualNexthopReproduction ./routing/
+
+      - name: Outcome summary
+        if: always()
+        run: |
+          echo "buggy step outcome: ${{ steps.buggy.outcome }}"
+          if [ "${{ steps.buggy.outcome }}" = "success" ]; then
+            echo "→ Repro test passed in current-behavior mode: bug is present and the diagnostic was observed."
+          else
+            echo "→ Repro test failed: either bug is already fixed, or the test setup broke. Check logs above."
+          fi
