@@ -45,9 +45,16 @@ func (s *Server) getNexthop(path *bgpapi.Path) string {
 			return nhAttr.NextHop
 		}
 		if err := attr.UnmarshalTo(mpReachAttr); err == nil {
-			if len(mpReachAttr.NextHops) != 1 {
-				s.log.Fatalf("Cannot process more than one Nlri in path attributes: %+v", mpReachAttr)
+			if len(mpReachAttr.NextHops) == 0 {
+				return ""
 			}
+			// RFC 2545 §3 / RFC 4760: an MP_REACH_NLRI for IPv6 may carry
+			// a global address only (16 octets) or a global + link-local
+			// pair (32 octets). gobgp surfaces both via NextHops[0..1]
+			// (osrg/gobgp/v3 pkg/apiutil/attribute.go
+			// NewMpReachNLRIAttributeFromNative). The L3 routing model
+			// here uses only the global next hop; ignore any link-local
+			// companion rather than crashing the agent.
 			return mpReachAttr.NextHops[0]
 		}
 	}
