@@ -80,19 +80,15 @@ jobs:
         # vpp-manager/Makefile の image target は VPP の tarball を要求する。
         # 本家 CI は S3 キャッシュから取るが、ここでは源からビルドする。
         # calicovpp/vpp-build イメージが両 arch 対応していることを前提とする。
-        run: make -C vpp-manager vpp
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
+        # TAG は common.mk で `TAG = $(shell git describe ...)` と即時代入される
+        # ため env では上書きできない。command-line 引数で渡して上書きする。
+        run: make -C vpp-manager TAG="${{ steps.tag.outputs.tag }}" vpp
 
       - name: Build calicovpp/vpp image
-        run: make -C vpp-manager vpp-image
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
+        run: make -C vpp-manager TAG="${{ steps.tag.outputs.tag }}" vpp-image
 
       - name: Build calicovpp/agent image
-        run: make -C calico-vpp-agent image
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
+        run: make -C calico-vpp-agent TAG="${{ steps.tag.outputs.tag }}" image
 
       - name: Tag and push per-arch images
         if: >-
