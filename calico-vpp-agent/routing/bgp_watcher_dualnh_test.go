@@ -1,19 +1,19 @@
 // Copyright (C) 2026 Calico-VPP contributors.
 // Licensed under the Apache License, Version 2.0.
 
-// Repro for Finding #1: getNexthop calls logrus.Fatalf (which calls os.Exit(1))
-// when an MP_REACH_NLRI carries 2 nexthops, even though RFC 2545 §3 mandates
-// that IPv6 BGP advertisements may legitimately carry a global + link-local
-// nexthop pair (length 32 octets on the wire, 2 entries in gobgp's gRPC API
-// per pkg/apiutil/attribute.go:NewMpReachNLRIAttributeFromNative).
+// Regression test for Finding #1: getNexthop used to call logrus.Fatalf
+// (which calls os.Exit(1)) when an MP_REACH_NLRI carried 2 nexthops, even
+// though RFC 2545 §3 permits IPv6 BGP advertisements to carry a global +
+// link-local nexthop pair (length 32 octets on the wire, 2 entries in gobgp's
+// gRPC API per pkg/apiutil/attribute.go:NewMpReachNLRIAttributeFromNative).
 //
 // Run modes:
 //   go test -run TestDualNexthopReproduction ./calico-vpp-agent/routing/...
-//     → asserts current (buggy) behavior: child exits non-zero and logs
-//       "Cannot process more than one Nlri".
-//   WANT_FIXED=1 go test -run TestDualNexthopReproduction ./calico-vpp-agent/routing/...
-//     → asserts fixed behavior: child returns the global nexthop without
-//       crashing.
+//     -> asserts fixed behavior: child returns the global nexthop without
+//        crashing.
+//   EXPECT_BUG=1 go test -run TestDualNexthopReproduction ./calico-vpp-agent/routing/...
+//     -> asserts the historical buggy behavior: child exits non-zero and logs
+//        "Cannot process more than one Nlri".
 
 package routing
 
@@ -68,21 +68,11 @@ func TestDualNexthopReproduction(t *testing.T) {
 	exitErr, isExitErr := err.(*exec.ExitError)
 	output := string(out)
 
-	wantFixed := os.Getenv("WANT_FIXED") == "1"
+	expectBug := os.Getenv("EXPECT_BUG") == "1"
 
 	switch {
-	case wantFixed:
-		// After fix: child must exit cleanly and emit the global address.
-		if err != nil {
-			t.Fatalf("FIX REGRESSED: child exited non-zero (%v); output:\n%s", err, output)
-		}
-		if !strings.Contains(output, "2001:db8::1") {
-			t.Fatalf("FIX REGRESSED: expected '2001:db8::1' in output; got:\n%s", output)
-		}
-		t.Logf("FIXED behavior confirmed: getNexthop returned global address without crashing.\n%s", output)
-
-	default:
-		// Current (buggy) behavior: child must crash with the diagnostic.
+	case expectBug:
+		// Historical buggy behavior: child must crash with the diagnostic.
 		if !isExitErr || exitErr.ExitCode() == 0 {
 			t.Fatalf("BUG NOT REPRODUCED: child exited cleanly (err=%v); output:\n%s", err, output)
 		}
@@ -94,5 +84,15 @@ func TestDualNexthopReproduction(t *testing.T) {
 		}
 		t.Logf("BUG REPRODUCED: child exit %d, diagnostic present. RFC 2545 §3 dual-NH IPv6 BGP UPDATE crashes calico-vpp-agent.\n%s",
 			exitErr.ExitCode(), output)
+
+	default:
+		// Fixed behavior: child must exit cleanly and emit the global address.
+		if err != nil {
+			t.Fatalf("FIX REGRESSED: child exited non-zero (%v); output:\n%s", err, output)
+		}
+		if !strings.Contains(output, "2001:db8::1") {
+			t.Fatalf("FIX REGRESSED: expected '2001:db8::1' in output; got:\n%s", output)
+		}
+		t.Logf("FIXED behavior confirmed: getNexthop returned global address without crashing.\n%s", output)
 	}
 }

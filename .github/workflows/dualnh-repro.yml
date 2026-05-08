@@ -1,7 +1,6 @@
 # Reproduces Finding #1 (BGP MP_REACH_NLRI dual-nexthop -> calico-vpp-agent
-# os.Exit) on Linux. Runs both the "current behavior" assertion (must crash)
-# and the "fixed behavior" assertion (must succeed) so the same workflow
-# clearly reports before/after a fix.
+# os.Exit) on Linux and also runs the same check inside a kind Kubernetes Job
+# so the pod logs can be captured as CI artifacts.
 name: dualnh-repro
 
 on:
@@ -9,8 +8,15 @@ on:
     branches: ["**"]
     paths:
       - "calico-vpp-agent/routing/**"
+      - ".github/dualnh-repro/**"
       - ".github/workflows/dualnh-repro.yml"
   workflow_dispatch:
+
+env:
+  KIND_VERSION: v0.26.0
+  KIND_NODE_IMAGE: kindest/node:v1.31.4
+  KUBECTL_VERSION: v1.31.4
+  DUALNH_IMAGE: dualnh-repro:ci
 
 jobs:
   repro:
@@ -28,39 +34,162 @@ jobs:
         working-directory: calico-vpp-agent
         run: go build ./routing/...
 
-      - name: Reproduce current (buggy) behavior — expect child crash
-        id: buggy
+      - name: Verify fixed behavior - expect child clean exit
+        id: fixed
         working-directory: calico-vpp-agent
         continue-on-error: true
         run: go test -count=1 -v -run TestDualNexthopReproduction ./routing/
 
-      - name: Verify fixed behavior — expect child clean exit
-        id: fixed
+      - name: Historical bug repro - expect child crash
+        id: buggy
         working-directory: calico-vpp-agent
         continue-on-error: true
         env:
-          WANT_FIXED: "1"
+          EXPECT_BUG: "1"
         run: go test -count=1 -v -run TestDualNexthopReproduction ./routing/
 
       - name: Outcome summary
         if: always()
         env:
-          BUGGY: ${{ steps.buggy.outcome }}
           FIXED: ${{ steps.fixed.outcome }}
+          BUGGY: ${{ steps.buggy.outcome }}
         run: |
-          echo "buggy-mode step: $BUGGY"
           echo "fixed-mode step: $FIXED"
-          if [ "$BUGGY" = "success" ] && [ "$FIXED" = "failure" ]; then
-            echo "→ Bug is present and reproducible. Fix is not yet applied."
+          echo "historical-bug-mode step: $BUGGY"
+          if [ "$FIXED" = "failure" ] && [ "$BUGGY" = "success" ]; then
+            echo "Bug is present and reproducible. Fix is not yet applied."
             exit 0
           fi
-          if [ "$BUGGY" = "failure" ] && [ "$FIXED" = "success" ]; then
-            echo "→ Fix is applied and verified. Bug repro test now (correctly) reports the bug as gone."
+          if [ "$FIXED" = "success" ] && [ "$BUGGY" = "failure" ]; then
+            echo "Fix is applied and verified. Historical bug mode now reports the bug as gone."
             exit 0
           fi
-          if [ "$BUGGY" = "success" ] && [ "$FIXED" = "success" ]; then
-            echo "→ Inconsistent: both modes passed. Test logic likely needs updating."
+          if [ "$FIXED" = "success" ] && [ "$BUGGY" = "success" ]; then
+            echo "Inconsistent: both modes passed. Test logic likely needs updating."
             exit 1
           fi
-          echo "→ Both modes failed: investigate (test setup, dependency drift, or unexpected behavior)."
+          echo "Both modes failed: investigate test setup, dependency drift, or unexpected behavior."
           exit 1
+
+  kind-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build dual-NH test binary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p .tmp/dualnh-image .tmp/dualnh-artifacts
+          go test -c -o .tmp/dualnh-image/dualnh.test ./calico-vpp-agent/routing/
+
+      - name: Build Kubernetes test image
+        run: docker build -t "${DUALNH_IMAGE}" -f .github/dualnh-repro/Dockerfile .tmp/dualnh-image
+
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kind version
+          kubectl version --client=true
+
+      - name: Create kind cluster
+        run: |
+          cat > .tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            ipFamily: dual
+          nodes:
+            - role: control-plane
+          EOF
+          kind create cluster --name dualnh-repro --image "${KIND_NODE_IMAGE}" --config .tmp/kind-config.yaml
+          kubectl cluster-info
+
+      - name: Load test image into kind
+        run: kind load docker-image "${DUALNH_IMAGE}" --name dualnh-repro
+
+      - name: Run dual-NH repro in Kubernetes Job
+        run: |
+          kubectl create namespace dualnh-repro
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: dualnh-repro
+            namespace: dualnh-repro
+          spec:
+            backoffLimit: 0
+            template:
+              metadata:
+                labels:
+                  app: dualnh-repro
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: dualnh-repro
+                    image: dualnh-repro:ci
+                    imagePullPolicy: Never
+                    command: ["/bin/bash", "-ceu"]
+                    args:
+                      - |
+                        set +e
+                        echo "=== fixed behavior: dual nexthop must not crash ==="
+                        /usr/local/bin/dualnh.test -test.v -test.run=TestDualNexthopReproduction
+                        fixed=$?
+                        echo "fixed-mode exit: ${fixed}"
+
+                        echo "=== historical bug behavior: expect child crash ==="
+                        EXPECT_BUG=1 /usr/local/bin/dualnh.test -test.v -test.run=TestDualNexthopReproduction
+                        buggy=$?
+                        echo "historical-bug-mode exit: ${buggy}"
+
+                        if [ "${fixed}" -eq 0 ] && [ "${buggy}" -ne 0 ]; then
+                          echo "RESULT: fix is applied; dual nexthop is handled without process exit."
+                          exit 0
+                        fi
+                        if [ "${fixed}" -ne 0 ] && [ "${buggy}" -eq 0 ]; then
+                          echo "RESULT: bug is present; dual nexthop triggers the historical Fatalf path."
+                          exit 0
+                        fi
+                        echo "RESULT: inconsistent test outcomes; inspect this pod log."
+                        exit 1
+          EOF
+          kubectl wait --for=condition=complete --timeout=180s -n dualnh-repro job/dualnh-repro
+
+      - name: Collect Kubernetes logs
+        if: always()
+        run: |
+          mkdir -p .tmp/dualnh-artifacts/k8s .tmp/dualnh-artifacts/kind
+          kubectl get all -n dualnh-repro -o wide > .tmp/dualnh-artifacts/k8s/get-all.txt || true
+          kubectl get pods -n dualnh-repro -o yaml > .tmp/dualnh-artifacts/k8s/pods.yaml || true
+          kubectl describe job -n dualnh-repro dualnh-repro > .tmp/dualnh-artifacts/k8s/job-describe.txt || true
+          kubectl describe pods -n dualnh-repro -l job-name=dualnh-repro > .tmp/dualnh-artifacts/k8s/pod-describe.txt || true
+          kubectl logs -n dualnh-repro job/dualnh-repro --all-containers=true > .tmp/dualnh-artifacts/k8s/dualnh-repro.log || true
+          kubectl get events -A --sort-by=.metadata.creationTimestamp > .tmp/dualnh-artifacts/k8s/events.txt || true
+          kind export logs .tmp/dualnh-artifacts/kind --name dualnh-repro || true
+          if [ -s .tmp/dualnh-artifacts/k8s/dualnh-repro.log ]; then
+            {
+              echo "### dualnh-repro pod log"
+              echo '```'
+              sed -n '1,220p' .tmp/dualnh-artifacts/k8s/dualnh-repro.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Kubernetes log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dualnh-kind-logs
+          path: .tmp/dualnh-artifacts
