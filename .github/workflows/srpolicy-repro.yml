@@ -1,0 +1,193 @@
+# Reproduces the getSRPolicy segment-bound bugs (17+ overflow / 0-segment)
+# on Linux Go test, with a kind Kubernetes Job mirroring the same checks
+# so the pod logs are captured as a CI artifact.
+name: srpolicy-repro
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "calico-vpp-agent/routing/**"
+      - ".github/srpolicy-repro/**"
+      - ".github/workflows/srpolicy-repro.yml"
+  workflow_dispatch:
+
+env:
+  KIND_VERSION: v0.26.0
+  KIND_NODE_IMAGE: kindest/node:v1.31.4
+  KUBECTL_VERSION: v1.31.4
+  SRPOLICY_IMAGE: srpolicy-repro:ci
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build (sanity)
+        working-directory: calico-vpp-agent
+        run: go build ./routing/...
+
+      - name: Verify fixed behavior - expect guarded error return
+        id: fixed
+        working-directory: calico-vpp-agent
+        continue-on-error: true
+        run: go test -count=1 -v -run TestSRPolicyBoundCheck ./routing/
+
+      - name: Historical bug repro - expect child crash
+        id: buggy
+        working-directory: calico-vpp-agent
+        continue-on-error: true
+        env:
+          EXPECT_BUG: "1"
+        run: go test -count=1 -v -run TestSRPolicyBoundCheck ./routing/
+
+      - name: Outcome summary
+        if: always()
+        env:
+          FIXED: ${{ steps.fixed.outcome }}
+          BUGGY: ${{ steps.buggy.outcome }}
+        run: |
+          echo "fixed-mode step: $FIXED"
+          echo "historical-bug-mode step: $BUGGY"
+          if [ "$FIXED" = "failure" ] && [ "$BUGGY" = "success" ]; then
+            echo "Bug is present and reproducible. Fix is not yet applied."
+            exit 0
+          fi
+          if [ "$FIXED" = "success" ] && [ "$BUGGY" = "failure" ]; then
+            echo "Fix is applied and verified. Historical bug mode now reports the bug as gone."
+            exit 0
+          fi
+          if [ "$FIXED" = "success" ] && [ "$BUGGY" = "success" ]; then
+            echo "Inconsistent: both modes passed. Test logic likely needs updating."
+            exit 1
+          fi
+          echo "Both modes failed: investigate test setup, dependency drift, or unexpected behavior."
+          exit 1
+
+  kind-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build SR-Policy test binary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p .tmp/srpolicy-image .tmp/srpolicy-artifacts
+          go test -c -o .tmp/srpolicy-image/srpolicy.test ./calico-vpp-agent/routing/
+
+      - name: Build Kubernetes test image
+        run: docker build -t "${SRPOLICY_IMAGE}" -f .github/srpolicy-repro/Dockerfile .tmp/srpolicy-image
+
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Create kind cluster
+        run: |
+          cat > .tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            ipFamily: dual
+          nodes:
+            - role: control-plane
+          EOF
+          kind create cluster --name srpolicy-repro --image "${KIND_NODE_IMAGE}" --config .tmp/kind-config.yaml
+          kubectl cluster-info
+
+      - name: Load test image into kind
+        run: kind load docker-image "${SRPOLICY_IMAGE}" --name srpolicy-repro
+
+      - name: Run SR-Policy repro in Kubernetes Job
+        run: |
+          kubectl create namespace srpolicy-repro
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: srpolicy-repro
+            namespace: srpolicy-repro
+          spec:
+            backoffLimit: 0
+            template:
+              metadata:
+                labels:
+                  app: srpolicy-repro
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: srpolicy-repro
+                    image: srpolicy-repro:ci
+                    imagePullPolicy: Never
+                    command: ["/bin/bash", "-ceu"]
+                    args:
+                      - |
+                        set +e
+                        echo "=== fixed behavior: malformed SR Policy must not crash ==="
+                        /usr/local/bin/srpolicy.test -test.v -test.run=TestSRPolicyBoundCheck
+                        fixed=$?
+                        echo "fixed-mode exit: ${fixed}"
+
+                        echo "=== historical bug behavior: expect child crash ==="
+                        EXPECT_BUG=1 /usr/local/bin/srpolicy.test -test.v -test.run=TestSRPolicyBoundCheck
+                        buggy=$?
+                        echo "historical-bug-mode exit: ${buggy}"
+
+                        if [ "${fixed}" -eq 0 ] && [ "${buggy}" -ne 0 ]; then
+                          echo "RESULT: fix is applied; getSRPolicy returns guarded error instead of panicking."
+                          exit 0
+                        fi
+                        if [ "${fixed}" -ne 0 ] && [ "${buggy}" -eq 0 ]; then
+                          echo "RESULT: bug is present; getSRPolicy panics on malformed input."
+                          exit 0
+                        fi
+                        echo "RESULT: inconsistent test outcomes; inspect this pod log."
+                        exit 1
+          EOF
+          kubectl wait --for=condition=complete --timeout=180s -n srpolicy-repro job/srpolicy-repro
+
+      - name: Collect Kubernetes logs
+        if: always()
+        run: |
+          mkdir -p .tmp/srpolicy-artifacts/k8s .tmp/srpolicy-artifacts/kind
+          kubectl get all -n srpolicy-repro -o wide > .tmp/srpolicy-artifacts/k8s/get-all.txt || true
+          kubectl get pods -n srpolicy-repro -o yaml > .tmp/srpolicy-artifacts/k8s/pods.yaml || true
+          kubectl describe job -n srpolicy-repro srpolicy-repro > .tmp/srpolicy-artifacts/k8s/job-describe.txt || true
+          kubectl describe pods -n srpolicy-repro -l job-name=srpolicy-repro > .tmp/srpolicy-artifacts/k8s/pod-describe.txt || true
+          kubectl logs -n srpolicy-repro job/srpolicy-repro --all-containers=true > .tmp/srpolicy-artifacts/k8s/srpolicy-repro.log || true
+          kubectl get events -A --sort-by=.metadata.creationTimestamp > .tmp/srpolicy-artifacts/k8s/events.txt || true
+          kind export logs .tmp/srpolicy-artifacts/kind --name srpolicy-repro || true
+          if [ -s .tmp/srpolicy-artifacts/k8s/srpolicy-repro.log ]; then
+            {
+              echo "### srpolicy-repro pod log"
+              echo '```'
+              sed -n '1,220p' .tmp/srpolicy-artifacts/k8s/srpolicy-repro.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Kubernetes log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: srpolicy-kind-logs
+          path: .tmp/srpolicy-artifacts
