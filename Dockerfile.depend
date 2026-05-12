@@ -3,6 +3,9 @@
 # use to build the code in a stable and cached environment
 #
 FROM ubuntu:24.04 AS dependencies
+# TARGETARCH is set automatically by docker buildx / BuildKit; default to
+# amd64 for legacy 'docker build' calls so existing behaviour is preserved.
+ARG TARGETARCH=amd64
 
 ENV GOVERSION=1.26.1
 ENV GOLANGCILINT_VERSION=v2.11.4
@@ -17,7 +20,7 @@ RUN apt-get update && \
     apt-get update -y -q && apt-get install -y -qq --no-install-recommends nodejs && \
 	npm install -g --no-progress markdownlint-cli@${MARKDOWNLINT_VERSION}
 
-RUN wget -nv "https://dl.google.com/go/go${GOVERSION}.linux-amd64.tar.gz" -O "/tmp/go.tar.gz" && \
+RUN wget -nv "https://dl.google.com/go/go${GOVERSION}.linux-${TARGETARCH}.tar.gz" -O "/tmp/go.tar.gz" && \
     tar -C /usr/local --strip-components=1 -xzf "/tmp/go.tar.gz" && \
     rm -f "/tmp/go.tar.gz" && \
     curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
