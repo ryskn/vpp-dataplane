@@ -77,28 +77,35 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Building tag: ${TAG} -> ${REGISTRY_PREFIX}calicovpp/<name>:${TAG}"
 
+      - name: Cache VPP source tarball (vpp-<hash>.tar)
+        uses: actions/cache@v4
+        with:
+          path: vpp-manager/vpp-*.tar
+          key: vpp-tarball-${{ hashFiles('vpplink/generated/vpp_clone_current.sh', 'vpplink/generated/vpp-version', 'vpplink/generated/generate.log') }}
+
       - name: Build builder image
         run: make builder-image
 
       - name: Build calicovpp images
         env:
           CI_BUILD: '1'
-          SKIP_S3_CACHE: '1'   # disable upstream's S3 VPP tarball cache (no AWS creds)
-          TAG: ${{ steps.tags.outputs.tag }}
+          SKIP_S3_CACHE: '1'   # bypass upstream's S3 VPP tarball cache (no AWS creds)
           ALSO_LATEST: 'y'
+        # NOTE: TAG and REGISTRIES must be passed on the command line — Makefile
+        # uses '=' / ':=' for them, which override env vars.
         run: |
           make clean-vpp || true
-          make image
+          make TAG='${{ steps.tags.outputs.tag }}' image
 
       - name: Push images to ghcr.io
         env:
           CI_BUILD: '1'
           SKIP_S3_CACHE: '1'
-          TAG: ${{ steps.tags.outputs.tag }}
           ALSO_LATEST: 'y'
-          REGISTRIES: ${{ steps.tags.outputs.registry_prefix }}
         run: |
-          make push
+          make TAG='${{ steps.tags.outputs.tag }}' \
+               REGISTRIES='${{ steps.tags.outputs.registry_prefix }}' \
+               push
 
       - name: Summary
         if: always()
