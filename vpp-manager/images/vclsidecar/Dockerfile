@@ -19,6 +19,7 @@ ADD artifacts/release/libsvm* /usr/local/lib/
 ADD artifacts/release/libmemif.so /usr/local/lib/
 ADD artifacts/release/calicovppversion /usr/local/lib/calicovppversion
 
-RUN cp /usr/lib/x86_64-linux-gnu/libunwind.so.8 /usr/local/lib/
-RUN cp /usr/lib/x86_64-linux-gnu/libcurl-gnutls.so* /usr/local/lib/
+RUN ARCH=$(uname -m) && \
+    cp /usr/lib/${ARCH}-linux-gnu/libunwind.so.8 /usr/local/lib/ && \
+    cp /usr/lib/${ARCH}-linux-gnu/libcurl-gnutls.so* /usr/local/lib/
 RUN cp /usr/share/lintian/overrides/libssh-4 /usr/local/lib/
