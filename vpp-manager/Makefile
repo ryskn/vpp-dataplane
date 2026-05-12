@@ -186,19 +186,26 @@ vpp: clone-vpp vpp-build-env version-file
 	echo "Built ${VPP_TARBALL}"
 	rm -rf $(CURDIR)/artifacts
 ifdef CI_BUILD
+ifndef SKIP_S3_CACHE
 	aws s3api put-object \
 		--bucket ${VPP_CI_ARTIFACTS_BUCKET} \
 		--key ${VPP_TARBALL} \
 		--body ${VPP_TARBALL}
 endif
+endif
 
 ${VPP_TARBALL}:
 ifdef CI_BUILD
+ifdef SKIP_S3_CACHE
+	@echo "SKIP_S3_CACHE set, building VPP locally from source"
+	$(MAKE) vpp
+else
 	aws s3api get-object \
 		--bucket ${VPP_CI_ARTIFACTS_BUCKET} \
 		--key ${VPP_TARBALL} \
 		${VPP_TARBALL} \
 	|| $(MAKE) vpp
+endif
 else
 	test -f ${VPP_TARBALL} \
 	|| $(MAKE) vpp

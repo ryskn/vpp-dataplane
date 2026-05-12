@@ -42,6 +42,13 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
+      - name: Configure git identity
+        run: |
+          # The VPP source build runs git cherry-pick inside the runner,
+          # which fails without a user identity. Use a synthetic local identity.
+          git config --global user.email "ci@ryskn.local"
+          git config --global user.name "ryskn CI"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -76,6 +83,7 @@ jobs:
       - name: Build calicovpp images
         env:
           CI_BUILD: '1'
+          SKIP_S3_CACHE: '1'   # disable upstream's S3 VPP tarball cache (no AWS creds)
           TAG: ${{ steps.tags.outputs.tag }}
           ALSO_LATEST: 'y'
         run: |
@@ -85,6 +93,7 @@ jobs:
       - name: Push images to ghcr.io
         env:
           CI_BUILD: '1'
+          SKIP_S3_CACHE: '1'
           TAG: ${{ steps.tags.outputs.tag }}
           ALSO_LATEST: 'y'
           REGISTRIES: ${{ steps.tags.outputs.registry_prefix }}
