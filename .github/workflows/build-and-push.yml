@@ -87,6 +87,10 @@ jobs:
           key: vpp-tarball-${{ hashFiles('vpplink/generated/vpp_clone_current.sh', 'vpplink/generated/vpp-version', 'vpplink/generated/generate.log') }}
 
       - name: Build builder image
+        env:
+          # arm64 runner: docker.io publishes only amd64 for calicovpp/ci-builder,
+          # so let make build the depend image locally (arm64-native).
+          SKIP_BUILDER_PULL: '1'
         run: make builder-image
 
       - name: Build calicovpp images

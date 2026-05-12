@@ -358,8 +358,13 @@ endif
 .PHONY: builder-image
 builder-image: ## Make dependencies image. (Not required normally; is implied in making any other container image).
 	# Try to pull an existing dependencies image; it's OK if none exists yet.
+	# Setting SKIP_BUILDER_PULL=1 forces a local build, useful when the
+	# upstream image at this hash is published for a different arch
+	# (e.g. building arm64 locally when only amd64 exists on docker.io).
 	@echo Building depend image
+ifndef SKIP_BUILDER_PULL
 	docker image pull ${CI_BUILDER_IMAGE} || /bin/true
+endif
 	docker image inspect ${CI_BUILDER_IMAGE} >/dev/null 2>/dev/null \
 		  || ( docker image build \
 				-f ./Dockerfile.depend \
