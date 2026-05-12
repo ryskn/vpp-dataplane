@@ -25,7 +25,10 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # GitHub-hosted arm64 runner — free for public repos since 2025.
+    # Apple Silicon Macs use OrbStack VMs as arm64, so native arm64 images
+    # avoid Rosetta emulation overhead on the dataplane.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     steps:
       - name: Checkout
