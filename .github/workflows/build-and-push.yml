@@ -84,7 +84,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vpp-manager/vpp-*.tar
-          key: vpp-tarball-${{ hashFiles('vpplink/generated/vpp_clone_current.sh', 'vpplink/generated/vpp-version', 'vpplink/generated/generate.log') }}
+          # Tarball contains arch-specific .deb files, so key must include runner arch
+          # to avoid restoring an amd64 build into an arm64 job.
+          key: vpp-tarball-${{ runner.arch }}-${{ hashFiles('vpplink/generated/vpp_clone_current.sh', 'vpplink/generated/vpp-version', 'vpplink/generated/generate.log') }}
 
       - name: Build builder image
         env:
