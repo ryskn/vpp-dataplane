@@ -41,6 +41,8 @@ ifdef CI_BUILD
 	# this is especially import for felix-api-proxy
 	DOCKER_OPTS  = -e CI_BUILD=1 -e GOFLAGS=${GOFLAGS}
 	DOCKER_OPTS += -e CGO_ENABLED=0
+	# Without HOME the unmapped uid falls back to / and go's build cache mkdir fails.
+	DOCKER_OPTS += -e HOME=/tmp
 	DOCKER_OPTS += --user $$(id -u):$$(id -g)
 	DOCKER_OPTS += -w /vpp-dataplane/$(shell git rev-parse --show-prefix)
 	DOCKER_OPTS += -v $(VPP_DATAPLANE_DIR):/vpp-dataplane
