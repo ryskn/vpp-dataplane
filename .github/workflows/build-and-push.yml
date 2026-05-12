@@ -1,0 +1,103 @@
+name: Build and push fork images
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: Optional suffix appended to TAG (default empty)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA=$(git rev-parse --short=12 HEAD)
+          SUFFIX='${{ github.event.inputs.tag_suffix }}'
+          if [ -n "$SUFFIX" ]; then
+            TAG="master-${SHA}-${SUFFIX}"
+          else
+            TAG="master-${SHA}"
+          fi
+          REGISTRY_PREFIX="${REGISTRY}/${IMAGE_OWNER}/"
+          {
+            echo "sha=${SHA}"
+            echo "tag=${TAG}"
+            echo "registry_prefix=${REGISTRY_PREFIX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building tag: ${TAG} -> ${REGISTRY_PREFIX}calicovpp/<name>:${TAG}"
+
+      - name: Build builder image
+        run: make builder-image
+
+      - name: Build calicovpp images
+        env:
+          CI_BUILD: '1'
+          TAG: ${{ steps.tags.outputs.tag }}
+          ALSO_LATEST: 'y'
+        run: |
+          make clean-vpp || true
+          make image
+
+      - name: Push images to ghcr.io
+        env:
+          CI_BUILD: '1'
+          TAG: ${{ steps.tags.outputs.tag }}
+          ALSO_LATEST: 'y'
+          REGISTRIES: ${{ steps.tags.outputs.registry_prefix }}
+        run: |
+          make push
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Published images" >> $GITHUB_STEP_SUMMARY
+          PREFIX="${{ steps.tags.outputs.registry_prefix }}calicovpp"
+          TAG="${{ steps.tags.outputs.tag }}"
+          for img in agent vpp multinet-monitor vclsidecar init-eks calicovppctl; do
+            echo "- \`${PREFIX}/${img}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${PREFIX}/${img}:latest\`" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "- \`${PREFIX}/vpp:dbg-${TAG}\`" >> $GITHUB_STEP_SUMMARY
