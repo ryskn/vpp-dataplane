@@ -3,7 +3,8 @@ name: Build and push fork images
 on:
   push:
     branches:
-      - master
+      - 'ci/build-and-push'
+      - 'ci/**'
     paths-ignore:
       - 'docs/**'
       - '**.md'
