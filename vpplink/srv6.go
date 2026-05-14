@@ -113,7 +113,12 @@ func (v *VppLink) AddSRv6Policy(policy *types.SrPolicy) error {
 				Sids:    sl.Sids,
 			},
 		}); err != nil {
-			return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w", i+1, err)
+			if _, delErr := client.SrPolicyDel(v.GetContext(), &sr.SrPolicyDel{
+				BsidAddr: policy.Bsid,
+			}); delErr != nil {
+				return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w; additionally failed to roll back SRv6Policy: %w", i+2, err, delErr)
+			}
+			return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w", i+2, err)
 		}
 	}
 	return nil
