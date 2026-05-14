@@ -159,11 +159,14 @@ func parseSegmentList(
 	srnrli *bgpapi.SRPolicyNLRI,
 ) (types.Srv6SidList, *bgpapi.SegmentTypeB, error) {
 	segments := make([]*bgpapi.SegmentTypeB, 0, len(sub.GetSegments()))
-	for _, seglist := range sub.GetSegments() {
+	for i, seglist := range sub.GetSegments() {
 		segment := &bgpapi.SegmentTypeB{}
-		if err := seglist.UnmarshalTo(segment); err == nil {
-			segments = append(segments, segment)
+		if err := seglist.UnmarshalTo(segment); err != nil {
+			return types.Srv6SidList{}, nil, fmt.Errorf(
+				"sr policy endpoint=%s has an unsupported or malformed segment at index %d: %w",
+				net.IP(srnrli.Endpoint), i, err)
 		}
+		segments = append(segments, segment)
 	}
 	if len(segments) == 0 {
 		return types.Srv6SidList{}, nil, fmt.Errorf(
