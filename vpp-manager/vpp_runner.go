@@ -286,6 +286,55 @@ func isDefaultRoute(dst *net.IPNet) bool {
 	return ones == 0 && (bits == 32 || bits == 128)
 }
 
+// addServicePrefixHostRoutes programs a host-side static route for every
+// configured Service CIDR through VPP's TAP next-hop, before vpp-manager
+// reaches out to the Kubernetes API on a cluster Service IP. The same routes
+// will normally be (re)installed by calico-vpp-agent's uplink_route_watcher
+// once the agent is running, but that runs only after vpp-manager has
+// declared itself Ready, so without this bootstrap step the updateCalicoNode
+// call below cannot route to fd30::1 / 10.96.0.1 on a node whose kernel was
+// previously cleaned of the static route. Failures are logged and ignored:
+// the agent's watcher remains the source of truth.
+func addServicePrefixHostRoutes(specs []config.UplinkInterfaceSpec) {
+	if config.ServiceCIDRs == nil {
+		return
+	}
+	for _, serviceCIDR := range *config.ServiceCIDRs {
+		if serviceCIDR == nil {
+			continue
+		}
+		for idx, ifSpec := range specs {
+			status, ok := config.Info.UplinkStatuses[ifSpec.InterfaceName]
+			if !ok {
+				continue
+			}
+			gw := status.FakeNextHopIP4
+			if serviceCIDR.IP.To4() == nil {
+				gw = status.FakeNextHopIP6
+			}
+			if gw == nil || gw.IsUnspecified() {
+				continue
+			}
+			priority := 0
+			if !ifSpec.IsMain {
+				priority = idx + 1
+			}
+			route := &netlink.Route{
+				Dst:      serviceCIDR,
+				Gw:       gw,
+				Protocol: syscall.RTPROT_STATIC,
+				Priority: priority,
+			}
+			if err := netlink.RouteAdd(route); err != nil && !errors.Is(err, syscall.EEXIST) {
+				log.Warnf("vpp-manager bootstrap route for service prefix %s via %s failed: %v (agent will retry)",
+					serviceCIDR.String(), gw.String(), err)
+			} else {
+				log.Infof("vpp-manager bootstrap route added: %s via %s", serviceCIDR.String(), gw.String())
+			}
+		}
+	}
+}
+
 // pick a next hop to use for cluster routes (services, pod cidrs) in the address prefix
 func (v *VppRunner) pickNextHopIP(ifState config.LinuxInterfaceState) (fakeNextHopIP4, fakeNextHopIP6 net.IP) {
 	fakeNextHopIP4 = net.ParseIP("0.0.0.0")
@@ -1130,6 +1179,16 @@ func (v *VppRunner) runVpp() (err error) {
 			return errors.Wrapf(err, "Error setting VPP uplink tap %d up", v.conf[idx].TapSwIfIndex)
 		}
 	}
+
+	// Program host routes for every Service CIDR through VPP's TAP before
+	// touching the Kubernetes API. Otherwise updateCalicoNode below tries to
+	// reach the in-cluster API on a Service IP (e.g. fd30::1:443) whose route
+	// is normally installed by calico-vpp-agent's uplink_route_watcher, which
+	// only starts after vpp-manager declares itself Ready — a deadlock that
+	// manifests as "Error updating Calico node ... dial ... network is
+	// unreachable" on workers whose host kernel never had the static
+	// service-prefix route programmed by a prior agent run.
+	addServicePrefixHostRoutes(v.params.UplinksSpecs)
 
 	// Update the Calico node with the IP address actually configured on VPP
 	err = v.updateCalicoNode(v.conf[0])
