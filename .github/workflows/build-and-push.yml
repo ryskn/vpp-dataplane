@@ -1,0 +1,129 @@
+name: Build and push fork images
+
+on:
+  push:
+    branches:
+      - 'ci/build-and-push'
+      - 'ci/**'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: Optional suffix appended to TAG (default empty)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build-and-push:
+    # GitHub-hosted arm64 runner — free for public repos since 2025.
+    # Apple Silicon Macs use OrbStack VMs as arm64, so native arm64 images
+    # avoid Rosetta emulation overhead on the dataplane.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Configure git identity
+        run: |
+          # The VPP source build runs git cherry-pick inside the runner,
+          # which fails without a user identity. Use a synthetic local identity.
+          git config --global user.email "ci@ryskn.local"
+          git config --global user.name "ryskn CI"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA=$(git rev-parse --short=12 HEAD)
+          SUFFIX='${{ github.event.inputs.tag_suffix }}'
+          if [ -n "$SUFFIX" ]; then
+            TAG="master-${SHA}-${SUFFIX}"
+          else
+            TAG="master-${SHA}"
+          fi
+          REGISTRY_PREFIX="${REGISTRY}/${IMAGE_OWNER}/"
+          {
+            echo "sha=${SHA}"
+            echo "tag=${TAG}"
+            echo "registry_prefix=${REGISTRY_PREFIX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building tag: ${TAG} -> ${REGISTRY_PREFIX}calicovpp/<name>:${TAG}"
+
+      - name: Cache VPP source tarball (vpp-<hash>.tar)
+        uses: actions/cache@v4
+        with:
+          path: vpp-manager/vpp-*.tar
+          # Tarball contains arch-specific .deb files, so key must include runner arch
+          # to avoid restoring an amd64 build into an arm64 job.
+          key: vpp-tarball-${{ runner.arch }}-${{ hashFiles('vpplink/generated/vpp_clone_current.sh', 'vpplink/generated/vpp-version', 'vpplink/generated/generate.log') }}
+
+      - name: Build builder image
+        env:
+          # arm64 runner: docker.io publishes only amd64 for calicovpp/ci-builder,
+          # so let make build the depend image locally (arm64-native).
+          SKIP_BUILDER_PULL: '1'
+        run: make builder-image
+
+      - name: Build calicovpp images
+        env:
+          CI_BUILD: '1'
+          SKIP_S3_CACHE: '1'   # bypass upstream's S3 VPP tarball cache (no AWS creds)
+          ALSO_LATEST: 'y'
+        # NOTE: TAG and REGISTRIES must be passed on the command line — Makefile
+        # uses '=' / ':=' for them, which override env vars.
+        run: |
+          make clean-vpp || true
+          make TAG='${{ steps.tags.outputs.tag }}' image
+
+      - name: Push images to ghcr.io
+        env:
+          CI_BUILD: '1'
+          SKIP_S3_CACHE: '1'
+          ALSO_LATEST: 'y'
+        run: |
+          make TAG='${{ steps.tags.outputs.tag }}' \
+               REGISTRIES='${{ steps.tags.outputs.registry_prefix }}' \
+               push
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Published images" >> $GITHUB_STEP_SUMMARY
+          PREFIX="${{ steps.tags.outputs.registry_prefix }}calicovpp"
+          TAG="${{ steps.tags.outputs.tag }}"
+          for img in agent vpp multinet-monitor vclsidecar init-eks calicovppctl; do
+            echo "- \`${PREFIX}/${img}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${PREFIX}/${img}:latest\`" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "- \`${PREFIX}/vpp:dbg-${TAG}\`" >> $GITHUB_STEP_SUMMARY

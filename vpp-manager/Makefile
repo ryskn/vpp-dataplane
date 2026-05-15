@@ -21,6 +21,10 @@ VERSION_FILE=$(VPP_DIR)/calicovppversion
 BASE ?=
 MOCK_POD_IMAGE ?= calicovpp/vpp-test-pod-mock:latest
 
+# Multiarch sub-directory name under build-root/build-vpp{,debug}-native/vpp/lib/.
+# Defaults from `uname -m` (e.g. x86_64-linux-gnu, aarch64-linux-gnu).
+DEB_MULTIARCH ?= $(shell uname -m)-linux-gnu
+
 VPP_REL_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/release/vpp_*.deb \
 	$(VPP_DIR)/build-root/debs/release/vpp-plugin-core_*.deb \
@@ -28,12 +32,12 @@ VPP_REL_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/release/libvppinfra_*.deb \
 	$(VPP_DIR)/build-root/debs/release/vpp-dbg_*.deb \
 	$(VPP_DIR)/build-root/debs/release/vpp-plugin-devtools_*.deb \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvcl_ldpreload.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libsvm.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvppcom.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvlibapi.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvppinfra.so* \
-	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/x86_64-linux-gnu/libvlibmemoryclient.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/$(DEB_MULTIARCH)/libvcl_ldpreload.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/$(DEB_MULTIARCH)/libsvm.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/$(DEB_MULTIARCH)/libvppcom.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/$(DEB_MULTIARCH)/libvlibapi.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/$(DEB_MULTIARCH)/libvppinfra.so* \
+	${VPP_DIR}/build-root/build-vpp-native/vpp/lib/$(DEB_MULTIARCH)/libvlibmemoryclient.so* \
 	${VPP_DIR}/extras/libmemif/release/install/lib/libmemif.so \
 
 VPP_DBG_DEB_LIST = \
@@ -43,12 +47,12 @@ VPP_DBG_DEB_LIST = \
 	$(VPP_DIR)/build-root/debs/debug/libvppinfra_*.deb \
 	$(VPP_DIR)/build-root/debs/debug/vpp-dbg_*.deb \
 	$(VPP_DIR)/build-root/debs/debug/vpp-plugin-devtools_*.deb \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvcl_ldpreload.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libsvm.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvppcom.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvlibapi.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvppinfra.so* \
-	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvlibmemoryclient.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/$(DEB_MULTIARCH)/libvcl_ldpreload.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/$(DEB_MULTIARCH)/libsvm.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/$(DEB_MULTIARCH)/libvppcom.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/$(DEB_MULTIARCH)/libvlibapi.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/$(DEB_MULTIARCH)/libvppinfra.so* \
+	${VPP_DIR}/build-root/build-vpp_debug-native/vpp/lib/$(DEB_MULTIARCH)/libvlibmemoryclient.so* \
 	${VPP_DIR}/extras/libmemif/debug/install/lib/libmemif.so \
 
 PATCHES = $(sort $(wildcard $(VPPLINK_DIR)/generated/patches/*.patch))
@@ -186,19 +190,26 @@ vpp: clone-vpp vpp-build-env version-file
 	echo "Built ${VPP_TARBALL}"
 	rm -rf $(CURDIR)/artifacts
 ifdef CI_BUILD
+ifndef SKIP_S3_CACHE
 	aws s3api put-object \
 		--bucket ${VPP_CI_ARTIFACTS_BUCKET} \
 		--key ${VPP_TARBALL} \
 		--body ${VPP_TARBALL}
 endif
+endif
 
 ${VPP_TARBALL}:
 ifdef CI_BUILD
+ifdef SKIP_S3_CACHE
+	@echo "SKIP_S3_CACHE set, building VPP locally from source"
+	$(MAKE) vpp
+else
 	aws s3api get-object \
 		--bucket ${VPP_CI_ARTIFACTS_BUCKET} \
 		--key ${VPP_TARBALL} \
 		${VPP_TARBALL} \
 	|| $(MAKE) vpp
+endif
 else
 	test -f ${VPP_TARBALL} \
 	|| $(MAKE) vpp
