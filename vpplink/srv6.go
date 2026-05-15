@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/interface_types"
+	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/ip_types"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/sr"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/sr_types"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
@@ -78,6 +79,15 @@ func (v *VppLink) AddSRv6Policy(policy *types.SrPolicy) error {
 	if len(policy.SidLists) == 0 {
 		return fmt.Errorf("failed to add SRv6Policy: policy has no SID lists")
 	}
+	// sr_policy_mod accepts an SR Policy keyed by either bsid_addr or a
+	// non-zero sr_policy_index; this code path only sets bsid_addr, so
+	// reject a zero / unset BSID up-front. Otherwise an SR Policy that
+	// reached AddSRv6Policy without a Binding SID sub-TLV decoded into it
+	// would silently target the all-zero-BSID entry on later SrPolicyMod
+	// calls.
+	if (policy.Bsid == ip_types.IP6Address{}) {
+		return fmt.Errorf("failed to add SRv6Policy: BSID is unset (zero address)")
+	}
 
 	// VPP's sr_policy_add accepts a single Segment List, so the first one is
 	// installed via SrPolicyAdd and any additional lists are appended one at
@@ -118,7 +128,7 @@ func (v *VppLink) AddSRv6Policy(policy *types.SrPolicy) error {
 			}); delErr != nil {
 				return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w; additionally failed to roll back SRv6Policy: %w", i+2, err, delErr)
 			}
-			return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w", i+2, err)
+			return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w; rolled back by deleting the SRv6Policy", i+2, err)
 		}
 	}
 	return nil
