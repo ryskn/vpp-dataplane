@@ -327,30 +327,26 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 	srv6tunnel.Bsid = srv6Policy.Bsid.ToIP()
 	srv6tunnel.Policy = srv6Policy
 
-	// VPP's sr_policy keeps one Behavior per BSID rather than per candidate
-	// path, so when the advertised Segment Lists disagree on the trailing
-	// segment's EndpointBehaviorStructure (RFC 9256 does not forbid this:
-	// different candidate paths MAY terminate with different behaviors), we
-	// pick the highest-weight list's behavior deterministically; ties are
-	// broken by walk order (= first occurrence). A non-fatal warning is
-	// logged so operators can spot mixed-behavior policies without losing
-	// connectivity on upgrade. parseSegmentList already guarantees every
+	// RFC 9256 permits candidate paths to terminate with different endpoint
+	// behaviors, but this agent's install layer keeps one Behavior per BSID
+	// (srv6tunnel.Behavior is matched against the destination pod prefix
+	// family in connectivity/srv6.go: getPolicyNode), and VPP installs all
+	// Segment Lists under a single sr_policy entry that ECMP/weight-load-
+	// balances across them. Accepting a mixed-behavior policy would mean
+	// installing two SID chains with one decap behavior, and traffic that
+	// hashes onto a list whose trailing segment expects the other behavior
+	// would be dropped/misdecapped at the egress node. Reject the policy
+	// here so the failure is visible at receive time instead of becoming a
+	// silent forwarding bug. parseSegmentList already guarantees every
 	// trailing segment has a non-nil EndpointBehaviorStructure.
-	winner := 0
-	for i, w := range sidLists {
-		if w.Weight > sidLists[winner].Weight {
-			winner = i
+	for i := 1; i < len(listBehaviors); i++ {
+		if listBehaviors[i] != listBehaviors[0] {
+			return nil, nil, srnrli, fmt.Errorf(
+				"sr policy endpoint=%s: segment list 0 ends with endpoint behavior %d, segment list %d ends with %d; this agent installs one Behavior per BSID and cannot represent a mixed-behavior candidate-path set safely, so the policy is rejected",
+				net.IP(srnrli.Endpoint), listBehaviors[0], i, listBehaviors[i])
 		}
 	}
-	srv6tunnel.Behavior = uint8(listBehaviors[winner])
-	for i, b := range listBehaviors {
-		if b != listBehaviors[winner] {
-			s.log.Warnf(
-				"sr policy endpoint=%s: segment list %d has endpoint behavior %d, differs from winner (list %d, weight %d, behavior %d); using winner",
-				net.IP(srnrli.Endpoint), i, b, winner, sidLists[winner].Weight, listBehaviors[winner])
-			break
-		}
-	}
+	srv6tunnel.Behavior = uint8(listBehaviors[0])
 
 	return srv6Policy, srv6tunnel, srnrli, nil
 }
