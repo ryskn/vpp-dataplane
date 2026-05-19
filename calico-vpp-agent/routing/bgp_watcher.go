@@ -137,6 +137,10 @@ func walkSRPolicyInnerTLVs(path *bgpapi.Path, fn func(*anypb.Any) error) error {
 	for _, pattr := range path.Pattrs {
 		tun := &bgpapi.TunnelEncapAttribute{}
 		if err := pattr.UnmarshalTo(tun); err != nil {
+			// path.Pattrs is heterogeneous (OriginAttribute,
+			// AsPathAttribute, NextHopAttribute, ...). Anything that is
+			// not a TunnelEncapAttribute fails UnmarshalTo here, which is
+			// expected, not a decoding bug -- skip and keep scanning.
 			continue
 		}
 		for _, tlv := range tun.Tlvs {
@@ -152,29 +156,65 @@ func walkSRPolicyInnerTLVs(path *bgpapi.Path, fn func(*anypb.Any) error) error {
 
 // parseSegmentList converts one TunnelEncapSubTLVSRSegmentList into a
 // single types.Srv6SidList, preserving the sub-TLV's weight. It also
-// returns the last SegmentTypeB so the caller can inspect the optional
-// EndpointBehaviorStructure for the policy as a whole.
+// returns the last SegmentTypeB so the caller can inspect the
+// EndpointBehaviorStructure that drives the SR Policy install behavior.
 //
-// Strict by design: if any entry inside the Segment List sub-TLV fails
-// to unmarshal as SegmentTypeB (for example, a Type-A SID embedded in a
-// list this agent does not yet support), the entire SR Policy is
-// rejected via an error rather than processing the surviving entries.
-// Silently dropping a malformed segment would change the installed SID
-// chain in a way the advertising peer never intended.
+// Caller contract: getSRPolicy propagates any error returned here through
+// walkSRPolicyInnerTLVs, which means *one bad Segment List rejects the
+// entire SR Policy*, not just the offending list. That whole-policy
+// rejection is intentional -- partial installation would change the
+// candidate-path / weight semantics the controller advertised (see the
+// design note in the PR description). parseSegmentList itself does not
+// know about sibling Segment Lists; it just guarantees that a list it
+// accepts can be installed in VPP without further validation.
+//
+// Segment-type policy: an SR Policy advertised to an SRv6 dataplane is
+// expected to carry SegmentTypeB (IPv6 SID) entries end-to-end. A
+// SegmentTypeA (SR-MPLS label) entry is legitimate per
+// draft-ietf-idr-segment-routing-te-policy but cannot be installed by
+// this SRv6 agent; silently skipping it would install a SID chain that
+// differs from the advertised one -- the forwarding path would change
+// in a way the advertising peer never intended. The list is therefore
+// rejected with a distinct error so operators can tell "advertiser sent
+// SR-MPLS segments we cannot install" from "advertiser sent malformed
+// protobuf bytes".
+//
+// EndpointBehaviorStructure on the trailing SegmentTypeB is required
+// (it drives srv6tunnel.Behavior). Lists whose last segment has no
+// behavior structure are rejected here per-list, so getSRPolicy does
+// not have to re-validate it after the walk.
 func parseSegmentList(
 	sub *bgpapi.TunnelEncapSubTLVSRSegmentList,
 	srnrli *bgpapi.SRPolicyNLRI,
 ) (types.Srv6SidList, *bgpapi.SegmentTypeB, error) {
 	segments := make([]*bgpapi.SegmentTypeB, 0, len(sub.GetSegments()))
-	for i, seglist := range sub.GetSegments() {
+	for i, raw := range sub.GetSegments() {
 		segment := &bgpapi.SegmentTypeB{}
-		if err := seglist.UnmarshalTo(segment); err != nil {
-			return types.Srv6SidList{}, nil, fmt.Errorf(
-				"sr policy endpoint=%s has an unsupported or malformed segment at index %d: %w",
-				net.IP(srnrli.Endpoint), i, err)
+		if err := raw.UnmarshalTo(segment); err == nil {
+			segments = append(segments, segment)
+			continue
 		}
-		segments = append(segments, segment)
+		// Distinguish "advertiser sent a known but unsupported segment
+		// type (SR-MPLS Type-A)" from "advertiser sent bytes that decode
+		// as no SR segment type at all". Both reject the list, but the
+		// SR-MPLS case is intentional on the advertiser's side and the
+		// genuinely-malformed case is a protocol violation; the
+		// different error wording makes the operator-side triage
+		// obvious.
+		typeA := &bgpapi.SegmentTypeA{}
+		if err := raw.UnmarshalTo(typeA); err == nil {
+			return types.Srv6SidList{}, nil, fmt.Errorf(
+				"sr policy endpoint=%s: SegmentTypeA (SR-MPLS label %d) at index %d cannot be installed by this SRv6 agent; rejecting list to avoid installing a SID chain different from the advertised one",
+				net.IP(srnrli.Endpoint), typeA.GetLabel(), i)
+		}
+		return types.Srv6SidList{}, nil, fmt.Errorf(
+			"sr policy endpoint=%s has an unsupported or malformed segment at index %d",
+			net.IP(srnrli.Endpoint), i)
 	}
+	// Defensive: protobuf message with zero `segments` repeated entries.
+	// parseSegmentList is called via walkSRPolicyInnerTLVs which only
+	// hits us for actual SegmentList sub-TLVs, but the peer could still
+	// advertise one with no inner Any entries.
 	if len(segments) == 0 {
 		return types.Srv6SidList{}, nil, fmt.Errorf(
 			"sr policy endpoint=%s has a segment list with no segments",
@@ -184,6 +224,17 @@ func parseSegmentList(
 		return types.Srv6SidList{}, nil, fmt.Errorf(
 			"sr policy endpoint=%s segment list has %d segments, vpp supports up to %d",
 			net.IP(srnrli.Endpoint), len(segments), vppMaxSRv6Sids)
+	}
+	// EndpointBehaviorStructure is optional in the protobuf but required
+	// by this agent: srv6tunnel.Behavior is derived from the trailing
+	// segment's behavior code, and the generated GetEndpointBehaviorStructure()
+	// is nil-safe but accessing .Behavior on the returned nil pointer panics.
+	// Reject the list here instead of crashing later in getSRPolicy.
+	last := segments[len(segments)-1]
+	if last.GetEndpointBehaviorStructure() == nil {
+		return types.Srv6SidList{}, nil, fmt.Errorf(
+			"sr policy endpoint=%s last segment has no endpoint behavior structure",
+			net.IP(srnrli.Endpoint))
 	}
 	sids := [vppMaxSRv6Sids]ip_types.IP6Address{}
 	for i, segment := range segments {
@@ -197,7 +248,7 @@ func parseSegmentList(
 		NumSids: uint8(len(segments)),
 		Weight:  weight,
 		Sids:    sids,
-	}, segments[len(segments)-1], nil
+	}, last, nil
 }
 
 func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv6tunnel *common.SRv6Tunnel, srnrli *bgpapi.SRPolicyNLRI, err error) {
@@ -221,8 +272,8 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 	}
 
 	var (
-		sidLists    []types.Srv6SidList
-		lastSegment *bgpapi.SegmentTypeB
+		sidLists      []types.Srv6SidList
+		listBehaviors []bgpapi.SRv6Behavior // parallel to sidLists; trailing-segment Behavior per list
 	)
 
 	err = walkSRPolicyInnerTLVs(path, func(innerTlv *anypb.Any) error {
@@ -238,22 +289,7 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 				return lerr
 			}
 			sidLists = append(sidLists, list)
-			// srv6tunnel.Behavior below derives from the trailing
-			// SegmentTypeB's EndpointBehaviorStructure. With multiple
-			// Segment Lists the choice would otherwise be order-
-			// dependent, so require every list's last segment to
-			// declare the same Behavior code rather than letting the
-			// walk order silently pick a winner.
-			if lastSegment != nil &&
-				lastSegment.GetEndpointBehaviorStructure().GetBehavior() !=
-					last.GetEndpointBehaviorStructure().GetBehavior() {
-				return fmt.Errorf(
-					"sr policy endpoint=%s: inconsistent endpoint behaviors across segment lists (%d vs %d)",
-					net.IP(srnrli.Endpoint),
-					lastSegment.GetEndpointBehaviorStructure().GetBehavior(),
-					last.GetEndpointBehaviorStructure().GetBehavior())
-			}
-			lastSegment = last
+			listBehaviors = append(listBehaviors, last.GetEndpointBehaviorStructure().GetBehavior())
 			return nil
 		}
 		// Binding SID sub-TLV.
@@ -291,18 +327,30 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 	srv6tunnel.Bsid = srv6Policy.Bsid.ToIP()
 	srv6tunnel.Policy = srv6Policy
 
-	// EndpointBehaviorStructure is an optional sub-TLV in SegmentTypeB
-	// (RFC 9830, RFC 9256). The protobuf-generated
-	// GetEndpointBehaviorStructure() is nil-safe, but accessing .Behavior on
-	// the returned nil pointer panics. Reject SR Policies whose last segment
-	// lacks endpoint behavior info instead of crashing the agent.
-	lastEBS := lastSegment.GetEndpointBehaviorStructure()
-	if lastEBS == nil {
-		return nil, nil, srnrli, fmt.Errorf(
-			"sr policy endpoint=%s last segment has no endpoint behavior structure",
-			net.IP(srnrli.Endpoint))
+	// VPP's sr_policy keeps one Behavior per BSID rather than per candidate
+	// path, so when the advertised Segment Lists disagree on the trailing
+	// segment's EndpointBehaviorStructure (RFC 9256 does not forbid this:
+	// different candidate paths MAY terminate with different behaviors), we
+	// pick the highest-weight list's behavior deterministically; ties are
+	// broken by walk order (= first occurrence). A non-fatal warning is
+	// logged so operators can spot mixed-behavior policies without losing
+	// connectivity on upgrade. parseSegmentList already guarantees every
+	// trailing segment has a non-nil EndpointBehaviorStructure.
+	winner := 0
+	for i, w := range sidLists {
+		if w.Weight > sidLists[winner].Weight {
+			winner = i
+		}
 	}
-	srv6tunnel.Behavior = uint8(lastEBS.Behavior)
+	srv6tunnel.Behavior = uint8(listBehaviors[winner])
+	for i, b := range listBehaviors {
+		if b != listBehaviors[winner] {
+			s.log.Warnf(
+				"sr policy endpoint=%s: segment list %d has endpoint behavior %d, differs from winner (list %d, weight %d, behavior %d); using winner",
+				net.IP(srnrli.Endpoint), i, b, winner, sidLists[winner].Weight, listBehaviors[winner])
+			break
+		}
+	}
 
 	return srv6Policy, srv6tunnel, srnrli, nil
 }

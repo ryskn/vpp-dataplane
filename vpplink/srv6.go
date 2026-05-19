@@ -95,7 +95,16 @@ func (v *VppLink) AddSRv6Policy(policy *types.SrPolicy) error {
 	// the RFC 9256 notion of multiple weighted Segment Lists per SR Policy
 	// (ECMP / fallback candidates) intact rather than collapsing them into a
 	// single strict chain.
+	//
+	// The "weight" field appears twice on the wire: once at the top level
+	// (sr_policy_add.weight, documented as "weight of the sid list") and
+	// once nested inside Sids (vl_api_srv6_sid_list_t.weight). VPP's
+	// sr_policy_add_fn implementation reads the top-level field as the
+	// authoritative per-SID-list weight; the nested copy is set to the same
+	// value so the on-wire srv6_sid_list_t round-trips correctly (the
+	// generated marshaller emits both). SrPolicyMod below behaves the same.
 	first := policy.SidLists[0]
+	total := len(policy.SidLists)
 	if _, err := client.SrPolicyAdd(v.GetContext(), &sr.SrPolicyAdd{
 		BsidAddr: policy.Bsid,
 		Weight:   first.Weight,
@@ -112,6 +121,7 @@ func (v *VppLink) AddSRv6Policy(policy *types.SrPolicy) error {
 	}
 
 	for i, sl := range policy.SidLists[1:] {
+		listIdx := i + 2 // 1-based, accounting for the SrPolicyAdd above
 		if _, err := client.SrPolicyMod(v.GetContext(), &sr.SrPolicyMod{
 			BsidAddr:  policy.Bsid,
 			FibTable:  policy.FibTable,
@@ -126,9 +136,9 @@ func (v *VppLink) AddSRv6Policy(policy *types.SrPolicy) error {
 			if _, delErr := client.SrPolicyDel(v.GetContext(), &sr.SrPolicyDel{
 				BsidAddr: policy.Bsid,
 			}); delErr != nil {
-				return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w; additionally failed to roll back SRv6Policy: %w", i+2, err, delErr)
+				return fmt.Errorf("failed to append SID list %d/%d to SRv6Policy: %w; additionally failed to roll back SRv6Policy: %w", listIdx, total, err, delErr)
 			}
-			return fmt.Errorf("failed to append SID list %d to SRv6Policy: %w; rolled back by deleting the SRv6Policy", i+2, err)
+			return fmt.Errorf("failed to append SID list %d/%d to SRv6Policy: %w; rolled back by deleting the SRv6Policy", listIdx, total, err)
 		}
 	}
 	return nil
