@@ -29,10 +29,29 @@ type NodeToPolicies struct {
 	SRv6Tunnel []common.SRv6Tunnel
 }
 
+// srv6VppAPI is the slice of *vpplink.VppLink that SRv6Provider talks to. It's
+// declared here so tests can substitute a fake without spinning up VPP; the
+// concrete *vpplink.VppLink satisfies it via duck typing.
+type srv6VppAPI interface {
+	ListSRv6Localsid() ([]*types.SrLocalsid, error)
+	AddSRv6Localsid(*types.SrLocalsid) error
+	AddModSRv6Policy(*types.SrPolicy) error
+	AddSRv6Steering(*types.SrSteer) error
+	DelSRv6Steering(*types.SrSteer) error
+	DelSRv6Policy(*types.SrPolicy) error
+	ListSRv6Steering() ([]*types.SrSteer, error)
+	SetEncapSource(net.IP) error
+	RouteAdd(*types.Route) error
+	RouteDel(*types.Route) error
+}
+
 // SRv6Provider is node connectivity provider that uses segment routing over IPv6 (SRv6) to connect the nodes
 // For more info about SRv6, see https://datatracker.ietf.org/doc/html/rfc8986.
 type SRv6Provider struct {
 	*ConnectivityProviderData
+	// vpp shadows the embedded ConnectivityProviderData.vpp so tests can inject
+	// a fake; production wires the real *vpplink.VppLink through here.
+	vpp srv6VppAPI
 
 	// nodePrefixes is internal data holder for information from common.NodeConnectivity data
 	// from common.ConnectivityAdded event
@@ -47,7 +66,12 @@ type SRv6Provider struct {
 }
 
 func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
-	p := &SRv6Provider{d, make(map[string]*NodeToPrefixes), make(map[string]*NodeToPolicies), net.IPNet{}, net.IPNet{}}
+	p := &SRv6Provider{
+		ConnectivityProviderData: d,
+		vpp:                      d.vpp,
+		nodePrefixes:             make(map[string]*NodeToPrefixes),
+		nodePolices:              make(map[string]*NodeToPolicies),
+	}
 	if *config.GetCalicoVppFeatureGates().SRv6Enabled {
 		p.localSidIPPool = cnet.MustParseNetwork(config.GetCalicoVppSrv6().LocalsidPool).IPNet
 		p.policyIPPool = cnet.MustParseNetwork(config.GetCalicoVppSrv6().PolicyPool).IPNet
@@ -229,10 +253,200 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 	return err
 }
 
-func (p *SRv6Provider) DelConnectivity(cn *common.NodeConnectivity) (err error) {
+// DelConnectivity tears down the SRv6 forwarding state put in place by AddConnectivity.
+// SRv6PolicyDeleted comes in with cn.Custom = *common.SRv6Tunnel; the <Distinguisher,
+// Color, Endpoint> NLRI key on it is what we match against the cache so a withdraw
+// only removes the one candidate path it identifies. Plain ConnectivityDeleted comes
+// in with cn.Custom = nil and cn.Dst set. Per-step failures are logged but do not
+// abort the rest of the cleanup.
+func (p *SRv6Provider) DelConnectivity(cn *common.NodeConnectivity) error {
 	p.log.Infof("SRv6Provider DelConnectivity %s", cn.String())
-	// FIXME SRv6 node connectivity removal not supported
+	if cn.Custom != nil {
+		return p.delSRPolicy(cn)
+	}
+	if cn.Dst.IP != nil {
+		return p.delPrefixSteering(cn)
+	}
+	return fmt.Errorf("SRv6Provider DelConnectivity: cn has neither Custom nor Dst.IP")
+}
+
+func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
+	policyData, ok := cn.Custom.(*common.SRv6Tunnel)
+	if !ok || policyData == nil {
+		return fmt.Errorf("SRv6Provider DelConnectivity: cn.Custom is not a *common.SRv6Tunnel: %T", cn.Custom)
+	}
+	nodeip := policyData.Dst.String()
+	entry := p.nodePolices[nodeip]
+	if entry == nil {
+		p.log.Infof("SRv6Provider DelConnectivity: no cached policies for endpoint %s", nodeip)
+		return nil
+	}
+
+	// Match cached tunnels by <Distinguisher, Color, Endpoint> NLRI key.
+	// Withdraws carry only the NLRI key (no BSID); the cached tunnel preserves
+	// the BSID we installed, which is what VPP needs to delete.
+	var matched []ip_types.IP6Address
+	remaining := entry.SRv6Tunnel[:0]
+	for _, tun := range entry.SRv6Tunnel {
+		if tun.Color == policyData.Color && tun.Distinguisher == policyData.Distinguisher {
+			if b, ok := tunnelBsid(&tun); ok {
+				matched = append(matched, b)
+			}
+			continue
+		}
+		remaining = append(remaining, tun)
+	}
+	if len(matched) == 0 {
+		p.log.Infof("SRv6Provider DelConnectivity: no cached policy matched endpoint=%s color=%d distinguisher=%d",
+			nodeip, policyData.Color, policyData.Distinguisher)
+		return nil
+	}
+
+	steering, listErr := p.vpp.ListSRv6Steering()
+	if listErr != nil {
+		p.log.Warnf("SRv6Provider DelConnectivity: failed to list steering: %v", listErr)
+	}
+	// Track which prefixes lose their steering: after we delete this BSID,
+	// the RFC 9256 candidate-path failover wants the next-best surviving
+	// policy of the same behavior to take over. Re-steer happens below, after
+	// the cache prune, so getPolicyNode sees the post-withdraw state.
+	var orphaned []ip_types.Prefix
+	for _, bsid := range matched {
+		for _, st := range steering {
+			if st.Bsid == bsid {
+				orphaned = append(orphaned, st.Prefix)
+				if delErr := p.vpp.DelSRv6Steering(st); delErr != nil {
+					p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering bsid=%s prefix=%s: %v",
+						st.Bsid.String(), st.Prefix.String(), delErr)
+				}
+			}
+		}
+		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid}); delErr != nil {
+			p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Policy bsid=%s: %v", bsid.String(), delErr)
+		}
+	}
+
+	if len(remaining) == 0 {
+		delete(p.nodePolices, nodeip)
+	} else {
+		entry.SRv6Tunnel = remaining
+	}
+
+	// AddConnectivity only installs the highest-priority candidate per behavior;
+	// lower-priority survivors are cached but absent from VPP. Track which we
+	// install on demand here so multiple orphaned prefixes targeting the same
+	// surviving BSID don't churn the install.
+	installed := make(map[ip_types.IP6Address]struct{})
+	for _, prefix := range orphaned {
+		p.resteerOrphan(nodeip, prefix, installed)
+	}
 	return nil
+}
+
+// resteerOrphan re-points a prefix whose steering BSID just got deleted at the
+// next-best surviving policy of the matching behavior on the same endpoint. The
+// chosen policy may have never been installed in VPP (it was masked by the
+// withdrawn higher-priority candidate), so install it on demand — guarded by
+// `installed` so we install at most once per delSRPolicy call. If no candidate
+// remains the prefix is left unsteered and AddConnectivity picks it up when a
+// new candidate is later advertised.
+func (p *SRv6Provider) resteerOrphan(nodeip string, prefix ip_types.Prefix, installed map[ip_types.IP6Address]struct{}) {
+	behavior := types.SrBehaviorDT4
+	if vpplink.IsIP6(prefix.Address.ToIP()) {
+		behavior = types.SrBehaviorDT6
+	}
+	policy, err := p.getPolicyNode(nodeip, behavior)
+	if err != nil || policy == nil {
+		p.log.Infof("SRv6Provider DelConnectivity: no surviving policy for endpoint=%s prefix=%s behavior=%d; prefix left unsteered",
+			nodeip, prefix.String(), behavior)
+		return
+	}
+	if _, ok := installed[policy.Bsid]; !ok {
+		if err := p.vpp.AddModSRv6Policy(policy); err != nil {
+			p.log.Warnf("SRv6Provider DelConnectivity: AddModSRv6Policy bsid=%s for failover: %v",
+				policy.Bsid.String(), err)
+			return
+		}
+		installed[policy.Bsid] = struct{}{}
+	}
+	srSteer := &types.SrSteer{
+		TrafficType: types.SrSteerIPv4,
+		Prefix:      prefix,
+		Bsid:        policy.Bsid,
+	}
+	if vpplink.IsIP6(prefix.Address.ToIP()) {
+		srSteer.TrafficType = types.SrSteerIPv6
+	}
+	if err := p.vpp.AddSRv6Steering(srSteer); err != nil {
+		p.log.Warnf("SRv6Provider DelConnectivity: AddSRv6Steering prefix=%s bsid=%s: %v",
+			prefix.String(), policy.Bsid.String(), err)
+		return
+	}
+	p.log.Infof("SRv6Provider DelConnectivity: re-steered prefix=%s onto surviving bsid=%s behavior=%d",
+		prefix.String(), policy.Bsid.String(), behavior)
+}
+
+func (p *SRv6Provider) delPrefixSteering(cn *common.NodeConnectivity) error {
+	if p.policyIPPool.Contains(cn.Dst.IP) {
+		p.log.Debugf("SRv6Provider DelConnectivity skip policyIPPool prefix %s", cn.Dst.String())
+		return nil
+	}
+	prefix, err := ip_types.ParsePrefix(cn.Dst.String())
+	if err != nil {
+		return errors.Wrapf(err, "SRv6Provider DelConnectivity unable to parse prefix %s", cn.Dst.String())
+	}
+	if p.localSidIPPool.Contains(cn.Dst.IP) {
+		if delErr := p.vpp.RouteDel(&types.Route{
+			Dst:   prefix.ToIPNet(),
+			Paths: []types.RoutePath{{Gw: cn.NextHop.To16(), SwIfIndex: common.VppManagerInfo.GetMainSwIfIndex()}},
+		}); delErr != nil {
+			p.log.Warnf("SRv6Provider DelConnectivity: RouteDel localSidIPPool %s: %v", cn.Dst.String(), delErr)
+		}
+		return nil
+	}
+
+	nodeip := cn.NextHop.String()
+	prefixKey := prefix.String()
+	steering, listErr := p.vpp.ListSRv6Steering()
+	if listErr != nil {
+		p.log.Warnf("SRv6Provider DelConnectivity: failed to list steering: %v", listErr)
+	}
+	for _, st := range steering {
+		if st.Prefix.String() == prefixKey {
+			if delErr := p.vpp.DelSRv6Steering(st); delErr != nil {
+				p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s: %v",
+					st.Prefix.String(), st.Bsid.String(), delErr)
+			}
+		}
+	}
+
+	if entry := p.nodePrefixes[nodeip]; entry != nil {
+		remaining := entry.Prefixes[:0]
+		for _, px := range entry.Prefixes {
+			if px.String() != prefixKey {
+				remaining = append(remaining, px)
+			}
+		}
+		if len(remaining) == 0 {
+			delete(p.nodePrefixes, nodeip)
+		} else {
+			entry.Prefixes = remaining
+		}
+	}
+	return nil
+}
+
+// tunnelBsid prefers Policy.Bsid (already ip_types.IP6Address) over the net.IP
+// form. Returns ok=false only for a malformed cached tunnel where neither field
+// is set — caller should skip it.
+func tunnelBsid(t *common.SRv6Tunnel) (ip_types.IP6Address, bool) {
+	if t.Policy != nil && (t.Policy.Bsid != ip_types.IP6Address{}) {
+		return t.Policy.Bsid, true
+	}
+	if len(t.Bsid) != 0 {
+		return types.ToVppIP6Address(t.Bsid), true
+	}
+	return ip_types.IP6Address{}, false
 }
 
 // isSRv6TunnelInfoFromBGP checks whether given NodeConnectivity data is from BGP watcher that should pass
