@@ -130,6 +130,14 @@ func (s *Server) injectRoute(path *bgpapi.Path) error {
 // SIDs; multiple Segment Lists must be installed via SrPolicyMod.
 const vppMaxSRv6Sids = 16
 
+// errSRPolicyMixedBehavior is wrapped into the error returned by
+// getSRPolicy when an advertised SR Policy's Segment Lists disagree on
+// trailing endpoint behavior. injectSRv6Policy unwraps it to decide
+// whether to dispatch an SRv6PolicyDeleted event for the endpoint --
+// previously-installed state under the same NLRI key must be torn down,
+// not silently kept, when the controller's new advertisement is rejected.
+var errSRPolicyMixedBehavior = errors.New("sr policy: candidate paths disagree on endpoint behavior; this agent installs one Behavior per BSID and cannot represent the candidate-path set safely")
+
 // walkSRPolicyInnerTLVs invokes fn for every inner TLV inside the
 // TunnelEncapAttribute(s) of an SR Policy path, hiding the
 // Path -> Pattrs -> TunnelEncapAttribute.Tlvs -> Tlv.Tlvs unmarshal nest.
@@ -342,8 +350,8 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 	for i := 1; i < len(listBehaviors); i++ {
 		if listBehaviors[i] != listBehaviors[0] {
 			return nil, nil, srnrli, fmt.Errorf(
-				"sr policy endpoint=%s: segment list 0 ends with endpoint behavior %d, segment list %d ends with %d; this agent installs one Behavior per BSID and cannot represent a mixed-behavior candidate-path set safely, so the policy is rejected",
-				net.IP(srnrli.Endpoint), listBehaviors[0], i, listBehaviors[i])
+				"sr policy endpoint=%s: segment list 0 ends with endpoint behavior %d, segment list %d ends with %d: %w",
+				net.IP(srnrli.Endpoint), listBehaviors[0], i, listBehaviors[i], errSRPolicyMixedBehavior)
 		}
 	}
 	srv6tunnel.Behavior = uint8(listBehaviors[0])
@@ -356,6 +364,35 @@ func (s *Server) injectSRv6Policy(path *bgpapi.Path) error {
 	_, srv6tunnel, srnrli, err := s.getSRPolicy(path)
 
 	if err != nil {
+		// The rejected advertisement may be an UPDATE for an SR Policy that
+		// was previously accepted and installed in VPP. Keeping the old
+		// installed state would diverge from the controller's view (the
+		// controller considers the policy replaced; we silently keep the old
+		// version). For rejection paths that hit on a parseable NLRI, treat
+		// the receive-time failure as an implicit withdraw of any earlier
+		// install under the same endpoint by dispatching SRv6PolicyDeleted.
+		// SRv6Provider.DelConnectivity is currently a no-op (separate
+		// pre-existing FIXME) so the actual VPP teardown will land when
+		// that work merges; the event signal here makes the cleanup intent
+		// correct in the meantime instead of leaving a silent gap.
+		//
+		// Scoped to errSRPolicyMixedBehavior for now: only this reject
+		// path is reachable AFTER an initial accept (the receive-time
+		// validation paths in parseSegmentList / NLRI unmarshal would
+		// have rejected the first advertisement too, so there is no
+		// stale install to tear down).
+		if srnrli != nil && srnrli.Endpoint != nil && errors.Is(err, errSRPolicyMixedBehavior) {
+			s.log.Warnf("injectSRv6Policy: rejecting mixed-behavior SR Policy for endpoint=%s and signalling teardown of any prior install under the same endpoint", net.IP(srnrli.Endpoint))
+			common.SendEvent(common.CalicoVppEvent{
+				Type: common.SRv6PolicyDeleted,
+				Old: &common.NodeConnectivity{
+					Dst:              net.IPNet{},
+					NextHop:          srnrli.Endpoint,
+					ResolvedProvider: "",
+					Custom:           &common.SRv6Tunnel{Dst: net.IP(srnrli.Endpoint)},
+				},
+			})
+		}
 		return errors.Wrap(err, "error injectSRv6Policy")
 	}
 	s.log.Debugf("injectSRv6Policy: endpoint=%s, dst=%s, behavior=%d, bsid=%s, sids=%v",
