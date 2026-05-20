@@ -176,6 +176,31 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 	p.log.Infof("SRv6Provider AddConnectivity %s", cn.String())
 
 	var nodeip string
+	// orphanedBsid / orphanedBsidValid are set by the NLRI-key upsert in the
+	// SR policy branch below when the prior cache entry's BSID differs from
+	// the incoming one. The deferred cleanup runs at function exit, AFTER
+	// the CreateSRv6Tunnel loop has had a chance to re-point the steering
+	// at the new winner. Doing the DelSRv6Policy before the re-point would
+	// leave the steering hash with steer_pl->sr_policy pointing at a freed
+	// pool slot during the install/del window — packets transiting the
+	// steering in that window would hit undefined sr_policy state.
+	var orphanedBsid ip_types.IP6Address
+	var orphanedBsidValid bool
+	defer func() {
+		if !orphanedBsidValid {
+			return
+		}
+		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: orphanedBsid}); delErr != nil {
+			if isAlreadyGoneOnDelete(delErr) {
+				p.log.Debugf("SRv6Provider AddConnectivity: prior BSID %s already absent on upsert: %v",
+					orphanedBsid.String(), delErr)
+			} else {
+				p.log.Warnf("SRv6Provider AddConnectivity: prior BSID %s cleanup on upsert failed: %v",
+					orphanedBsid.String(), delErr)
+			}
+		}
+	}()
+
 	// processing normal NodeConnectivity data only IPv6 destination
 	if vpplink.IsIP6(cn.NextHop) && !p.isSRv6TunnelInfoFromBGP(cn) {
 		// destination IP can't be from policy IPPool, because this IPPool is reserved for policy BSIDs
@@ -245,16 +270,15 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		// pass (NO_SUCH_INNER_FIB on DelSRv6Steering, UNSPECIFIED on DelSRv6Policy).
 		entry := p.nodePolices[policyData.Dst.String()]
 		replaced := false
-		var orphanedBsid ip_types.IP6Address
-		var orphanedBsidValid bool
 		for i := range entry.SRv6Tunnel {
 			if entry.SRv6Tunnel[i].Color == policyData.Color && entry.SRv6Tunnel[i].Distinguisher == policyData.Distinguisher {
 				// If the prior candidate carried a different BSID, the SR Policy
-				// previously installed in VPP for it loses its only cache reference
-				// and would not be reachable from delSRPolicy on withdraw. Record
-				// it so we can tear it down after the cache mutation; the steering
-				// itself, if any, will be re-pointed by the subsequent
-				// AddSRv6Steering call (VPP's update path).
+				// installed in VPP for it (if any) loses its only cache reference
+				// and would not be reachable from delSRPolicy on withdraw. Hand
+				// it off to the function-level deferred cleanup, which fires
+				// AFTER CreateSRv6Tunnel has re-pointed the steering at the new
+				// winner — never delete a sr_policy that the steering still
+				// recursively resolves through.
 				if oldBsid, ok := tunnelBsid(&entry.SRv6Tunnel[i]); ok {
 					if newBsid, newOk := tunnelBsid(policyData); newOk && oldBsid != newBsid {
 						orphanedBsid = oldBsid
@@ -268,17 +292,6 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		}
 		if !replaced {
 			entry.SRv6Tunnel = append(entry.SRv6Tunnel, *policyData)
-		}
-		if orphanedBsidValid {
-			if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: orphanedBsid}); delErr != nil {
-				if isAlreadyGoneOnDelete(delErr) {
-					p.log.Debugf("SRv6Provider AddConnectivity: prior BSID %s for NLRI key (color=%d distinguisher=%d) already absent on upsert: %v",
-						orphanedBsid.String(), policyData.Color, policyData.Distinguisher, delErr)
-				} else {
-					p.log.Warnf("SRv6Provider AddConnectivity: prior BSID %s cleanup on upsert failed: %v",
-						orphanedBsid.String(), delErr)
-				}
-			}
 		}
 
 		// stopping processing until we have also needed normal common.NodeConnectivity data

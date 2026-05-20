@@ -19,7 +19,9 @@ import (
 )
 
 // fakeSRv6VPP records every srv6VppAPI call so tests can assert what reached
-// the dataplane and seed ListSRv6Steering output.
+// the dataplane and seed ListSRv6Steering output. callLog records the
+// interleaving across methods so ordering-sensitive tests can verify e.g.
+// "AddSRv6Steering happened before DelSRv6Policy".
 type fakeSRv6VPP struct {
 	steering []*types.SrSteer
 
@@ -29,6 +31,7 @@ type fakeSRv6VPP struct {
 	delSteering  []*types.SrSteer
 	routeAdd     []*types.Route
 	routeDel     []*types.Route
+	callLog      []string
 
 	listSteeringErr error
 	addModPolicyErr error
@@ -44,18 +47,22 @@ func (f *fakeSRv6VPP) RouteDel(r *types.Route) error                  { f.routeD
 
 func (f *fakeSRv6VPP) AddModSRv6Policy(p *types.SrPolicy) error {
 	f.addModPolicy = append(f.addModPolicy, p)
+	f.callLog = append(f.callLog, "AddModSRv6Policy:"+p.Bsid.String())
 	return f.addModPolicyErr
 }
 func (f *fakeSRv6VPP) DelSRv6Policy(p *types.SrPolicy) error {
 	f.delPolicy = append(f.delPolicy, p)
+	f.callLog = append(f.callLog, "DelSRv6Policy:"+p.Bsid.String())
 	return f.delPolicyErr
 }
 func (f *fakeSRv6VPP) AddSRv6Steering(s *types.SrSteer) error {
 	f.addSteering = append(f.addSteering, s)
+	f.callLog = append(f.callLog, "AddSRv6Steering:"+s.Bsid.String())
 	return nil
 }
 func (f *fakeSRv6VPP) DelSRv6Steering(s *types.SrSteer) error {
 	f.delSteering = append(f.delSteering, s)
+	f.callLog = append(f.callLog, "DelSRv6Steering:"+s.Bsid.String())
 	return f.delSteeringErr
 }
 func (f *fakeSRv6VPP) ListSRv6Steering() ([]*types.SrSteer, error) {
@@ -474,6 +481,68 @@ func TestAddConnectivity_BsidChangeOnUpsertCleansUpOldBsid(t *testing.T) {
 	cache := p.nodePolices[dst.String()].SRv6Tunnel
 	if len(cache) != 1 || cache[0].Policy.Bsid != newBsid {
 		t.Fatalf("expected cache to hold only new BSID %s; got %+v", newBsid.String(), cache)
+	}
+}
+
+// When the upsert changes the BSID AND prefixes are wired up for the endpoint,
+// the steering MUST be re-pointed at the new BSID BEFORE the old SR Policy is
+// deleted. Otherwise VPP's steering hash holds steer_pl->sr_policy = freed
+// pool index for the duration of the gap and packets transiting the steering
+// land on undefined state. Verified by asserting the call sequence.
+func TestAddConnectivity_BsidChangeCleansUpAfterRePoint(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	oldBsid := mustBsid(t, "cafe::aaa1")
+	newBsid := mustBsid(t, "cafe::aaa2")
+	prefix := mustPrefix(t, "fd20::5506:688f:1e5:6f80/122")
+
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+	// Pre-populate nodePrefixes so CreateSRv6Tunnel runs on each AddConnectivity.
+	p.nodePrefixes[dst.String()] = &NodeToPrefixes{Node: dst, Prefixes: []ip_types.Prefix{prefix}}
+
+	dt6Behavior := uint8(18) // bgpapi.SRv6Behavior_END_DT6
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 100,
+			Policy: &types.SrPolicy{Bsid: oldBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (old): %v", err)
+	}
+
+	// Reset call log so we observe only the upsert's calls.
+	fake.callLog = nil
+
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 100,
+			Policy: &types.SrPolicy{Bsid: newBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (new): %v", err)
+	}
+
+	addNewSteer := -1
+	delOld := -1
+	for i, op := range fake.callLog {
+		if op == "AddSRv6Steering:"+newBsid.String() && addNewSteer == -1 {
+			addNewSteer = i
+		}
+		if op == "DelSRv6Policy:"+oldBsid.String() && delOld == -1 {
+			delOld = i
+		}
+	}
+	if addNewSteer == -1 {
+		t.Fatalf("expected AddSRv6Steering(newBsid=%s) in call log; got %v", newBsid.String(), fake.callLog)
+	}
+	if delOld == -1 {
+		t.Fatalf("expected DelSRv6Policy(oldBsid=%s) in call log; got %v", oldBsid.String(), fake.callLog)
+	}
+	if !(addNewSteer < delOld) {
+		t.Fatalf("AddSRv6Steering(new) must precede DelSRv6Policy(old); got log %v (newSteer@%d, delOld@%d)",
+			fake.callLog, addNewSteer, delOld)
 	}
 }
 
