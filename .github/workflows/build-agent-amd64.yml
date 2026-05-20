@@ -1,0 +1,111 @@
+name: Build agent (amd64)
+
+# Cross-compiles calico-vpp-agent for linux/amd64 and pushes the image to
+# ghcr.io/<owner>/calicovpp/agent:<tag>. Used to iterate on agent-only changes
+# (e.g. SRv6 path) without rebuilding VPP — vpp container keeps the upstream tag.
+
+on:
+  push:
+    branches:
+      - 'fix/**'
+      - 'feat/**'
+      - 'srv6/**'
+      - 'dev/**'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build-agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+        env:
+          GOTOOLCHAIN: auto
+
+      - name: Cross-compile agent binaries (linux/amd64)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+          GOFLAGS: -buildvcs=false
+        working-directory: calico-vpp-agent
+        run: |
+          mkdir -p bin
+          go build -ldflags="-s -w" -o ./bin/felix-api-proxy   ./cmd/api-proxy
+          go build -ldflags="-s -w" -o ./bin/calico-vpp-agent  ./cmd
+          go build -ldflags="-s -w" -o ./bin/gobgp             github.com/osrg/gobgp/v3/cmd/gobgp/
+          ls -lh bin/
+
+      - name: Generate version file
+        working-directory: calico-vpp-agent
+        run: |
+          if [ -f ../vpplink/generated/generate.log ]; then
+            cat ../vpplink/generated/generate.log > version
+          else
+            git rev-parse --short=12 HEAD > version
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA=$(git rev-parse --short=12 HEAD)
+          BRANCH=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+          PREFIX="${REGISTRY}/${IMAGE_OWNER}/calicovpp/agent"
+          {
+            echo "sha=${SHA}"
+            echo "branch=${BRANCH}"
+            echo "image_sha=${PREFIX}:${BRANCH}-${SHA}"
+            echo "image_branch=${PREFIX}:${BRANCH}"
+            echo "image_latest=${PREFIX}:latest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push image (linux/amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: calico-vpp-agent
+          file: calico-vpp-agent/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.image_sha }}
+            ${{ steps.tags.outputs.image_branch }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Pushed images"
+            echo "- \`${{ steps.tags.outputs.image_sha }}\` (immutable)"
+            echo "- \`${{ steps.tags.outputs.image_branch }}\` (moving)"
+          } >> "$GITHUB_STEP_SUMMARY"
