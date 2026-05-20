@@ -245,8 +245,22 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		// pass (NO_SUCH_INNER_FIB on DelSRv6Steering, UNSPECIFIED on DelSRv6Policy).
 		entry := p.nodePolices[policyData.Dst.String()]
 		replaced := false
+		var orphanedBsid ip_types.IP6Address
+		var orphanedBsidValid bool
 		for i := range entry.SRv6Tunnel {
 			if entry.SRv6Tunnel[i].Color == policyData.Color && entry.SRv6Tunnel[i].Distinguisher == policyData.Distinguisher {
+				// If the prior candidate carried a different BSID, the SR Policy
+				// previously installed in VPP for it loses its only cache reference
+				// and would not be reachable from delSRPolicy on withdraw. Record
+				// it so we can tear it down after the cache mutation; the steering
+				// itself, if any, will be re-pointed by the subsequent
+				// AddSRv6Steering call (VPP's update path).
+				if oldBsid, ok := tunnelBsid(&entry.SRv6Tunnel[i]); ok {
+					if newBsid, newOk := tunnelBsid(policyData); newOk && oldBsid != newBsid {
+						orphanedBsid = oldBsid
+						orphanedBsidValid = true
+					}
+				}
 				entry.SRv6Tunnel[i] = *policyData
 				replaced = true
 				break
@@ -254,6 +268,17 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		}
 		if !replaced {
 			entry.SRv6Tunnel = append(entry.SRv6Tunnel, *policyData)
+		}
+		if orphanedBsidValid {
+			if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: orphanedBsid}); delErr != nil {
+				if isAlreadyGoneOnDelete(delErr) {
+					p.log.Debugf("SRv6Provider AddConnectivity: prior BSID %s for NLRI key (color=%d distinguisher=%d) already absent on upsert: %v",
+						orphanedBsid.String(), policyData.Color, policyData.Distinguisher, delErr)
+				} else {
+					p.log.Warnf("SRv6Provider AddConnectivity: prior BSID %s cleanup on upsert failed: %v",
+						orphanedBsid.String(), delErr)
+				}
+			}
 		}
 
 		// stopping processing until we have also needed normal common.NodeConnectivity data

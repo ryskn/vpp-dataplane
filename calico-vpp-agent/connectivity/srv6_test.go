@@ -419,6 +419,94 @@ func TestAddConnectivity_ReAdvertiseSameNLRIKeyReplacesInPlace(t *testing.T) {
 	}
 }
 
+// Re-advertising with the SAME NLRI key but a DIFFERENT BSID (BGP path
+// refresh updates path attributes including the BSID TLV) must tear down the
+// prior BSID in VPP. Otherwise the old SR Policy stays installed with no cache
+// reference, and a later withdraw — matched against only the new BSID — leaks
+// it permanently.
+func TestAddConnectivity_BsidChangeOnUpsertCleansUpOldBsid(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	oldBsid := mustBsid(t, "cafe::aaa1")
+	newBsid := mustBsid(t, "cafe::aaa2")
+
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+
+	// First advertisement: cached, no VPP install (no nodePrefixes wired up
+	// for the test — we just exercise the cache + cleanup path).
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst:           dst,
+			Color:         6,
+			Distinguisher: 1,
+			Priority:      100,
+			Policy:        &types.SrPolicy{Bsid: oldBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (first): %v", err)
+	}
+	if len(fake.delPolicy) != 0 {
+		t.Fatalf("expected no DelSRv6Policy on first advertisement; got %+v", fake.delPolicy)
+	}
+
+	// Re-advertisement with same NLRI key but new BSID.
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst:           dst,
+			Color:         6,
+			Distinguisher: 1,
+			Priority:      100,
+			Policy:        &types.SrPolicy{Bsid: newBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (second): %v", err)
+	}
+
+	// Old BSID must be torn down so it doesn't leak.
+	if len(fake.delPolicy) != 1 || fake.delPolicy[0].Bsid != oldBsid {
+		t.Fatalf("expected exactly one DelSRv6Policy(oldBsid=%s) on BSID change; got %+v",
+			oldBsid.String(), fake.delPolicy)
+	}
+
+	// Cache holds only the new candidate.
+	cache := p.nodePolices[dst.String()].SRv6Tunnel
+	if len(cache) != 1 || cache[0].Policy.Bsid != newBsid {
+		t.Fatalf("expected cache to hold only new BSID %s; got %+v", newBsid.String(), cache)
+	}
+}
+
+// Re-advertising the SAME NLRI key with the SAME BSID (only priority or SID
+// list changed) must NOT trigger cleanup — there is nothing to clean up.
+// Guards against the BSID-change cleanup over-firing.
+func TestAddConnectivity_SameBsidOnUpsertSkipsCleanup(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	bsid := mustBsid(t, "cafe::aaa")
+
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+
+	for _, prio := range []uint32{100, 150} {
+		if err := p.AddConnectivity(&common.NodeConnectivity{
+			NextHop: dst,
+			Custom: &common.SRv6Tunnel{
+				Dst:           dst,
+				Color:         6,
+				Distinguisher: 1,
+				Priority:      prio,
+				Policy:        &types.SrPolicy{Bsid: bsid},
+			},
+		}); err != nil {
+			t.Fatalf("AddConnectivity prio=%d: %v", prio, err)
+		}
+	}
+
+	if len(fake.delPolicy) != 0 {
+		t.Fatalf("expected no DelSRv6Policy when BSID unchanged; got %+v", fake.delPolicy)
+	}
+}
+
 // A second advertisement with a DIFFERENT NLRI key on the same endpoint must
 // coexist as a candidate path — RFC 9256 candidate-path failover relies on
 // this. This guards against the dedup logic over-applying.
