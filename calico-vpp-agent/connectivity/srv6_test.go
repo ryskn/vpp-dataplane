@@ -595,6 +595,87 @@ func TestAddConnectivity_BsidChangeSkipsCleanupWhenStillReferenced(t *testing.T)
 	}
 }
 
+// Eventual consistency: when the prior BSID couldn't be released on the
+// first upsert (steering still referenced it), it must NOT be silently
+// dropped from the cache. The next SR-policy event must re-attempt the
+// cleanup; once VPP reports the BSID is no longer steered, the deferred
+// DelSRv6Policy fires. Without the pendingBsidCleanup queue, the upsert
+// would replace the cache entry, lose the prior BSID reference, and leak
+// the SR Policy in VPP forever.
+func TestAddConnectivity_BsidChangePendingRetryOnNextEvent(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	oldBsid := mustBsid(t, "cafe::aaa1")
+	newBsid := mustBsid(t, "cafe::aaa2")
+	otherBsid := mustBsid(t, "cafe::bbb")
+	prefix := mustPrefix(t, "fd20::5506:688f:1e5:6f80/122")
+
+	// First upsert leaves OLD still referenced (re-point "failed").
+	fake := &fakeSRv6VPP{
+		steering: []*types.SrSteer{{Bsid: oldBsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}},
+	}
+	p := newTestProvider(fake)
+
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
+			Policy: &types.SrPolicy{Bsid: oldBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (old): %v", err)
+	}
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
+			Policy: &types.SrPolicy{Bsid: newBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (new): %v", err)
+	}
+
+	// After the first upsert, OLD should be queued — VPP still steers it.
+	if len(p.pendingBsidCleanup) != 1 || p.pendingBsidCleanup[0] != oldBsid {
+		t.Fatalf("expected pendingBsidCleanup=[%s] after first upsert; got %v",
+			oldBsid.String(), p.pendingBsidCleanup)
+	}
+	for _, pol := range fake.delPolicy {
+		if pol.Bsid == oldBsid {
+			t.Fatalf("DelSRv6Policy(oldBsid) must not fire while steering still resolves through it; call log %v", fake.callLog)
+		}
+	}
+
+	// Simulate VPP catching up: the steering is now repointed at otherBsid,
+	// freeing OLD for cleanup.
+	fake.steering = []*types.SrSteer{{Bsid: otherBsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}}
+
+	// A subsequent SR-policy event (different NLRI key, not related to OLD)
+	// must drain the pending queue and finally release OLD in VPP.
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 99, Priority: 50,
+			Policy: &types.SrPolicy{Bsid: otherBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (third event): %v", err)
+	}
+
+	if len(p.pendingBsidCleanup) != 0 {
+		t.Fatalf("expected pendingBsidCleanup to drain to empty; got %v", p.pendingBsidCleanup)
+	}
+	sawOldCleanup := false
+	for _, pol := range fake.delPolicy {
+		if pol.Bsid == oldBsid {
+			sawOldCleanup = true
+			break
+		}
+	}
+	if !sawOldCleanup {
+		t.Fatalf("expected DelSRv6Policy(oldBsid=%s) on retry; got call log %v", oldBsid.String(), fake.callLog)
+	}
+}
+
 // Re-advertising the SAME NLRI key with the SAME BSID (only priority or SID
 // list changed) must NOT trigger cleanup — there is nothing to clean up.
 // Guards against the BSID-change cleanup over-firing.
