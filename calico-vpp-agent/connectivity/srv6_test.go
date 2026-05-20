@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/sirupsen/logrus"
+	govppapi "go.fd.io/govpp/api"
 
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/common"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/ip_types"
@@ -31,6 +32,8 @@ type fakeSRv6VPP struct {
 
 	listSteeringErr error
 	addModPolicyErr error
+	delSteeringErr  error
+	delPolicyErr    error
 }
 
 func (f *fakeSRv6VPP) ListSRv6Localsid() ([]*types.SrLocalsid, error) { return nil, nil }
@@ -45,7 +48,7 @@ func (f *fakeSRv6VPP) AddModSRv6Policy(p *types.SrPolicy) error {
 }
 func (f *fakeSRv6VPP) DelSRv6Policy(p *types.SrPolicy) error {
 	f.delPolicy = append(f.delPolicy, p)
-	return nil
+	return f.delPolicyErr
 }
 func (f *fakeSRv6VPP) AddSRv6Steering(s *types.SrSteer) error {
 	f.addSteering = append(f.addSteering, s)
@@ -53,7 +56,7 @@ func (f *fakeSRv6VPP) AddSRv6Steering(s *types.SrSteer) error {
 }
 func (f *fakeSRv6VPP) DelSRv6Steering(s *types.SrSteer) error {
 	f.delSteering = append(f.delSteering, s)
-	return nil
+	return f.delSteeringErr
 }
 func (f *fakeSRv6VPP) ListSRv6Steering() ([]*types.SrSteer, error) {
 	return f.steering, f.listSteeringErr
@@ -362,6 +365,132 @@ func TestDelPrefixSteering_NormalPrefixDeletesSteeringAndPrunesCache(t *testing.
 }
 
 // ---------- DelConnectivity dispatcher ----------
+
+// Re-advertising an SR Policy with the SAME NLRI key (Color, Distinguisher,
+// Endpoint) must REPLACE the cached candidate in-place, not append a duplicate.
+// Without this, BGP path refresh would silently grow the cache and delSRPolicy
+// would iterate the same BSID multiple times — the second pass hits VPP with
+// an already-gone steering / policy and used to warn with NO_SUCH_INNER_FIB
+// and UNSPECIFIED.
+func TestAddConnectivity_ReAdvertiseSameNLRIKeyReplacesInPlace(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	bsidA := mustBsid(t, "cafe::aaa")
+	bsidB := mustBsid(t, "cafe::bbb")
+
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+
+	// First advertisement.
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst:           dst,
+			Color:         6,
+			Distinguisher: 1,
+			Priority:      100,
+			Policy:        &types.SrPolicy{Bsid: bsidA},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (first): %v", err)
+	}
+
+	// Re-advertisement with same NLRI key but different attrs (e.g. new BSID
+	// after a path refresh). RFC 9252 says this must REPLACE the prior entry.
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst:           dst,
+			Color:         6,
+			Distinguisher: 1,
+			Priority:      150,
+			Policy:        &types.SrPolicy{Bsid: bsidB},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (second): %v", err)
+	}
+
+	cache := p.nodePolices[dst.String()].SRv6Tunnel
+	if len(cache) != 1 {
+		t.Fatalf("expected cache to dedup to 1 entry; got %d (%+v)", len(cache), cache)
+	}
+	if cache[0].Priority != 150 || cache[0].Policy.Bsid != bsidB {
+		t.Fatalf("expected re-advertisement to replace in place (prio=150, bsid=%s); got prio=%d bsid=%s",
+			bsidB.String(), cache[0].Priority, cache[0].Policy.Bsid.String())
+	}
+}
+
+// A second advertisement with a DIFFERENT NLRI key on the same endpoint must
+// coexist as a candidate path — RFC 9256 candidate-path failover relies on
+// this. This guards against the dedup logic over-applying.
+func TestAddConnectivity_DifferentNLRIKeysCoexist(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	bsidA := mustBsid(t, "cafe::aaa")
+	bsidB := mustBsid(t, "cafe::bbb")
+
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+
+	for _, tun := range []common.SRv6Tunnel{
+		{Dst: dst, Color: 6, Distinguisher: 1, Priority: 100, Policy: &types.SrPolicy{Bsid: bsidA}},
+		{Dst: dst, Color: 6, Distinguisher: 2, Priority: 50, Policy: &types.SrPolicy{Bsid: bsidB}},
+	} {
+		tun := tun
+		if err := p.AddConnectivity(&common.NodeConnectivity{NextHop: dst, Custom: &tun}); err != nil {
+			t.Fatalf("AddConnectivity: %v (tun=%+v)", err, tun)
+		}
+	}
+
+	cache := p.nodePolices[dst.String()].SRv6Tunnel
+	if len(cache) != 2 {
+		t.Fatalf("expected 2 candidate paths to coexist; got %d (%+v)", len(cache), cache)
+	}
+}
+
+// Idempotent delete: when DelSRv6Steering reports NO_SUCH_INNER_FIB (the L3
+// key has already been removed from VPP's steering hash) and DelSRv6Policy
+// reports UNSPECIFIED (the BSID has already been removed from VPP's policy
+// hash), delSRPolicy must still complete its work. Failover re-steer must
+// run; nodePolices must be pruned.
+func TestDelSRPolicy_IdempotentWhenVPPAlreadyMissing(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	bsid := mustBsid(t, "cafe::aaa")
+	prefix := mustPrefix(t, "fd20::aaaa/128")
+	surviverBsid := mustBsid(t, "cafe::bbb")
+
+	fake := &fakeSRv6VPP{
+		steering:       []*types.SrSteer{{Bsid: bsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}},
+		delSteeringErr: govppapi.NO_SUCH_INNER_FIB,
+		delPolicyErr:   govppapi.UNSPECIFIED,
+	}
+	p := newTestProvider(fake)
+	dt6Behavior := uint8(18) // bgpapi.SRv6Behavior_END_DT6
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: bsid}},
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: surviverBsid}},
+		},
+	}
+
+	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6, Distinguisher: 0}}
+	if err := p.delSRPolicy(cn); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+
+	if len(fake.delSteering) != 1 || fake.delSteering[0].Bsid != bsid {
+		t.Fatalf("expected DelSRv6Steering(bsid=%s); got %+v", bsid.String(), fake.delSteering)
+	}
+	if len(fake.delPolicy) != 1 || fake.delPolicy[0].Bsid != bsid {
+		t.Fatalf("expected DelSRv6Policy(bsid=%s); got %+v", bsid.String(), fake.delPolicy)
+	}
+	// Failover still runs despite the VPP errors.
+	if len(fake.addModPolicy) != 1 || fake.addModPolicy[0].Bsid != surviverBsid {
+		t.Fatalf("expected AddModSRv6Policy(surviver=%s) for failover; got %+v", surviverBsid.String(), fake.addModPolicy)
+	}
+	if len(fake.addSteering) != 1 || fake.addSteering[0].Bsid != surviverBsid {
+		t.Fatalf("expected AddSRv6Steering(surviver=%s) for failover; got %+v", surviverBsid.String(), fake.addSteering)
+	}
+}
 
 func TestDelConnectivity_DispatcherRoutesByEventShape(t *testing.T) {
 	fake := &fakeSRv6VPP{}

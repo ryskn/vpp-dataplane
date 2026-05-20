@@ -9,6 +9,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	govppapi "go.fd.io/govpp/api"
 
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/common"
 	"github.com/projectcalico/vpp-dataplane/v3/config"
@@ -16,6 +17,22 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/ip_types"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
 )
+
+// isAlreadyGoneOnDelete reports whether a VPP delete-side error means "the
+// target was not in the relevant hash" — i.e. nothing to do. sr_steering_policy
+// returns NO_SUCH_INNER_FIB (-4) when the L3 key is not in the steering hash;
+// sr_policy_del returns UNSPECIFIED (-1) when the BSID is not in the SR policy
+// hash. Both are benign in a delete context.
+func isAlreadyGoneOnDelete(err error) bool {
+	if err == nil {
+		return false
+	}
+	var vppErr govppapi.VPPApiError
+	if !errors.As(err, &vppErr) {
+		return false
+	}
+	return vppErr == govppapi.NO_SUCH_INNER_FIB || vppErr == govppapi.UNSPECIFIED
+}
 
 // NodeToPrefixes is data holder for node and traffic destination prefixes (subnets) that should end in the given node
 type NodeToPrefixes struct {
@@ -219,7 +236,25 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		}
 
 		p.log.Debugf("SRv6Provider new policy %s with behavior %d on node %s and priority %d", policyData.Bsid.String(), policyData.Behavior, nodeip, policyData.Priority)
-		p.nodePolices[policyData.Dst.String()].SRv6Tunnel = append(p.nodePolices[policyData.Dst.String()].SRv6Tunnel, *policyData)
+		// RFC 9252: the NLRI key is <Distinguisher, Color, Endpoint>. The endpoint
+		// is implicit in the nodePolices map key; re-advertisement with the same
+		// (Color, Distinguisher) on the same endpoint REPLACES the prior candidate
+		// rather than coexisting. Without this, BGP path refresh or peer-state
+		// churn could leak duplicate entries into the cache, making delSRPolicy
+		// iterate the same BSID multiple times and double-delete on the second
+		// pass (NO_SUCH_INNER_FIB on DelSRv6Steering, UNSPECIFIED on DelSRv6Policy).
+		entry := p.nodePolices[policyData.Dst.String()]
+		replaced := false
+		for i := range entry.SRv6Tunnel {
+			if entry.SRv6Tunnel[i].Color == policyData.Color && entry.SRv6Tunnel[i].Distinguisher == policyData.Distinguisher {
+				entry.SRv6Tunnel[i] = *policyData
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			entry.SRv6Tunnel = append(entry.SRv6Tunnel, *policyData)
+		}
 
 		// stopping processing until we have also needed normal common.NodeConnectivity data
 		if p.nodePrefixes[nodeip] == nil {
@@ -316,13 +351,22 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 			if st.Bsid == bsid {
 				orphaned = append(orphaned, st.Prefix)
 				if delErr := p.vpp.DelSRv6Steering(st); delErr != nil {
-					p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering bsid=%s prefix=%s: %v",
-						st.Bsid.String(), st.Prefix.String(), delErr)
+					if isAlreadyGoneOnDelete(delErr) {
+						p.log.Debugf("SRv6Provider DelConnectivity: DelSRv6Steering bsid=%s prefix=%s already absent: %v",
+							st.Bsid.String(), st.Prefix.String(), delErr)
+					} else {
+						p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering bsid=%s prefix=%s: %v",
+							st.Bsid.String(), st.Prefix.String(), delErr)
+					}
 				}
 			}
 		}
 		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid}); delErr != nil {
-			p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Policy bsid=%s: %v", bsid.String(), delErr)
+			if isAlreadyGoneOnDelete(delErr) {
+				p.log.Debugf("SRv6Provider DelConnectivity: DelSRv6Policy bsid=%s already absent: %v", bsid.String(), delErr)
+			} else {
+				p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Policy bsid=%s: %v", bsid.String(), delErr)
+			}
 		}
 	}
 
@@ -414,8 +458,13 @@ func (p *SRv6Provider) delPrefixSteering(cn *common.NodeConnectivity) error {
 	for _, st := range steering {
 		if st.Prefix.String() == prefixKey {
 			if delErr := p.vpp.DelSRv6Steering(st); delErr != nil {
-				p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s: %v",
-					st.Prefix.String(), st.Bsid.String(), delErr)
+				if isAlreadyGoneOnDelete(delErr) {
+					p.log.Debugf("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s already absent: %v",
+						st.Prefix.String(), st.Bsid.String(), delErr)
+				} else {
+					p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s: %v",
+						st.Prefix.String(), st.Bsid.String(), delErr)
+				}
 			}
 		}
 	}
