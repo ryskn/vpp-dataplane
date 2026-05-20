@@ -398,6 +398,7 @@ func (w *PeerWatcher) createBGPPeer(ip string, asn uint32, peerSpec *calicov3.BG
 	typSRv6 := &common.BgpFamilySRv6IPv6
 	typvpn4 := &common.BgpFamilyUnicastIPv4VPN
 	typvpn6 := &common.BgpFamilyUnicastIPv6VPN
+	typv6 := &common.BgpFamilyUnicastIPv6
 
 	if ipAddr.IP.To4() == nil {
 		typ = &common.BgpFamilyUnicastIPv6
@@ -433,6 +434,19 @@ func (w *PeerWatcher) createBGPPeer(ip string, asn uint32, peerSpec *calicov3.BG
 				Enabled: true,
 			},
 		},
+	}
+
+	// Activate IPv6 unicast on top of typ. For IPv4-typed peers this is the
+	// MP-BGP IPv6-over-IPv4-session path (extended-nexthop), needed so an
+	// external SR-TE controller can advertise pod prefixes with IPv6 next-hops
+	// over the IPv4 BGP session. Idempotent when typ is already IPv6 unicast.
+	if ipAddr.IP.To4() != nil {
+		afiSafis = append(afiSafis, &bgpapi.AfiSafi{
+			Config: &bgpapi.AfiSafiConfig{
+				Family:  typv6,
+				Enabled: true,
+			},
+		})
 	}
 	peer := &bgpapi.Peer{
 		Conf: &bgpapi.PeerConf{
