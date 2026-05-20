@@ -546,6 +546,55 @@ func TestAddConnectivity_BsidChangeCleansUpAfterRePoint(t *testing.T) {
 	}
 }
 
+// Failure mode: CreateSRv6Tunnel below the upsert can fail (getPolicyNode
+// returned nil, AddModSRv6Policy errored, AddSRv6Steering errored), leaving
+// the steering still resolving through the prior BSID. The deferred cleanup
+// MUST NOT delete that BSID — VPP's sr_policy entry is still in use by a live
+// steering. Simulated here by seeding ListSRv6Steering with an entry that
+// continues to point at the old BSID after the upsert.
+func TestAddConnectivity_BsidChangeSkipsCleanupWhenStillReferenced(t *testing.T) {
+	dst := net.ParseIP("fd00:1::12")
+	oldBsid := mustBsid(t, "cafe::aaa1")
+	newBsid := mustBsid(t, "cafe::aaa2")
+	prefix := mustPrefix(t, "fd20::5506:688f:1e5:6f80/122")
+
+	// fake.steering reports what ListSRv6Steering returns. By leaving the
+	// pre-existing entry pointing at oldBsid we simulate VPP's view after a
+	// failed AddSRv6Steering — steer_pl->sr_policy never got re-pointed.
+	fake := &fakeSRv6VPP{
+		steering: []*types.SrSteer{{Bsid: oldBsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}},
+	}
+	p := newTestProvider(fake)
+
+	// Make CreateSRv6Tunnel a no-op for this test by not wiring nodePrefixes;
+	// the defer should still consult ListSRv6Steering before deleting.
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
+			Policy: &types.SrPolicy{Bsid: oldBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (old): %v", err)
+	}
+	if err := p.AddConnectivity(&common.NodeConnectivity{
+		NextHop: dst,
+		Custom: &common.SRv6Tunnel{
+			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
+			Policy: &types.SrPolicy{Bsid: newBsid},
+		},
+	}); err != nil {
+		t.Fatalf("AddConnectivity (new): %v", err)
+	}
+
+	for _, p := range fake.delPolicy {
+		if p.Bsid == oldBsid {
+			t.Fatalf("DelSRv6Policy(oldBsid=%s) must NOT fire while steering still resolves through it; got call log %v",
+				oldBsid.String(), fake.callLog)
+		}
+	}
+}
+
 // Re-advertising the SAME NLRI key with the SAME BSID (only priority or SID
 // list changed) must NOT trigger cleanup — there is nothing to clean up.
 // Guards against the BSID-change cleanup over-firing.

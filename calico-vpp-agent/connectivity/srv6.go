@@ -184,11 +184,31 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 	// leave the steering hash with steer_pl->sr_policy pointing at a freed
 	// pool slot during the install/del window — packets transiting the
 	// steering in that window would hit undefined sr_policy state.
+	//
+	// We also gate the cleanup on VPP's actual post-loop steering state:
+	// if CreateSRv6Tunnel above failed to install/re-point (getPolicyNode
+	// returned nil, AddModSRv6Policy errored, AddSRv6Steering errored), the
+	// steering may still resolve through the prior BSID, and pulling its
+	// SR policy out would break the live data path. Re-list and only
+	// delete when nothing references it.
 	var orphanedBsid ip_types.IP6Address
 	var orphanedBsidValid bool
 	defer func() {
 		if !orphanedBsidValid {
 			return
+		}
+		steering, listErr := p.vpp.ListSRv6Steering()
+		if listErr != nil {
+			p.log.Warnf("SRv6Provider AddConnectivity: skipping prior BSID %s cleanup; ListSRv6Steering failed: %v",
+				orphanedBsid.String(), listErr)
+			return
+		}
+		for _, st := range steering {
+			if st.Bsid == orphanedBsid {
+				p.log.Debugf("SRv6Provider AddConnectivity: prior BSID %s still steered by prefix %s; cleanup deferred",
+					orphanedBsid.String(), st.Prefix.String())
+				return
+			}
 		}
 		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: orphanedBsid}); delErr != nil {
 			if isAlreadyGoneOnDelete(delErr) {
