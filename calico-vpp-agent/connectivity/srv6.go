@@ -80,6 +80,13 @@ type SRv6Provider struct {
 	policyIPPool net.IPNet
 	// localSidIPPool is IP pool for LocalSID's SIDs (SID = IPv6 address in SRv6)
 	localSidIPPool net.IPNet
+	// pendingBsidCleanup holds prior-candidate BSIDs that the NLRI-key upsert
+	// in AddConnectivity wanted to free, but couldn't because a steering in
+	// VPP still recursively resolved through them (the re-point above either
+	// errored or was never attempted). Once removed from nodePolices the
+	// cache can't reach them again, so they'd leak. Re-checked and drained
+	// at every SR-policy AddConnectivity invocation and at delSRPolicy time.
+	pendingBsidCleanup []ip_types.IP6Address
 }
 
 func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
@@ -178,48 +185,14 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 	var nodeip string
 	// orphanedBsid / orphanedBsidValid are set by the NLRI-key upsert in the
 	// SR policy branch below when the prior cache entry's BSID differs from
-	// the incoming one. The deferred cleanup runs at function exit, AFTER
-	// the CreateSRv6Tunnel loop has had a chance to re-point the steering
-	// at the new winner. Doing the DelSRv6Policy before the re-point would
-	// leave the steering hash with steer_pl->sr_policy pointing at a freed
-	// pool slot during the install/del window — packets transiting the
-	// steering in that window would hit undefined sr_policy state.
-	//
-	// We also gate the cleanup on VPP's actual post-loop steering state:
-	// if CreateSRv6Tunnel above failed to install/re-point (getPolicyNode
-	// returned nil, AddModSRv6Policy errored, AddSRv6Steering errored), the
-	// steering may still resolve through the prior BSID, and pulling its
-	// SR policy out would break the live data path. Re-list and only
-	// delete when nothing references it.
+	// the incoming one. drainPendingBsidCleanup at function end attempts to
+	// release the prior BSID AFTER the CreateSRv6Tunnel loop has had a
+	// chance to re-point the steering, and queues the BSID on
+	// pendingBsidCleanup if VPP says it's still in use — that way a
+	// subsequent SR-policy event will retry rather than dropping the BSID
+	// on the floor (the cache loses its only reference after upsert).
 	var orphanedBsid ip_types.IP6Address
 	var orphanedBsidValid bool
-	defer func() {
-		if !orphanedBsidValid {
-			return
-		}
-		steering, listErr := p.vpp.ListSRv6Steering()
-		if listErr != nil {
-			p.log.Warnf("SRv6Provider AddConnectivity: skipping prior BSID %s cleanup; ListSRv6Steering failed: %v",
-				orphanedBsid.String(), listErr)
-			return
-		}
-		for _, st := range steering {
-			if st.Bsid == orphanedBsid {
-				p.log.Debugf("SRv6Provider AddConnectivity: prior BSID %s still steered by prefix %s; cleanup deferred",
-					orphanedBsid.String(), st.Prefix.String())
-				return
-			}
-		}
-		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: orphanedBsid}); delErr != nil {
-			if isAlreadyGoneOnDelete(delErr) {
-				p.log.Debugf("SRv6Provider AddConnectivity: prior BSID %s already absent on upsert: %v",
-					orphanedBsid.String(), delErr)
-			} else {
-				p.log.Warnf("SRv6Provider AddConnectivity: prior BSID %s cleanup on upsert failed: %v",
-					orphanedBsid.String(), delErr)
-			}
-		}
-	}()
 
 	// processing normal NodeConnectivity data only IPv6 destination
 	if vpplink.IsIP6(cn.NextHop) && !p.isSRv6TunnelInfoFromBGP(cn) {
@@ -314,10 +287,11 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 			entry.SRv6Tunnel = append(entry.SRv6Tunnel, *policyData)
 		}
 
-		// stopping processing until we have also needed normal common.NodeConnectivity data
 		if p.nodePrefixes[nodeip] == nil {
 			p.log.Debugf("SRv6Provider no prefixes for %s", nodeip)
-			return err
+			// Fall through so drainPendingBsidCleanup at function end still
+			// runs — the bottom CreateSRv6Tunnel block is already gated on
+			// nodePrefixes != nil and will skip itself.
 		}
 
 	}
@@ -343,7 +317,57 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		}
 	}
 
+	p.drainPendingBsidCleanup(orphanedBsid, orphanedBsidValid)
 	return err
+}
+
+// drainPendingBsidCleanup tries to release SR Policy BSIDs that earlier
+// NLRI-key upserts could not free because their steering reference was
+// still live in VPP. orphanedBsid (when valid) is appended to the queue
+// before the drain so the current invocation's prior BSID rides the same
+// path. A single ListSRv6Steering classifies each candidate; referenced
+// ones stay queued, the rest get DelSRv6Policy. Errors other than
+// "already gone" re-queue the BSID for the next try.
+//
+// The retry is needed because, after an in-place cache upsert, the prior
+// BSID is no longer reachable from the cache; if cleanup fails on this
+// pass it would leak permanently. Subsequent SR-policy AddConnectivity
+// invocations and delSRPolicy both call this drain to give VPP another
+// chance to release the BSID.
+func (p *SRv6Provider) drainPendingBsidCleanup(orphanedBsid ip_types.IP6Address, orphanedBsidValid bool) {
+	if orphanedBsidValid {
+		p.pendingBsidCleanup = append(p.pendingBsidCleanup, orphanedBsid)
+	}
+	if len(p.pendingBsidCleanup) == 0 {
+		return
+	}
+	steering, listErr := p.vpp.ListSRv6Steering()
+	if listErr != nil {
+		p.log.Warnf("SRv6Provider drainPendingBsidCleanup: ListSRv6Steering failed: %v; %d BSID cleanups deferred",
+			listErr, len(p.pendingBsidCleanup))
+		return
+	}
+	referenced := make(map[ip_types.IP6Address]struct{}, len(steering))
+	for _, st := range steering {
+		referenced[st.Bsid] = struct{}{}
+	}
+	queue := p.pendingBsidCleanup
+	p.pendingBsidCleanup = nil
+	for _, bsid := range queue {
+		if _, ok := referenced[bsid]; ok {
+			p.log.Debugf("SRv6Provider drainPendingBsidCleanup: BSID %s still steered; cleanup re-queued", bsid.String())
+			p.pendingBsidCleanup = append(p.pendingBsidCleanup, bsid)
+			continue
+		}
+		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid}); delErr != nil {
+			if isAlreadyGoneOnDelete(delErr) {
+				p.log.Debugf("SRv6Provider drainPendingBsidCleanup: BSID %s already absent: %v", bsid.String(), delErr)
+				continue
+			}
+			p.log.Warnf("SRv6Provider drainPendingBsidCleanup: BSID %s cleanup failed: %v; re-queued", bsid.String(), delErr)
+			p.pendingBsidCleanup = append(p.pendingBsidCleanup, bsid)
+		}
+	}
 }
 
 // DelConnectivity tears down the SRv6 forwarding state put in place by AddConnectivity.
@@ -368,6 +392,11 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 	if !ok || policyData == nil {
 		return fmt.Errorf("SRv6Provider DelConnectivity: cn.Custom is not a *common.SRv6Tunnel: %T", cn.Custom)
 	}
+	// Withdraw events may unblock a BSID that an earlier upsert couldn't
+	// release (its steering had still resolved through it at the time).
+	// Run the drain at function exit regardless of which return path
+	// fires so the pending queue gets another opportunity.
+	defer p.drainPendingBsidCleanup(ip_types.IP6Address{}, false)
 	nodeip := policyData.Dst.String()
 	entry := p.nodePolices[nodeip]
 	if entry == nil {
