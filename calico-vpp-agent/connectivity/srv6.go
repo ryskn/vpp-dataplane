@@ -245,19 +245,20 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		entry := p.nodePolices[policyData.Dst.String()]
 		replaced := false
 		for i := range entry.SRv6Tunnel {
-			if entry.SRv6Tunnel[i].Color == policyData.Color && entry.SRv6Tunnel[i].Distinguisher == policyData.Distinguisher {
-				// BSID changed: hand the prior one to the deferred cleanup
-				// (freed after the steering is re-pointed, never while live).
-				if oldBsid, ok := tunnelBsid(&entry.SRv6Tunnel[i]); ok {
-					if newBsid, newOk := tunnelBsid(policyData); newOk && oldBsid != newBsid {
-						orphanedBsid = oldBsid
-						orphanedBsidValid = true
-					}
-				}
-				entry.SRv6Tunnel[i] = *policyData
-				replaced = true
-				break
+			if entry.SRv6Tunnel[i].Color != policyData.Color || entry.SRv6Tunnel[i].Distinguisher != policyData.Distinguisher {
+				continue
 			}
+			// BSID changed: hand the prior one to the deferred cleanup
+			// (freed after the steering is re-pointed, never while live).
+			oldBsid, oldOk := tunnelBsid(&entry.SRv6Tunnel[i])
+			newBsid, newOk := tunnelBsid(policyData)
+			if oldOk && newOk && oldBsid != newBsid {
+				orphanedBsid = oldBsid
+				orphanedBsidValid = true
+			}
+			entry.SRv6Tunnel[i] = *policyData
+			replaced = true
+			break
 		}
 		if !replaced {
 			entry.SRv6Tunnel = append(entry.SRv6Tunnel, *policyData)
