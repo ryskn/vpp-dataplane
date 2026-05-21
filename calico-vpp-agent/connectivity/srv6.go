@@ -31,6 +31,31 @@ func isAlreadyGoneOnDelete(err error) bool {
 	return vppErr == govppapi.NO_SUCH_INNER_FIB || vppErr == govppapi.UNSPECIFIED
 }
 
+// delSteering deletes a steering, logging an already-gone result at debug and a
+// real failure at warn.
+func (p *SRv6Provider) delSteering(st *types.SrSteer) {
+	err := p.vpp.DelSRv6Steering(st)
+	switch {
+	case err == nil:
+	case isAlreadyGoneOnDelete(err):
+		p.log.Debugf("SRv6Provider: DelSRv6Steering bsid=%s prefix=%s already absent: %v", st.Bsid.String(), st.Prefix.String(), err)
+	default:
+		p.log.Warnf("SRv6Provider: DelSRv6Steering bsid=%s prefix=%s: %v", st.Bsid.String(), st.Prefix.String(), err)
+	}
+}
+
+// delPolicy deletes an SR policy by BSID, with the same log levels as delSteering.
+func (p *SRv6Provider) delPolicy(bsid ip_types.IP6Address) {
+	err := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid})
+	switch {
+	case err == nil:
+	case isAlreadyGoneOnDelete(err):
+		p.log.Debugf("SRv6Provider: DelSRv6Policy bsid=%s already absent: %v", bsid.String(), err)
+	default:
+		p.log.Warnf("SRv6Provider: DelSRv6Policy bsid=%s: %v", bsid.String(), err)
+	}
+}
+
 // NodeToPrefixes is data holder for node and traffic destination prefixes (subnets) that should end in the given node
 type NodeToPrefixes struct {
 	Node     net.IP
@@ -393,26 +418,13 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 	var orphaned []ip_types.Prefix
 	for _, bsid := range matched {
 		for _, st := range steering {
-			if st.Bsid == bsid {
-				orphaned = append(orphaned, st.Prefix)
-				if delErr := p.vpp.DelSRv6Steering(st); delErr != nil {
-					if isAlreadyGoneOnDelete(delErr) {
-						p.log.Debugf("SRv6Provider DelConnectivity: DelSRv6Steering bsid=%s prefix=%s already absent: %v",
-							st.Bsid.String(), st.Prefix.String(), delErr)
-					} else {
-						p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering bsid=%s prefix=%s: %v",
-							st.Bsid.String(), st.Prefix.String(), delErr)
-					}
-				}
+			if st.Bsid != bsid {
+				continue
 			}
+			orphaned = append(orphaned, st.Prefix)
+			p.delSteering(st)
 		}
-		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid}); delErr != nil {
-			if isAlreadyGoneOnDelete(delErr) {
-				p.log.Debugf("SRv6Provider DelConnectivity: DelSRv6Policy bsid=%s already absent: %v", bsid.String(), delErr)
-			} else {
-				p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Policy bsid=%s: %v", bsid.String(), delErr)
-			}
-		}
+		p.delPolicy(bsid)
 	}
 
 	if len(remaining) == 0 {
@@ -501,17 +513,10 @@ func (p *SRv6Provider) delPrefixSteering(cn *common.NodeConnectivity) error {
 		p.log.Warnf("SRv6Provider DelConnectivity: failed to list steering: %v", listErr)
 	}
 	for _, st := range steering {
-		if st.Prefix.String() == prefixKey {
-			if delErr := p.vpp.DelSRv6Steering(st); delErr != nil {
-				if isAlreadyGoneOnDelete(delErr) {
-					p.log.Debugf("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s already absent: %v",
-						st.Prefix.String(), st.Bsid.String(), delErr)
-				} else {
-					p.log.Warnf("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s: %v",
-						st.Prefix.String(), st.Bsid.String(), delErr)
-				}
-			}
+		if st.Prefix.String() != prefixKey {
+			continue
 		}
+		p.delSteering(st)
 	}
 
 	if entry := p.nodePrefixes[nodeip]; entry != nil {
