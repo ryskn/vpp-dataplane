@@ -31,31 +31,6 @@ func isAlreadyGoneOnDelete(err error) bool {
 	return vppErr == govppapi.NO_SUCH_INNER_FIB || vppErr == govppapi.UNSPECIFIED
 }
 
-// delSteering deletes a steering, logging an already-gone result at debug and a
-// real failure at warn.
-func (p *SRv6Provider) delSteering(st *types.SrSteer) {
-	err := p.vpp.DelSRv6Steering(st)
-	switch {
-	case err == nil:
-	case isAlreadyGoneOnDelete(err):
-		p.log.Debugf("SRv6Provider: DelSRv6Steering bsid=%s prefix=%s already absent: %v", st.Bsid.String(), st.Prefix.String(), err)
-	default:
-		p.log.Warnf("SRv6Provider: DelSRv6Steering bsid=%s prefix=%s: %v", st.Bsid.String(), st.Prefix.String(), err)
-	}
-}
-
-// delPolicy deletes an SR policy by BSID, with the same log levels as delSteering.
-func (p *SRv6Provider) delPolicy(bsid ip_types.IP6Address) {
-	err := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid})
-	switch {
-	case err == nil:
-	case isAlreadyGoneOnDelete(err):
-		p.log.Debugf("SRv6Provider: DelSRv6Policy bsid=%s already absent: %v", bsid.String(), err)
-	default:
-		p.log.Warnf("SRv6Provider: DelSRv6Policy bsid=%s: %v", bsid.String(), err)
-	}
-}
-
 // NodeToPrefixes is data holder for node and traffic destination prefixes (subnets) that should end in the given node
 type NodeToPrefixes struct {
 	Node     net.IP
@@ -343,19 +318,19 @@ func (p *SRv6Provider) drainPendingBsidCleanup(orphanedBsid ip_types.IP6Address,
 	queue := p.pendingBsidCleanup
 	p.pendingBsidCleanup = nil
 	for _, bsid := range queue {
-		if _, ok := referenced[bsid]; ok {
-			p.log.Debugf("SRv6Provider drainPendingBsidCleanup: BSID %s still steered; cleanup re-queued", bsid.String())
+		if _, stillSteered := referenced[bsid]; stillSteered {
+			p.log.Debugf("SRv6Provider drainPendingBsidCleanup: BSID %s still steered; re-queued", bsid)
 			p.pendingBsidCleanup = append(p.pendingBsidCleanup, bsid)
 			continue
 		}
-		if delErr := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid}); delErr != nil {
-			if isAlreadyGoneOnDelete(delErr) {
-				p.log.Debugf("SRv6Provider drainPendingBsidCleanup: BSID %s already absent: %v", bsid.String(), delErr)
-				continue
-			}
-			p.log.Warnf("SRv6Provider drainPendingBsidCleanup: BSID %s cleanup failed: %v; re-queued", bsid.String(), delErr)
-			p.pendingBsidCleanup = append(p.pendingBsidCleanup, bsid)
+		err := p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid})
+		if err == nil || isAlreadyGoneOnDelete(err) {
+			p.log.Debugf("SRv6Provider drainPendingBsidCleanup: BSID %s freed: %v", bsid, err)
+			continue
 		}
+		// Hard error: keep the BSID queued to retry on the next event.
+		p.log.Warnf("SRv6Provider drainPendingBsidCleanup: BSID %s cleanup failed: %v; re-queued", bsid, err)
+		p.pendingBsidCleanup = append(p.pendingBsidCleanup, bsid)
 	}
 }
 
@@ -411,6 +386,18 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 	if listErr != nil {
 		p.log.Warnf("SRv6Provider DelConnectivity: failed to list steering: %v", listErr)
 	}
+	// logDel: silent on success, debug when VPP says it's already gone, warn otherwise.
+	logDel := func(what string, err error) {
+		if err == nil {
+			return
+		}
+		log := p.log.Warnf
+		if isAlreadyGoneOnDelete(err) {
+			log = p.log.Debugf
+		}
+		log("SRv6Provider DelConnectivity: %s: %v", what, err)
+	}
+
 	// Track which prefixes lose their steering: after we delete this BSID,
 	// the RFC 9256 candidate-path failover wants the next-best surviving
 	// policy of the same behavior to take over. Re-steer happens below, after
@@ -422,9 +409,9 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 				continue
 			}
 			orphaned = append(orphaned, st.Prefix)
-			p.delSteering(st)
+			logDel(fmt.Sprintf("DelSRv6Steering bsid=%s prefix=%s", st.Bsid, st.Prefix), p.vpp.DelSRv6Steering(st))
 		}
-		p.delPolicy(bsid)
+		logDel(fmt.Sprintf("DelSRv6Policy bsid=%s", bsid), p.vpp.DelSRv6Policy(&types.SrPolicy{Bsid: bsid}))
 	}
 
 	if len(remaining) == 0 {
@@ -516,7 +503,13 @@ func (p *SRv6Provider) delPrefixSteering(cn *common.NodeConnectivity) error {
 		if st.Prefix.String() != prefixKey {
 			continue
 		}
-		p.delSteering(st)
+		if err := p.vpp.DelSRv6Steering(st); err != nil {
+			log := p.log.Warnf
+			if isAlreadyGoneOnDelete(err) {
+				log = p.log.Debugf
+			}
+			log("SRv6Provider DelConnectivity: DelSRv6Steering prefix=%s bsid=%s: %v", st.Prefix, st.Bsid, err)
+		}
 	}
 
 	if entry := p.nodePrefixes[nodeip]; entry != nil {
