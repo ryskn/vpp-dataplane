@@ -171,7 +171,7 @@ func (p *SRv6Provider) CreateSRv6Tunnnel(dst net.IP, prefixDst ip_types.Prefix, 
 // The SRv6 tunnel info is propagated from tunnel-ending node using BGP(see bgp_watcher.go and
 // srv6_localsid_watcher.go). After these 3 calls (and the RescanState call)
 // you get fully configured SRv6 tunnel with SR steering, SR policy, SR localsids an SRv6 traffic forwarding.
-func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) {
+func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 	p.log.Infof("SRv6Provider AddConnectivity %s", cn.String())
 
 	var nodeip string
@@ -185,7 +185,7 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		// destination IP can't be from policy IPPool, because this IPPool is reserved for policy BSIDs
 		if p.policyIPPool.Contains(cn.Dst.IP) {
 			p.log.Infof("SRv6Provider AddConnectivity no valid prefix %s", cn.Dst.String())
-			return err
+			return nil
 		}
 
 		// variables processing
@@ -221,7 +221,7 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		// from the destination node (BGP transportation)
 		if p.nodePolices[nodeip] == nil {
 			p.log.Infof("SRv6Provider no policies for %s", nodeip)
-			return err
+			return nil
 		}
 
 	} else if p.isSRv6TunnelInfoFromBGP(cn) && cn.Custom != nil { // getting SRv6 tunnel data from BGP
@@ -240,7 +240,7 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		}
 
 		p.log.Debugf("SRv6Provider new policy %s with behavior %d on node %s and priority %d", policyData.Bsid.String(), policyData.Behavior, nodeip, policyData.Priority)
-		// RFC 9252 NLRI key <Distinguisher, Color, Endpoint>: same key replaces
+		// RFC 9012 NLRI key <Distinguisher, Color, Endpoint>: same key replaces
 		// the prior candidate in place (endpoint = map key), never appends.
 		entry := p.nodePolices[policyData.Dst.String()]
 		replaced := false
@@ -294,7 +294,7 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 	}
 
 	p.drainPendingBsidCleanup(orphanedBsid, orphanedBsidValid)
-	return err
+	return nil
 }
 
 // drainPendingBsidCleanup deletes queued BSIDs no steering resolves through
@@ -559,8 +559,9 @@ func (p *SRv6Provider) getPolicyNode(nodeip string, behavior types.SrBehavior) (
 			converted := types.FromGoBGPSrBehavior(tunnel.Behavior)
 			p.log.Infof("SRv6Provider getPolicyNode: tunnel[%d] behavior=%d converted=%d want=%d match=%v policy=%v",
 				i, tunnel.Behavior, converted, behavior, converted == behavior, tunnel.Policy != nil)
-			// Skip candidates without an installed Policy; resteerOrphan would
-			// nil-deref. Strict > keeps the first candidate on a priority tie.
+			// Skip a candidate with no SrPolicy object (nil-deref guard; a nil
+			// Policy here does not imply not-installed-in-VPP). Strict > keeps
+			// the first candidate on a priority tie.
 			if tunnel.Policy == nil || converted != behavior {
 				continue
 			}
