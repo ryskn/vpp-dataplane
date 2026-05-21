@@ -1,0 +1,31 @@
+name: Sync master from upstream
+
+# Keeps this private research repo's master tracking
+# projectcalico/vpp-dataplane:master. This workflow commit is the only delta
+# on master; it is rebased onto the latest upstream master each run, so master
+# stays at "upstream + this single commit".
+
+on:
+  schedule:
+    - cron: '17 18 * * 0' # weekly, Sunday 18:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Rebase onto upstream/master and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/projectcalico/vpp-dataplane.git
+          git fetch upstream master
+          git rebase upstream/master
+          git push --force-with-lease origin master
