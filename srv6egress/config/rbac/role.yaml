@@ -7,7 +7,10 @@ metadata:
 rules:
   - apiGroups: ["srv6egress.ryskn.io"]
     resources: ["egresspolicies"]
-    verbs: ["get", "list", "watch"]
+    # update + patch are required so the controller can add/remove its
+    # finalizer (kubernetes carries finalizers in ObjectMeta, so the main
+    # resource needs write access, not just the /finalizers subresource).
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["srv6egress.ryskn.io"]
     resources: ["egresspolicies/status"]
     verbs: ["get", "update", "patch"]
