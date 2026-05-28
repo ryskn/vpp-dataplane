@@ -1,0 +1,226 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: egresspolicies.srv6egress.ryskn.io
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: srv6egress.ryskn.io
+  names:
+    kind: EgressPolicy
+    listKind: EgressPolicyList
+    plural: egresspolicies
+    singular: egresspolicy
+    shortNames:
+      - egp
+      - egpol
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Color
+          type: integer
+          jsonPath: .spec.egress.color
+        - name: Upstream
+          type: string
+          jsonPath: .status.upstream
+        - name: EgressIP
+          type: string
+          jsonPath: .status.egressIP
+        - name: Endpoint
+          type: string
+          jsonPath: .status.activeEndpoint
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=='Ready')].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          description: |
+            EgressPolicy declares per-tenant SRv6 egress path steering.
+            A namespace/pod selector picks source workloads; matched egress
+            traffic is SRv6-steered through the SR Policy resolved from
+            <color, endpoint>, then SNAT'd to a per-tenant VIP at the egress
+            gateway. Color follows RFC 9256 (color = path intent).
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - selector
+                - egress
+              properties:
+                selector:
+                  description: Source workload selector (namespace + pod labels).
+                  type: object
+                  properties:
+                    namespaceSelector:
+                      type: object
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required:
+                              - key
+                              - operator
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
+                    podSelector:
+                      type: object
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required:
+                              - key
+                              - operator
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
+                destinationCIDRs:
+                  description: |
+                    Restrict to traffic destined to these CIDRs.
+                    Empty => all off-cluster destinations.
+                  type: array
+                  items:
+                    type: string
+                    format: cidr
+                egress:
+                  description: Egress endpoint, intent (color), and VIP allocation.
+                  type: object
+                  required:
+                    - endpointSelector
+                    - color
+                    - egressIPPool
+                  properties:
+                    endpointSelector:
+                      type: object
+                      required:
+                        - nodeSelector
+                      properties:
+                        nodeSelector:
+                          type: object
+                          properties:
+                            matchLabels:
+                              type: object
+                              additionalProperties:
+                                type: string
+                            matchExpressions:
+                              type: array
+                              items:
+                                type: object
+                                required:
+                                  - key
+                                  - operator
+                                properties:
+                                  key:
+                                    type: string
+                                  operator:
+                                    type: string
+                                  values:
+                                    type: array
+                                    items:
+                                      type: string
+                    color:
+                      description: |
+                        SR Policy color (RFC 9256 §2.1). Operator-defined intent
+                        (e.g. low-latency). The bgp-controller resolves <color,
+                        endpoint> to a segment list via its config.
+                      type: integer
+                      format: int64
+                      minimum: 1
+                      maximum: 4294967295
+                    egressIPPool:
+                      description: |
+                        Calico IPPool name to allocate the per-tenant egress VIP
+                        from. SHOULD carry allowedUses: [Tunnel].
+                      type: string
+                      minLength: 1
+            status:
+              type: object
+              properties:
+                egressIP:
+                  type: string
+                activeEndpoint:
+                  type: string
+                upstream:
+                  type: string
+                srPolicy:
+                  type: object
+                  properties:
+                    bsid:
+                      type: string
+                    color:
+                      type: integer
+                      format: int64
+                    segmentList:
+                      type: array
+                      items:
+                        type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys:
+                    - type
