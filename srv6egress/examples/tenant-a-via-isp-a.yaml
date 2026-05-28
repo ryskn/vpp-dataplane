@@ -1,0 +1,39 @@
+# Example: send all egress from tenant-a namespace via ISP-A (color 100).
+# Assumes the bgp-controller config defines: color 100 -> upstream isp-a -> End.DT6 SID of egress GW.
+apiVersion: srv6egress.ryskn.io/v1alpha1
+kind: EgressPolicy
+metadata:
+  name: tenant-a-via-isp-a
+spec:
+  selector:
+    namespaceSelector:
+      matchLabels:
+        tenant: a
+    # podSelector omitted => all pods in matched namespaces
+  destinationCIDRs:
+    - "2000::/3"   # global unicast; omit for "all off-cluster"
+  egress:
+    endpointSelector:
+      nodeSelector:
+        matchLabels:
+          srv6egress.ryskn.io/role: egress
+    color: 100
+    egressIPPool: tenant-egress-pool
+---
+# A second policy: tenant-b uses ISP-B (color 200), demonstrating per-tenant path selection.
+apiVersion: srv6egress.ryskn.io/v1alpha1
+kind: EgressPolicy
+metadata:
+  name: tenant-b-via-isp-b
+spec:
+  selector:
+    namespaceSelector:
+      matchLabels:
+        tenant: b
+  egress:
+    endpointSelector:
+      nodeSelector:
+        matchLabels:
+          srv6egress.ryskn.io/role: egress
+    color: 200
+    egressIPPool: tenant-egress-pool

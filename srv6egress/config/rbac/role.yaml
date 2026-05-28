@@ -1,0 +1,43 @@
+---
+# Controller (bgp-controller VM-side or in-cluster) — full reconcile rights.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: srv6egress-controller
+rules:
+  - apiGroups: ["srv6egress.ryskn.io"]
+    resources: ["egresspolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["srv6egress.ryskn.io"]
+    resources: ["egresspolicies/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["srv6egress.ryskn.io"]
+    resources: ["egresspolicies/finalizers"]
+    verbs: ["update"]
+  # Calico IPPool access for per-tenant VIP allocation.
+  - apiGroups: ["crd.projectcalico.org"]
+    resources: ["ippools"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["crd.projectcalico.org"]
+    resources: ["ipamblocks", "ipamhandles"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # Node lookup for endpointSelector resolution.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+# Agent (calico-vpp-agent) — read-only watch on policies + status read.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: srv6egress-agent
+rules:
+  - apiGroups: ["srv6egress.ryskn.io"]
+    resources: ["egresspolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["srv6egress.ryskn.io"]
+    resources: ["egresspolicies/status"]
+    verbs: ["get"]
