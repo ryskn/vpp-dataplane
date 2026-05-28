@@ -11,7 +11,7 @@ func baseValid() *ControllerConfig {
 		},
 		Colors: map[uint32]ColorConfig{
 			100: {Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}},
-			200: {Upstream: "isp-b", SegmentList: []string{"fcff:0:0:t1::", "fcff:0:0:e0:b::"}},
+			200: {Upstream: "isp-b", SegmentList: []string{"fcff:0:0:71::", "fcff:0:0:e0:b::"}},
 		},
 	}
 }
@@ -65,9 +65,53 @@ func TestValidate_MultiSegmentTerminatesAtUpstream(t *testing.T) {
 	// transit hop then correct terminal SID — must pass.
 	c.Colors[100] = ColorConfig{
 		Upstream:    "isp-a",
-		SegmentList: []string{"fcff:0:0:t9::", "fcff:0:0:e0:a::"},
+		SegmentList: []string{"fcff:0:0:79::", "fcff:0:0:e0:a::"},
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("expected valid multi-segment config, got: %v", err)
+	}
+}
+
+// SID comparison must be by canonical IPv6 value, not raw string: an
+// equivalent but differently-written terminal SID must still pass.
+func TestValidate_TerminalSIDTextualVariantMatches(t *testing.T) {
+	c := baseValid()
+	// "fcff:0:0:e0:a::" == "fcff:0:0:e0:a:0:0:0" written without the "::".
+	c.Colors[100] = ColorConfig{
+		Upstream:    "isp-a",
+		SegmentList: []string{"fcff:0:0:e0:a:0:0:0"},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected canonical-equal terminal SID to pass, got: %v", err)
+	}
+}
+
+func TestValidate_MalformedSegmentRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		Upstream:    "isp-a",
+		SegmentList: []string{"not-an-ip"},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for malformed (non-IP) segment")
+	}
+}
+
+func TestValidate_IPv4SegmentRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		Upstream:    "isp-a",
+		SegmentList: []string{"10.0.0.1"},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error: SRv6 SIDs must be IPv6, not IPv4")
+	}
+}
+
+func TestValidate_MalformedUpstreamSIDRejected(t *testing.T) {
+	c := baseValid()
+	c.Upstreams["isp-a"] = UpstreamConfig{SID: "zzzz::nope", VRF: "upstream-a"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for malformed upstream SID")
 	}
 }
