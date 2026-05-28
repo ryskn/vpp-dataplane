@@ -1,0 +1,29 @@
+# bgp-controller operator config (color → upstream / segment list).
+#
+# RFC 9012 §3.4.2 deliberately leaves color semantics out of scope of the
+# protocol — the meaning of each color is operator-defined. This file is
+# where the operator pins that meaning for our cluster.
+#
+# Loaded by `bgp-controller --config /etc/srv6egress/controller-config.yaml`.
+
+upstreams:
+  isp-a:
+    sid: "fcff:0:0:e0:a::"     # End.DT6 SID on the egress GW for VRF upstream-A
+    vrf: upstream-a
+    egressGW: egress-1.ryskn.k8s
+  isp-b:
+    sid: "fcff:0:0:e0:b::"
+    vrf: upstream-b
+    egressGW: egress-1.ryskn.k8s
+
+colors:
+  # color 100 — "low-latency / via ISP-A"
+  100:
+    upstream: isp-a
+    segmentList:
+      - "fcff:0:0:e0:a::"
+  # color 200 — "best-effort / via ISP-B"
+  200:
+    upstream: isp-b
+    segmentList:
+      - "fcff:0:0:e0:b::"
