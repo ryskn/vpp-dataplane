@@ -65,11 +65,19 @@ func (c *ControllerConfig) Validate() error {
 		if cc.Upstream == "" {
 			return fmt.Errorf("color %d: upstream is required", color)
 		}
-		if _, ok := c.Upstreams[cc.Upstream]; !ok {
+		up, ok := c.Upstreams[cc.Upstream]
+		if !ok {
 			return fmt.Errorf("color %d: upstream %q not defined in upstreams", color, cc.Upstream)
 		}
 		if len(cc.SegmentList) == 0 {
 			return fmt.Errorf("color %d: segmentList must not be empty", color)
+		}
+		// The SR Policy terminates at the upstream's End.DT6 SID, so the last
+		// segment MUST equal that upstream's SID. Otherwise the headend would
+		// steer traffic to the wrong SID (VRF-isolation bypass / blackhole).
+		if last := cc.SegmentList[len(cc.SegmentList)-1]; last != up.SID {
+			return fmt.Errorf("color %d: last segment %q must equal upstream %q SID %q",
+				color, last, cc.Upstream, up.SID)
 		}
 	}
 	return nil
