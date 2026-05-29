@@ -6,11 +6,17 @@ import (
 	"os/exec"
 )
 
-// VPPProgrammer applies/removes a route in VPP. Implementations back this with
-// vppctl (standalone) or, in-agent, with vpplink (native VPP binary API).
+// VPPProgrammer applies/removes a route in VPP and reads back a VRF's FIB.
+// Implementations back this with vppctl (standalone) or, in-agent, with
+// vpplink (native VPP binary API).
 type VPPProgrammer interface {
 	Add(r Route) error
 	Del(r Route) error
+	// ShowFIB returns the raw `show ip6 fib table <table>` output, used to
+	// recover the set of routes this component already installed (so state is
+	// not lost across a restart). Returning an error must NOT be treated as
+	// "table is empty".
+	ShowFIB(table uint32) ([]byte, error)
 }
 
 // ExecProgrammer programs VPP by running a configurable command (the "vpp exec"
@@ -60,3 +66,16 @@ func (p *ExecProgrammer) run(vppArgs []string) error {
 
 func (p *ExecProgrammer) Add(r Route) error { return p.run(r.AddArgs()) }
 func (p *ExecProgrammer) Del(r Route) error { return p.run(r.DelArgs()) }
+
+func (p *ExecProgrammer) ShowFIB(table uint32) ([]byte, error) {
+	if len(p.Prefix) == 0 {
+		return nil, fmt.Errorf("vpp exec prefix is empty")
+	}
+	args := append(append([]string{}, p.Prefix[1:]...),
+		"show", "ip6", "fib", "table", fmt.Sprintf("%d", table))
+	out, err := p.Run(p.Prefix[0], args...)
+	if err != nil {
+		return nil, fmt.Errorf("vpp show ip6 fib table %d: %w: %s", table, err, bytes.TrimSpace(out))
+	}
+	return out, nil
+}
