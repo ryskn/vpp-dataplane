@@ -3,7 +3,6 @@ package bgp
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/go-logr/logr"
 	api "github.com/osrg/gobgp/v3/api"
@@ -21,9 +20,6 @@ type goBGPDistributor struct {
 	log  logr.Logger
 	cli  api.GobgpApiClient
 	conn *grpc.ClientConn
-
-	mu        sync.Mutex
-	announced map[string]*api.Path // policyOwner -> path (for withdraw)
 }
 
 // NewGoBGP dials a gobgp gRPC endpoint (e.g. "127.0.0.1:50051").
@@ -33,10 +29,9 @@ func NewGoBGP(addr string, log logr.Logger) (Distributor, error) {
 		return nil, fmt.Errorf("dial gobgp %s: %w", addr, err)
 	}
 	return &goBGPDistributor{
-		log:       log,
-		cli:       api.NewGobgpApiClient(conn),
-		conn:      conn,
-		announced: map[string]*api.Path{},
+		log:  log,
+		cli:  api.NewGobgpApiClient(conn),
+		conn: conn,
 	}, nil
 }
 
@@ -87,29 +82,33 @@ func (d *goBGPDistributor) Announce(ctx context.Context, policyOwner string, key
 	if err != nil {
 		return "", fmt.Errorf("build path: %w", err)
 	}
+	// AddPath is idempotent for the same NLRI (re-announce after a restart just
+	// updates the existing path), so no local bookkeeping is needed.
 	if _, err := d.cli.AddPath(ctx, &api.AddPathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
 		return "", fmt.Errorf("gobgp AddPath: %w", err)
 	}
-	d.mu.Lock()
-	d.announced[policyOwner] = path
-	d.mu.Unlock()
 	d.log.Info("announced SR Policy via gobgp",
 		"owner", policyOwner, "color", key.Color, "endpoint", key.Endpoint, "sid", sid)
 	return sid, nil
 }
 
-func (d *goBGPDistributor) Withdraw(ctx context.Context, policyOwner string) error {
-	d.mu.Lock()
-	path, ok := d.announced[policyOwner]
-	delete(d.announced, policyOwner)
-	d.mu.Unlock()
-	if !ok {
-		return nil // idempotent
+// Withdraw rebuilds the route from the key + segmentList (no in-memory state),
+// so it works even after a controller restart — the reconciler replays it from
+// the EgressPolicy's persisted status, leaving no stale gobgp route.
+func (d *goBGPDistributor) Withdraw(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) error {
+	if len(segmentList) == 0 {
+		return nil // nothing was announced (policy never went Ready)
+	}
+	sid := segmentList[len(segmentList)-1]
+	path, err := coloredHostPath(sid, key.Color)
+	if err != nil {
+		return fmt.Errorf("build path: %w", err)
 	}
 	if _, err := d.cli.DeletePath(ctx, &api.DeletePathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
 		return fmt.Errorf("gobgp DeletePath: %w", err)
 	}
-	d.log.Info("withdrew SR Policy via gobgp", "owner", policyOwner)
+	d.log.Info("withdrew SR Policy via gobgp",
+		"owner", policyOwner, "color", key.Color, "sid", sid)
 	return nil
 }
 

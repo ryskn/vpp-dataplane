@@ -10,7 +10,6 @@ package bgp
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/go-logr/logr"
 )
@@ -29,31 +28,32 @@ type PolicyKey struct {
 // Announce returns the chosen BSID for the policy. Implementations MAY
 // generate a BSID from the controller's BSID pool, or accept one provided
 // externally; for the v1alpha1 stub we synthesize a deterministic string.
+//
+// Withdraw takes the same key + segmentList as Announce so the route can be
+// reconstructed and deleted WITHOUT relying on in-memory state. This keeps the
+// distributor restart-safe: a policy deleted while the controller was down is
+// still torn down correctly on restart (the reconciler replays Withdraw from
+// the EgressPolicy's persisted status), so no stale BGP route is left behind.
 type Distributor interface {
 	Announce(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) (bsid string, err error)
-	Withdraw(ctx context.Context, policyOwner string) error
+	Withdraw(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) error
 }
 
 // NewLoggingStub returns a Distributor that only logs operations.
 // Use during bring-up and unit tests. Replace with gobgp-backed impl for
 // real BGP distribution.
 func NewLoggingStub(log logr.Logger) Distributor {
-	return &loggingStub{log: log, announced: make(map[string]PolicyKey)}
+	return &loggingStub{log: log}
 }
 
 type loggingStub struct {
-	log       logr.Logger
-	mu        sync.Mutex
-	announced map[string]PolicyKey // policyOwner → key
+	log logr.Logger
 }
 
 func (s *loggingStub) Announce(_ context.Context, owner string, key PolicyKey, segmentList []string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(segmentList) == 0 {
 		return "", fmt.Errorf("segmentList must not be empty")
 	}
-	s.announced[owner] = key
 	bsid := fmt.Sprintf("stub-bsid:%s:%d", key.Endpoint, key.Color)
 	s.log.Info("announce SR Policy (stub)",
 		"owner", owner, "color", key.Color, "endpoint", key.Endpoint,
@@ -61,17 +61,9 @@ func (s *loggingStub) Announce(_ context.Context, owner string, key PolicyKey, s
 	return bsid, nil
 }
 
-func (s *loggingStub) Withdraw(_ context.Context, owner string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key, ok := s.announced[owner]
-	if !ok {
-		// idempotent
-		return nil
-	}
-	delete(s.announced, owner)
+func (s *loggingStub) Withdraw(_ context.Context, owner string, key PolicyKey, segmentList []string) error {
 	s.log.Info("withdraw SR Policy (stub)",
-		"owner", owner, "color", key.Color, "endpoint", key.Endpoint)
+		"owner", owner, "color", key.Color, "endpoint", key.Endpoint, "segmentList", segmentList)
 	return nil
 }
 
