@@ -16,8 +16,11 @@
 package routesync
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 )
 
@@ -140,6 +143,74 @@ func DesiredRoutes(rib map[string]string, cfg *Config) []Route {
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].Key() < routes[j].Key() })
 	return routes
+}
+
+// fibPrefixRe matches a FIB entry header line, e.g. "2001:db8:a::/64 fib:11 ..."
+// or "::/0" / "fe80::/10" (prefix at column 0).
+var fibPrefixRe = regexp.MustCompile(`^([0-9A-Fa-f:]+/\d+)`)
+
+// fibViaRe matches a forwarding via line, e.g.
+// "[@0]: ipv6 via fda1::1 virtio-0/0/12/0: mtu:1500 ...".
+var fibViaRe = regexp.MustCompile(`via (\S+) (\S+?):`)
+
+// ParseOwnedRoutes parses `show ip6 fib table <table>` output and returns the
+// routes this component owns in that table — i.e. those whose next-hop is one
+// of our upstream peers. This lets the syncer recover its installed set from
+// VPP itself (source of truth) instead of trusting in-memory state that is
+// lost across a restart. Routes installed by Calico or others (different
+// next-hop) are ignored, so we never delete what we did not install.
+func ParseOwnedRoutes(raw []byte, table uint32, peers map[string]Upstream) []Route {
+	var routes []Route
+	seen := map[string]bool{}
+	curPrefix := ""
+	sc := bufio.NewScanner(bytes.NewReader(raw))
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+			if m := fibPrefixRe.FindStringSubmatch(line); m != nil {
+				curPrefix = m[1]
+			} else {
+				curPrefix = "" // header / unrelated top-level line
+			}
+			continue
+		}
+		if curPrefix == "" || seen[curPrefix] {
+			continue
+		}
+		if m := fibViaRe.FindStringSubmatch(line); m != nil {
+			via, iface := m[1], m[2]
+			if up, ok := peers[via]; ok {
+				routes = append(routes, Route{
+					Prefix:    curPrefix,
+					Table:     table,
+					Via:       via,
+					Interface: iface,
+				})
+				_ = up
+				seen[curPrefix] = true
+			}
+		}
+	}
+	sort.Slice(routes, func(i, j int) bool { return routes[i].Key() < routes[j].Key() })
+	return routes
+}
+
+// PeerIndex exposes the peer->upstream map for callers needing ownership info.
+func (c *Config) PeerIndex() map[string]Upstream { return c.byPeer() }
+
+// Tables returns the distinct VRF tables referenced by the config.
+func (c *Config) Tables() []uint32 {
+	seen := map[uint32]bool{}
+	var out []uint32
+	for _, u := range c.Upstreams {
+		if !seen[u.Table] {
+			seen[u.Table] = true
+			out = append(out, u.Table)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Reconcile diffs desired vs installed and returns the routes to add and to

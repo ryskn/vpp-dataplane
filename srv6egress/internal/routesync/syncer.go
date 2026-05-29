@@ -53,21 +53,22 @@ func ExecRIBFetcher(gobgpPrefix []string) RIBFetcher {
 }
 
 // Syncer reconciles the gobgp RIB into VPP VRF FIBs on an interval.
+//
+// It holds NO in-memory ownership state: on every pass the "installed" set is
+// read back from VPP itself (the routes in our VRF tables whose next-hop is one
+// of our upstream peers). This makes the syncer self-healing and, critically,
+// correct across restarts — a route installed before a restart and withdrawn
+// while the syncer was down is still discovered in VPP and removed.
 type Syncer struct {
 	Cfg      *Config
 	Fetch    RIBFetcher
 	VPP      VPPProgrammer
 	Log      logr.Logger
 	Interval time.Duration
-
-	installed map[string]Route // Key -> Route currently programmed
 }
 
 // Run loops until ctx is cancelled, reconciling each interval.
 func (s *Syncer) Run(ctx context.Context) error {
-	if s.installed == nil {
-		s.installed = map[string]Route{}
-	}
 	t := time.NewTicker(s.Interval)
 	defer t.Stop()
 	// Reconcile immediately, then on each tick.
@@ -80,6 +81,23 @@ func (s *Syncer) Run(ctx context.Context) error {
 			s.reconcileOnce(ctx)
 		}
 	}
+}
+
+// installedFromVPP reads every configured VRF table and returns the routes we
+// own (next-hop ∈ our peers). If any table read fails it returns an error so
+// the caller can skip this pass rather than risk deleting live routes based on
+// an incomplete view.
+func (s *Syncer) installedFromVPP() ([]Route, error) {
+	peers := s.Cfg.PeerIndex()
+	var installed []Route
+	for _, table := range s.Cfg.Tables() {
+		raw, err := s.VPP.ShowFIB(table)
+		if err != nil {
+			return nil, err
+		}
+		installed = append(installed, ParseOwnedRoutes(raw, table, peers)...)
+	}
+	return installed, nil
 }
 
 func (s *Syncer) reconcileOnce(ctx context.Context) {
@@ -95,18 +113,20 @@ func (s *Syncer) reconcileOnce(ctx context.Context) {
 	}
 	desired := DesiredRoutes(rib, s.Cfg)
 
-	installedList := make([]Route, 0, len(s.installed))
-	for _, r := range s.installed {
-		installedList = append(installedList, r)
+	installed, err := s.installedFromVPP()
+	if err != nil {
+		// Do NOT proceed with a partial view: deleting based on it could remove
+		// routes that are actually still wanted.
+		s.Log.Error(err, "read installed routes from VPP; skipping this pass")
+		return
 	}
-	add, del := Reconcile(desired, installedList)
 
+	add, del := Reconcile(desired, installed)
 	for _, r := range add {
 		if err := s.VPP.Add(r); err != nil {
 			s.Log.Error(err, "install route", "prefix", r.Prefix, "table", r.Table, "via", r.Via)
 			continue
 		}
-		s.installed[r.Key()] = r
 		s.Log.Info("installed route", "prefix", r.Prefix, "table", r.Table, "via", r.Via, "iface", r.Interface)
 	}
 	for _, r := range del {
@@ -114,7 +134,6 @@ func (s *Syncer) reconcileOnce(ctx context.Context) {
 			s.Log.Error(err, "remove route", "prefix", r.Prefix, "table", r.Table, "via", r.Via)
 			continue
 		}
-		delete(s.installed, r.Key())
-		s.Log.Info("removed route", "prefix", r.Prefix, "table", r.Table, "via", r.Via)
+		s.Log.Info("removed stale route", "prefix", r.Prefix, "table", r.Table, "via", r.Via)
 	}
 }
