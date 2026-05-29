@@ -49,6 +49,10 @@ func main() {
 		metricsAddr          string
 		probeAddr            string
 		enableLeaderElection bool
+		vipBackend           string
+		bgpBackend           string
+		gobgpAddr            string
+		kubeconfig           string
 	)
 	flag.StringVar(&configPath, "config", "/etc/srv6egress/controller-config.yaml",
 		"Path to the operator-supplied controller config (color/upstream mapping).")
@@ -56,9 +60,24 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for liveness/readiness probes.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election (set when running multiple controller replicas).")
+	flag.StringVar(&vipBackend, "vip-backend", "memory",
+		"VIP allocator backend: 'calico' (Calico IPAM) or 'memory' (in-memory stub).")
+	flag.StringVar(&bgpBackend, "bgp-backend", "stub",
+		"BGP distributor backend: 'gobgp' (real gRPC) or 'stub' (logging only).")
+	flag.StringVar(&gobgpAddr, "gobgp-addr", "127.0.0.1:50051",
+		"gobgp gRPC address (used when --bgp-backend=gobgp).")
+	// NOTE: do not register --kubeconfig here; controller-runtime's
+	// pkg/client/config already registers it. We read its value after Parse
+	// (used by --vip-backend=calico; empty = in-cluster).
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	// controller-runtime registers --kubeconfig; pick up its value for the
+	// Calico IPAM backend.
+	if f := flag.Lookup("kubeconfig"); f != nil {
+		kubeconfig = f.Value.String()
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("bgp-controller")
@@ -84,16 +103,41 @@ func main() {
 		os.Exit(1)
 	}
 
-	// v1alpha1: stub allocator + stub BGP distributor.
-	// Production: swap these for Calico-IPAM and gobgp-backed implementations.
-	// The BGP stub does NOT emit real BGP UPDATEs (no Color Extended Community
-	// is sent), so headends receive no SR Policy — loudly warn operators that
-	// this build does not actually steer traffic.
-	log.Info("WARNING: v1alpha1 build uses STUB BGP distributor and STUB VIP allocator — " +
-		"no real BGP UPDATE is sent and VIPs are synthetic placeholders; " +
-		"NOT for production traffic steering")
-	vipAlloc := vipalloc.NewInMemory()
-	bgpDist := bgp.NewLoggingStub(log.WithName("bgp"))
+	// Select backends. Defaults are the stubs (no external deps); production
+	// deployments pass --vip-backend=calico --bgp-backend=gobgp.
+	var vipAlloc vipalloc.Allocator
+	switch vipBackend {
+	case "calico":
+		vipAlloc, err = vipalloc.NewCalico(kubeconfig)
+		if err != nil {
+			log.Error(err, "init Calico IPAM VIP allocator")
+			os.Exit(1)
+		}
+		log.Info("VIP backend: Calico IPAM")
+	case "memory":
+		vipAlloc = vipalloc.NewInMemory()
+		log.Info("WARNING: VIP backend is in-memory stub (synthetic VIPs; not for production)")
+	default:
+		log.Error(fmt.Errorf("unknown vip-backend %q", vipBackend), "invalid flag")
+		os.Exit(1)
+	}
+
+	var bgpDist bgp.Distributor
+	switch bgpBackend {
+	case "gobgp":
+		bgpDist, err = bgp.NewGoBGP(gobgpAddr, log.WithName("bgp"))
+		if err != nil {
+			log.Error(err, "init gobgp distributor")
+			os.Exit(1)
+		}
+		log.Info("BGP backend: gobgp", "addr", gobgpAddr)
+	case "stub":
+		bgpDist = bgp.NewLoggingStub(log.WithName("bgp"))
+		log.Info("WARNING: BGP backend is logging stub (no real BGP UPDATE; not for production)")
+	default:
+		log.Error(fmt.Errorf("unknown bgp-backend %q", bgpBackend), "invalid flag")
+		os.Exit(1)
+	}
 
 	if err := (&controller.EgressPolicyReconciler{
 		Client: mgr.GetClient(),
