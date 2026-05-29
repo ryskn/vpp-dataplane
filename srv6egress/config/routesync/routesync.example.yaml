@@ -1,0 +1,15 @@
+# vpp-route-sync config: maps each eBGP upstream peer (route next-hop) to the
+# VPP VRF table + egress interface its learned routes are installed into.
+#
+# These tables/SIDs match the controller-config example:
+#   isp-a -> End.DT6 fcff:0:0:e0:a:: -> VRF table 100
+#   isp-b -> End.DT6 fcff:0:0:e0:b:: -> VRF table 200
+#
+# Loaded by `vpp-route-sync --config /etc/srv6egress/routesync.yaml`.
+upstreams:
+  - peer: "fda1::1"           # sim-isp-a eBGP peer (== route next-hop)
+    table: 100                # VPP VRF for upstream-A (End.DT6 fcff:0:0:e0:a::)
+    interface: "virtio-0/0/12/0"
+  - peer: "fda2::1"           # sim-isp-b eBGP peer
+    table: 200                # VPP VRF for upstream-B (End.DT6 fcff:0:0:e0:b::)
+    interface: "virtio-0/0/12/0"
