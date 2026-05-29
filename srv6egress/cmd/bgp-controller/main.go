@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -112,6 +113,17 @@ func main() {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		log.Error(err, "add readyz")
 		os.Exit(1)
+	}
+
+	// Re-register VIPs already recorded in EgressPolicy statuses BEFORE the
+	// manager starts reconciling. Uses the direct API reader (no cache needed
+	// pre-Start). This makes the restart-collision fix order-independent: every
+	// existing VIP is known to the allocator before any reconcile can allocate.
+	if n, err := controller.RehydrateVIPs(context.Background(), mgr.GetAPIReader(), vipAlloc); err != nil {
+		log.Error(err, "rehydrate VIP allocations")
+		os.Exit(1)
+	} else {
+		log.Info("rehydrated existing VIP allocations", "count", n)
 	}
 
 	log.Info("starting bgp-controller", "version", versionString())

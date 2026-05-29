@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerruntimecfg "sigs.k8s.io/controller-runtime/pkg/controller"
 
 	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
@@ -288,10 +289,41 @@ func setReady(ep *srv6egressv1alpha1.EgressPolicy, status metav1.ConditionStatus
 	ep.Status.Conditions = append(ep.Status.Conditions, cond)
 }
 
+// RehydrateVIPs re-registers every already-allocated egress VIP into the
+// allocator BEFORE any reconcile runs. This must be called once at startup
+// (with a direct API reader, before the manager's caches/controllers start),
+// otherwise the restart-collision fix is order-dependent: a freshly created
+// policy could allocate a synthetic VIP that an existing policy still holds in
+// its status, because reconcile order is arbitrary.
+//
+// reader should be the manager's API reader (mgr.GetAPIReader()), which talks
+// directly to the API server and works before mgr.Start().
+func RehydrateVIPs(ctx context.Context, reader client.Reader, vips vipalloc.Allocator) (int, error) {
+	var list srv6egressv1alpha1.EgressPolicyList
+	if err := reader.List(ctx, &list); err != nil {
+		return 0, fmt.Errorf("rehydrate: list egresspolicies: %w", err)
+	}
+	n := 0
+	for i := range list.Items {
+		ep := &list.Items[i]
+		if ep.Status.EgressIP == "" {
+			continue
+		}
+		if err := vips.Register(ctx, string(ep.UID), ep.Status.EgressIP); err != nil {
+			return n, fmt.Errorf("rehydrate: register %s (%s): %w", ep.Name, ep.Status.EgressIP, err)
+		}
+		n++
+	}
+	return n, nil
+}
+
 // SetupWithManager wires the reconciler into the controller-runtime manager.
+// MaxConcurrentReconciles is pinned to 1 so the <color, endpoint> uniqueness
+// check (findColorEndpointConflict) is first-writer-wins and deterministic.
 func (r *EgressPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&srv6egressv1alpha1.EgressPolicy{}).
+		WithOptions(controllerruntimecfg.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
 
