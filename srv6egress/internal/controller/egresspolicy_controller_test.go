@@ -110,6 +110,24 @@ func newReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler 
 	}
 }
 
+// recordingBGP records the args of the last Announce/Withdraw.
+type recordingBGP struct {
+	wOwner string
+	wKey   bgp.PolicyKey
+	wSegs  []string
+}
+
+func (b *recordingBGP) Announce(_ context.Context, _ string, key bgp.PolicyKey, segs []string) (string, error) {
+	if len(segs) == 0 {
+		return "", nil
+	}
+	return segs[len(segs)-1], nil
+}
+func (b *recordingBGP) Withdraw(_ context.Context, owner string, key bgp.PolicyKey, segs []string) error {
+	b.wOwner, b.wKey, b.wSegs = owner, key, segs
+	return nil
+}
+
 func reconcile(t *testing.T, r *EgressPolicyReconciler, name string) error {
 	t.Helper()
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -242,5 +260,54 @@ func TestRehydrateVIPs_RegistersExistingThenNoCollision(t *testing.T) {
 	}
 	if nw.Status.EgressIP != "pool:tenant-egress-pool:2" {
 		t.Fatalf("expected counter advanced to :2 after rehydrate, got %q", nw.Status.EgressIP)
+	}
+}
+
+// Delete must withdraw the route using the PERSISTED announced color/segments
+// from status, not the (possibly edited) mutable spec — otherwise it would try
+// to delete a route that was never advertised and leave the real one stale.
+func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
+	ctx := context.Background()
+	rec := &recordingBGP{}
+	s := testScheme(t)
+	c := fakeclient.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
+			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
+		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
+		Build()
+	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
+		VIPs: vipalloc.NewInMemory(), BGP: rec}
+
+	// Announce with color 100 → status.srPolicy.color = 100.
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// Edit spec.egress.color to 200 (simulate a spec change), then delete.
+	var ep srv6egressv1alpha1.EgressPolicy
+	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Status.SRPolicy == nil || ep.Status.SRPolicy.Color != 100 {
+		t.Fatalf("precondition: expected status.srPolicy.color=100, got %+v", ep.Status.SRPolicy)
+	}
+	ep.Spec.Egress.Color = 200
+	if err := r.Update(ctx, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &ep); err != nil { // sets deletionTimestamp (finalizer present)
+		t.Fatal(err)
+	}
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcileDelete: %v", err)
+	}
+
+	// Withdraw must use the announced color (100), not the edited spec (200).
+	if rec.wKey.Color != 100 {
+		t.Fatalf("Withdraw used color %d, want persisted announced 100", rec.wKey.Color)
+	}
+	if len(rec.wSegs) == 0 || rec.wSegs[len(rec.wSegs)-1] != "fcff:0:0:e0:a::" {
+		t.Fatalf("Withdraw used segments %v, want the announced color-100 list", rec.wSegs)
 	}
 }

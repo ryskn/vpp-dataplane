@@ -161,13 +161,17 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 	}
 
 	owner := string(ep.UID)
-	// Rebuild the SR Policy key + segment list from persisted status so the
-	// BGP route is withdrawn correctly even after a controller restart (the
-	// in-memory announce cache would be empty). If the policy never went Ready,
-	// SRPolicy is nil and Withdraw is a no-op.
-	key := bgp.PolicyKey{Color: ep.Spec.Egress.Color, Endpoint: ep.Status.ActiveEndpoint}
+	// Rebuild the SR Policy key + segment list from the PERSISTED ANNOUNCED
+	// values in status (not the mutable spec): the route in BGP was announced
+	// with status.srPolicy.{color,segmentList}, which may differ from the
+	// current spec if it was edited. Using status guarantees we delete exactly
+	// what we added — and it works after a controller restart too (the in-memory
+	// announce cache would be empty). If the policy never went Ready, SRPolicy
+	// is nil and Withdraw is a no-op.
+	key := bgp.PolicyKey{Endpoint: ep.Status.ActiveEndpoint}
 	var segs []string
 	if ep.Status.SRPolicy != nil {
+		key.Color = ep.Status.SRPolicy.Color
 		segs = ep.Status.SRPolicy.SegmentList
 	}
 	if err := r.BGP.Withdraw(ctx, owner, key, segs); err != nil {
