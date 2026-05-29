@@ -43,9 +43,11 @@ func testConfig() *config.ControllerConfig {
 	return &config.ControllerConfig{
 		Upstreams: map[string]config.UpstreamConfig{
 			"isp-a": {SID: "fcff:0:0:e0:a::", VRF: "upstream-a"},
+			"isp-b": {SID: "fcff:0:0:e0:b::", VRF: "upstream-b"},
 		},
 		Colors: map[uint32]config.ColorConfig{
 			100: {Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}},
+			200: {Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}},
 		},
 	}
 }
@@ -197,5 +199,48 @@ func TestReconcile_IPPoolMissingRejected(t *testing.T) {
 	c := getReady(t, r, "tenant-a")
 	if c.Reason != "InvalidEgressIPPool" {
 		t.Fatalf("expected InvalidEgressIPPool, got %s", c.Reason)
+	}
+}
+
+// Finding #1 (order-independence): RehydrateVIPs must register every existing
+// VIP from status before any reconcile, so a newly created policy reconciled
+// BEFORE the old policy is re-seen still cannot be handed a colliding VIP.
+func TestRehydrateVIPs_RegistersExistingThenNoCollision(t *testing.T) {
+	ctx := context.Background()
+
+	// Existing policy with a VIP already recorded in status (survived restart).
+	existing := newPolicy("tenant-old", "uid-old", 100, "tenant-egress-pool")
+	existing.Status.EgressIP = "pool:tenant-egress-pool:1"
+
+	r := newReconciler(t,
+		egressNode("egress-1"),
+		ippool("tenant-egress-pool", "Tunnel"),
+		existing,
+		// brand-new policy created around restart time, no status yet.
+		newPolicy("tenant-new", "uid-new", 200, "tenant-egress-pool"),
+	)
+
+	// Startup rehydrate (uses the same client as reader).
+	n, err := RehydrateVIPs(ctx, r.Client, r.VIPs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 VIP rehydrated, got %d", n)
+	}
+
+	// Now reconcile the NEW policy FIRST (the order that previously collided).
+	if err := reconcile(t, r, "tenant-new"); err != nil {
+		t.Fatalf("reconcile tenant-new: %v", err)
+	}
+	var nw srv6egressv1alpha1.EgressPolicy
+	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-new"}, &nw); err != nil {
+		t.Fatal(err)
+	}
+	if nw.Status.EgressIP == "pool:tenant-egress-pool:1" {
+		t.Fatalf("collision: tenant-new got the VIP already held by tenant-old (%s)", nw.Status.EgressIP)
+	}
+	if nw.Status.EgressIP != "pool:tenant-egress-pool:2" {
+		t.Fatalf("expected counter advanced to :2 after rehydrate, got %q", nw.Status.EgressIP)
 	}
 }
