@@ -16,8 +16,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -26,6 +28,17 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/vipalloc"
 )
+
+// calicoIPPoolGVK identifies the Calico IPPool CRD used for egress VIP pools.
+var calicoIPPoolGVK = schema.GroupVersionKind{
+	Group:   "crd.projectcalico.org",
+	Version: "v1",
+	Kind:    "IPPool",
+}
+
+// tunnelAllowedUse is the IPPool allowedUses value that isolates a pool from
+// pod IPAM, making it safe to draw egress VIPs from (see design issue #5 §5.3).
+const tunnelAllowedUse = "Tunnel"
 
 const finalizerName = "srv6egress.ryskn.io/finalizer"
 
@@ -43,6 +56,7 @@ type EgressPolicyReconciler struct {
 // +kubebuilder:rbac:groups=srv6egress.ryskn.io,resources=egresspolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=crd.projectcalico.org,resources=ippools,verbs=get;list;watch
 
 // Reconcile performs one reconciliation pass.
 func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -81,10 +95,30 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.markNotReady(ctx, &ep, "EndpointResolution", err.Error())
 	}
 
+	// 2b) Enforce RFC 9256 §2 SR Policy uniqueness: <color, endpoint> must be
+	// unique cluster-wide. Reject if another EgressPolicy already owns it.
+	if conflict, err := r.findColorEndpointConflict(ctx, &ep, endpoint); err != nil {
+		return ctrl.Result{}, err
+	} else if conflict != "" {
+		return r.markNotReady(ctx, &ep, "DuplicateColorEndpoint",
+			fmt.Sprintf("color %d + endpoint %q already used by EgressPolicy %q",
+				ep.Spec.Egress.Color, endpoint, conflict))
+	}
+
 	// 3) Allocate VIP (idempotent by EgressPolicy UID).
 	policyOwner := string(ep.UID)
 	vip := ep.Status.EgressIP
-	if vip == "" {
+	if vip != "" {
+		// Recover prior allocation after a controller restart so the in-memory
+		// allocator never reissues this VIP to another policy.
+		if err := r.VIPs.Register(ctx, policyOwner, vip); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		// Validate the named pool is egress-safe before allocating.
+		if err := r.validateEgressIPPool(ctx, ep.Spec.Egress.EgressIPPool); err != nil {
+			return r.markNotReady(ctx, &ep, "InvalidEgressIPPool", err.Error())
+		}
 		vip, err = r.VIPs.Allocate(ctx, policyOwner, ep.Spec.Egress.EgressIPPool)
 		if err != nil {
 			return r.markNotReady(ctx, &ep, "VIPAllocation", err.Error())
@@ -167,6 +201,62 @@ func (r *EgressPolicyReconciler) resolveEndpoint(ctx context.Context, es srv6egr
 		}
 		return "", fmt.Errorf("v1alpha1 requires exactly one matching node, got %d: %v", len(nodes.Items), names)
 	}
+}
+
+// findColorEndpointConflict returns the name of another (non-deleting)
+// EgressPolicy that already occupies the same <color, endpoint> tuple, or "".
+// A peer is considered to occupy the tuple once its reconcile has recorded the
+// resolved endpoint in status.activeEndpoint. Reconciles are serialized
+// (MaxConcurrentReconciles=1), so the first writer wins and later duplicates
+// are rejected deterministically.
+func (r *EgressPolicyReconciler) findColorEndpointConflict(ctx context.Context, me *srv6egressv1alpha1.EgressPolicy, endpoint string) (string, error) {
+	var list srv6egressv1alpha1.EgressPolicyList
+	if err := r.List(ctx, &list); err != nil {
+		return "", fmt.Errorf("list egresspolicies: %w", err)
+	}
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.UID == me.UID {
+			continue
+		}
+		if !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if other.Spec.Egress.Color == me.Spec.Egress.Color &&
+			other.Status.ActiveEndpoint == endpoint {
+			return other.Name, nil
+		}
+	}
+	return "", nil
+}
+
+// validateEgressIPPool verifies the named Calico IPPool exists and carries
+// allowedUses: [Tunnel], so egress VIPs are isolated from pod IPAM. Without
+// this guard a pool with allowedUses: [Workload] would later (once real Calico
+// IPAM is wired in) hand out pod-range addresses as SNAT VIPs (issue #5 §5.3).
+func (r *EgressPolicyReconciler) validateEgressIPPool(ctx context.Context, poolName string) error {
+	if poolName == "" {
+		return fmt.Errorf("egressIPPool is required")
+	}
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(calicoIPPoolGVK)
+	if err := r.Get(ctx, client.ObjectKey{Name: poolName}, pool); err != nil {
+		return fmt.Errorf("get IPPool %q: %w", poolName, err)
+	}
+
+	uses, found, err := unstructured.NestedStringSlice(pool.Object, "spec", "allowedUses")
+	if err != nil {
+		return fmt.Errorf("IPPool %q: read spec.allowedUses: %w", poolName, err)
+	}
+	if !found {
+		return fmt.Errorf("IPPool %q has no spec.allowedUses; egress pools must set allowedUses: [%s]", poolName, tunnelAllowedUse)
+	}
+	for _, u := range uses {
+		if u == tunnelAllowedUse {
+			return nil
+		}
+	}
+	return fmt.Errorf("IPPool %q allowedUses %v must include %q for egress VIP isolation", poolName, uses, tunnelAllowedUse)
 }
 
 func (r *EgressPolicyReconciler) markNotReady(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy, reason, message string) (ctrl.Result, error) {
