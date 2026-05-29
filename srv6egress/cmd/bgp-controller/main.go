@@ -85,6 +85,12 @@ func main() {
 
 	// v1alpha1: stub allocator + stub BGP distributor.
 	// Production: swap these for Calico-IPAM and gobgp-backed implementations.
+	// The BGP stub does NOT emit real BGP UPDATEs (no Color Extended Community
+	// is sent), so headends receive no SR Policy — loudly warn operators that
+	// this build does not actually steer traffic.
+	log.Info("WARNING: v1alpha1 build uses STUB BGP distributor and STUB VIP allocator — " +
+		"no real BGP UPDATE is sent and VIPs are synthetic placeholders; " +
+		"NOT for production traffic steering")
 	vipAlloc := vipalloc.NewInMemory()
 	bgpDist := bgp.NewLoggingStub(log.WithName("bgp"))
 
