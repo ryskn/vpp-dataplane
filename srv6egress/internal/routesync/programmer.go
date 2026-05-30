@@ -6,17 +6,19 @@ import (
 	"os/exec"
 )
 
-// VPPProgrammer applies/removes a route in VPP and reads back a VRF's FIB.
-// Implementations back this with vppctl (standalone) or, in-agent, with
-// vpplink (native VPP binary API).
+// VPPProgrammer applies/removes a route in VPP and reads back the routes it
+// owns in a VRF. Implementations back this with vppctl (ExecProgrammer:
+// standalone / off-box via kubectl exec) or govpp/vpplink (the native VPP
+// binary API, in-pod; see internal/routesync/vpplinkprog).
 type VPPProgrammer interface {
 	Add(r Route) error
 	Del(r Route) error
-	// ShowFIB returns the raw `show ip6 fib table <table>` output, used to
-	// recover the set of routes this component already installed (so state is
-	// not lost across a restart). Returning an error must NOT be treated as
-	// "table is empty".
-	ShowFIB(table uint32) ([]byte, error)
+	// InstalledRoutes returns the routes in the given VRF table whose next-hop
+	// is one of peers — i.e. the routes this component owns. The syncer uses it
+	// to recover its installed set from VPP itself (source of truth), so state
+	// is not lost across a restart. Returning an error must NOT be treated as
+	// "table is empty" (that would delete still-wanted routes).
+	InstalledRoutes(table uint32, peers map[string]Upstream) ([]Route, error)
 }
 
 // ExecProgrammer programs VPP by running a configurable command (the "vpp exec"
@@ -64,10 +66,30 @@ func (p *ExecProgrammer) run(vppArgs []string) error {
 	return nil
 }
 
-func (p *ExecProgrammer) Add(r Route) error { return p.run(r.AddArgs()) }
-func (p *ExecProgrammer) Del(r Route) error { return p.run(r.DelArgs()) }
+// routeArgs builds the vppctl `ip route add|del ...` argument vector for r.
+// This is vppctl-specific serialization, so it lives with the vppctl-backed
+// programmer rather than on the backend-agnostic Route value (a vpplink-backed
+// programmer would not use string args at all).
+func routeArgs(r Route, op string) []string {
+	return []string{"ip", "route", op, r.Prefix,
+		"table", fmt.Sprintf("%d", r.Table), "via", r.Via, r.Interface}
+}
 
-func (p *ExecProgrammer) ShowFIB(table uint32) ([]byte, error) {
+func (p *ExecProgrammer) Add(r Route) error { return p.run(routeArgs(r, "add")) }
+func (p *ExecProgrammer) Del(r Route) error { return p.run(routeArgs(r, "del")) }
+
+// InstalledRoutes runs `show ip6 fib table <table>` and parses the routes this
+// component owns. The text-parsing is an ExecProgrammer-internal detail; the
+// VPPProgrammer interface deals in typed Routes.
+func (p *ExecProgrammer) InstalledRoutes(table uint32, peers map[string]Upstream) ([]Route, error) {
+	raw, err := p.showFIB(table)
+	if err != nil {
+		return nil, err
+	}
+	return ParseOwnedRoutes(raw, table, peers), nil
+}
+
+func (p *ExecProgrammer) showFIB(table uint32) ([]byte, error) {
 	if len(p.Prefix) == 0 {
 		return nil, fmt.Errorf("vpp exec prefix is empty")
 	}

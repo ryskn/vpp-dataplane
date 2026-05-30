@@ -2,49 +2,67 @@
 // per-VRF gobgp into VPP's per-upstream VRF FIBs.
 //
 // It periodically reads `gobgp ... global rib -a ipv6 -j`, keeps the prefixes
-// whose next-hop is a configured upstream peer, and programs
-// `ip route add/del <prefix> table <vrf> via <peer> <iface>` into VPP via a
-// configurable exec command.
+// whose next-hop is a configured upstream peer, and programs them into VPP via
+// the selected backend: --vpp-backend=govpp (default; native binary API, must
+// run co-located with VPP) or --vpp-backend=vppctl (shell out; supports off-box
+// kubectl exec).
 //
-// Example (run on the egress node, vppctl in PATH):
+// Example (production, on the egress node, native VPP binary API — default):
 //
 //	vpp-route-sync --config /etc/srv6egress/routesync.yaml \
-//	  --gobgp-cmd "gobgp -p 50052" --vpp-exec "vppctl"
+//	  --gobgp-cmd "gobgp -p 50052" \
+//	  --vpp-backend govpp --vpp-api-socket /run/vpp/vpp-api.sock
 //
-// Example (run off-box, VPP reached via kubectl):
+// Example (standalone, vppctl in PATH):
+//
+//	vpp-route-sync --config /etc/srv6egress/routesync.yaml \
+//	  --gobgp-cmd "gobgp -p 50052" \
+//	  --vpp-backend vppctl --vpp-exec "vppctl"
+//
+// Example (off-box, VPP reached via kubectl — vppctl backend only):
 //
 //	vpp-route-sync --config routesync.yaml \
 //	  --gobgp-cmd "gobgp -p 50052" \
+//	  --vpp-backend vppctl \
 //	  --vpp-exec "kubectl -n calico-vpp-dataplane exec calico-vpp-node-xxxxx -c vpp -- vppctl"
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/routesync"
+	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/routesync/vpplinkprog"
 )
 
 func main() {
 	var (
 		configPath string
 		gobgpCmd   string
+		vppBackend string
 		vppExec    string
+		vppSocket  string
 		interval   time.Duration
 	)
 	flag.StringVar(&configPath, "config", "/etc/srv6egress/routesync.yaml",
 		"Path to the peer->VRF mapping config.")
 	flag.StringVar(&gobgpCmd, "gobgp-cmd", "gobgp -p 50052",
 		"Command (with args) used to invoke the gobgp CLI.")
+	flag.StringVar(&vppBackend, "vpp-backend", "govpp",
+		"VPP programming backend: 'govpp' (native binary API via vpplink; must run co-located with VPP) or 'vppctl' (shell out; supports off-box kubectl exec).")
 	flag.StringVar(&vppExec, "vpp-exec", "vppctl",
-		"Command (with args) used to run a vppctl invocation; route args are appended.")
+		"Command (with args) for the vppctl invocation; route args are appended. Used when --vpp-backend=vppctl.")
+	flag.StringVar(&vppSocket, "vpp-api-socket", "/run/vpp/vpp-api.sock",
+		"VPP binary API socket. Used when --vpp-backend=govpp. (calico-vpp names it vpp-api.sock.)")
 	flag.DurationVar(&interval, "interval", 5*time.Second, "Reconcile interval.")
 	flag.Parse()
 
@@ -57,10 +75,17 @@ func main() {
 	}
 	log.Info("config loaded", "upstreams", len(cfg.Upstreams), "interval", interval.String())
 
+	vpp, err := newProgrammer(vppBackend, vppExec, vppSocket)
+	if err != nil {
+		log.Error(err, "init VPP backend", "backend", vppBackend)
+		os.Exit(1)
+	}
+	log.Info("VPP backend selected", "backend", vppBackend)
+
 	s := &routesync.Syncer{
 		Cfg:      cfg,
 		Fetch:    routesync.ExecRIBFetcher(strings.Fields(gobgpCmd)),
-		VPP:      routesync.NewExecProgrammer(strings.Fields(vppExec)),
+		VPP:      vpp,
 		Log:      log,
 		Interval: interval,
 	}
@@ -72,5 +97,18 @@ func main() {
 	if err := s.Run(ctx); err != nil && err != context.Canceled {
 		log.Error(err, "run")
 		os.Exit(1)
+	}
+}
+
+// newProgrammer selects the VPP programming backend. govpp is the production
+// path (native binary API); vppctl is kept for standalone / off-box bring-up.
+func newProgrammer(backend, vppExec, vppSocket string) (routesync.VPPProgrammer, error) {
+	switch backend {
+	case "govpp":
+		return vpplinkprog.New(vppSocket, logrus.WithField("component", "vpp-route-sync"))
+	case "vppctl":
+		return routesync.NewExecProgrammer(strings.Fields(vppExec)), nil
+	default:
+		return nil, fmt.Errorf("unknown vpp-backend %q (want 'govpp' or 'vppctl')", backend)
 	}
 }

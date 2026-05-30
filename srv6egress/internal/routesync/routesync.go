@@ -59,15 +59,6 @@ func (r Route) Key() string {
 	return fmt.Sprintf("%d|%s", r.Table, r.Prefix)
 }
 
-// AddArgs / DelArgs return the vppctl argument vector for this route.
-func (r Route) AddArgs() []string { return r.args("add") }
-func (r Route) DelArgs() []string { return r.args("del") }
-
-func (r Route) args(op string) []string {
-	return []string{"ip", "route", op, r.Prefix,
-		"table", fmt.Sprintf("%d", r.Table), "via", r.Via, r.Interface}
-}
-
 // --- gobgp RIB JSON parsing ---
 
 // ribPath is one path entry in gobgp's `global rib -j` output.
