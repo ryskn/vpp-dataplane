@@ -91,11 +91,11 @@ func (s *Syncer) installedFromVPP() ([]Route, error) {
 	peers := s.Cfg.PeerIndex()
 	var installed []Route
 	for _, table := range s.Cfg.Tables() {
-		raw, err := s.VPP.ShowFIB(table)
+		routes, err := s.VPP.InstalledRoutes(table, peers)
 		if err != nil {
 			return nil, err
 		}
-		installed = append(installed, ParseOwnedRoutes(raw, table, peers)...)
+		installed = append(installed, routes...)
 	}
 	return installed, nil
 }

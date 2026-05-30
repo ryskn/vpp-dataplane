@@ -81,14 +81,29 @@ func TestDesiredRoutes(t *testing.T) {
 	}
 }
 
-func TestRouteArgs(t *testing.T) {
-	r := Route{Prefix: "2001:db8:a::/64", Table: 100, Via: "fda1::1", Interface: "virtio-0/0/12/0"}
-	wantAdd := []string{"ip", "route", "add", "2001:db8:a::/64", "table", "100", "via", "fda1::1", "virtio-0/0/12/0"}
-	if !reflect.DeepEqual(r.AddArgs(), wantAdd) {
-		t.Fatalf("AddArgs = %v, want %v", r.AddArgs(), wantAdd)
+func TestExecProgrammerArgs(t *testing.T) {
+	var gotName string
+	var gotArgs []string
+	p := &ExecProgrammer{
+		Prefix: []string{"vppctl"},
+		Run: func(name string, args ...string) ([]byte, error) {
+			gotName, gotArgs = name, args
+			return nil, nil
+		},
 	}
-	if r.DelArgs()[2] != "del" {
-		t.Fatalf("DelArgs op = %q, want del", r.DelArgs()[2])
+	r := Route{Prefix: "2001:db8:a::/64", Table: 100, Via: "fda1::1", Interface: "virtio-0/0/12/0"}
+	if err := p.Add(r); err != nil {
+		t.Fatal(err)
+	}
+	wantAdd := []string{"ip", "route", "add", "2001:db8:a::/64", "table", "100", "via", "fda1::1", "virtio-0/0/12/0"}
+	if gotName != "vppctl" || !reflect.DeepEqual(gotArgs, wantAdd) {
+		t.Fatalf("Add ran %q %v, want vppctl %v", gotName, gotArgs, wantAdd)
+	}
+	if err := p.Del(r); err != nil {
+		t.Fatal(err)
+	}
+	if gotArgs[2] != "del" {
+		t.Fatalf("Del op = %q, want del", gotArgs[2])
 	}
 }
 
@@ -141,9 +156,10 @@ func (f *fakeProgrammer) Del(r Route) error {
 	return nil
 }
 
-// ShowFIB renders the fake table in the real `show ip6 fib table N` shape so
-// ParseOwnedRoutes exercises the actual parser.
-func (f *fakeProgrammer) ShowFIB(table uint32) ([]byte, error) {
+// InstalledRoutes renders the fake table in the real `show ip6 fib table N`
+// shape and runs it through the actual ParseOwnedRoutes parser, so the syncer
+// path still exercises the ownership filter.
+func (f *fakeProgrammer) InstalledRoutes(table uint32, peers map[string]Upstream) ([]Route, error) {
 	var b []byte
 	b = append(b, []byte("ipv6-VRF:"+itoa(table)+", fib_index:11, flow hash:[...]\n")...)
 	for _, r := range f.fib[table] {
@@ -154,7 +170,7 @@ func (f *fakeProgrammer) ShowFIB(table uint32) ([]byte, error) {
 	// Always include some noise routes (not ours) to prove the ownership filter.
 	b = append(b, []byte("::/0\n  [@0]: dpo-drop ip6\n")...)
 	b = append(b, []byte("fe80::/10\n  [@14]: ip6-link-local\n")...)
-	return b, nil
+	return ParseOwnedRoutes(b, table, peers), nil
 }
 
 func itoa(u uint32) string {
@@ -238,7 +254,7 @@ func TestSyncer_SkipsOnFIBReadError(t *testing.T) {
 	fp := newFakeProgrammer()
 	_ = fp.Add(Route{Prefix: "2001:db8:a::/64", Table: 100, Via: "fda1::1", Interface: "e"})
 	fp.added, fp.deleted = nil, nil
-	fe := &failingShowFIB{fakeProgrammer: fp}
+	fe := &failingReader{fakeProgrammer: fp}
 	rib := `{}`
 	s := &Syncer{Cfg: testCfg(), VPP: fe, Log: logr.Discard(),
 		Fetch: func(_ context.Context) ([]byte, error) { return []byte(rib), nil }}
@@ -248,9 +264,9 @@ func TestSyncer_SkipsOnFIBReadError(t *testing.T) {
 	}
 }
 
-type failingShowFIB struct{ *fakeProgrammer }
+type failingReader struct{ *fakeProgrammer }
 
-func (f *failingShowFIB) ShowFIB(uint32) ([]byte, error) {
+func (f *failingReader) InstalledRoutes(uint32, map[string]Upstream) ([]Route, error) {
 	return nil, errFIB
 }
 
