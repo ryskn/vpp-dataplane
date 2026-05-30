@@ -18,6 +18,7 @@ package vpplinkprog
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -30,8 +31,12 @@ import (
 // routesync.VPPProgrammer.
 type Programmer struct {
 	vpp *vpplink.VppLink
-	// ifIndex memoizes interface name → swIfIndex (interfaces are long-lived).
-	ifIndex map[string]uint32
+	// installedPaths records the exact path VPP reported for each owned route in
+	// the most recent InstalledRoutes() dump (keyed by Route.Key()). Del uses it
+	// to remove precisely the installed path — robust to config/interface drift,
+	// where the route's actual egress interface no longer matches the configured
+	// one and a name-resolved delete would silently miss.
+	installedPaths map[string]types.RoutePath
 }
 
 // New connects to the VPP binary API at socket (calico-vpp: "/run/vpp/vpp-api.sock").
@@ -40,69 +45,97 @@ func New(socket string, logger *logrus.Entry) (*Programmer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to VPP at %s: %w", socket, err)
 	}
-	return &Programmer{vpp: vpp, ifIndex: map[string]uint32{}}, nil
+	return &Programmer{vpp: vpp, installedPaths: map[string]types.RoutePath{}}, nil
 }
 
-func (p *Programmer) swIfIndex(name string) (uint32, error) {
-	if idx, ok := p.ifIndex[name]; ok {
-		return idx, nil
-	}
+// resolveIfIndex looks up an interface swIfIndex by name. It deliberately does
+// NOT cache: an interface can be deleted and recreated with a different index
+// (drift), and a stale cache would then program the wrong index.
+func (p *Programmer) resolveIfIndex(name string) (uint32, error) {
 	idx, err := p.vpp.SearchInterfaceWithName(name)
 	if err != nil {
 		return 0, fmt.Errorf("resolve interface %q: %w", name, err)
 	}
-	p.ifIndex[name] = idx
 	return idx, nil
 }
 
-// toVppRoute maps a routesync.Route to the vpplink route type, resolving the
-// egress interface name to its swIfIndex.
-func (p *Programmer) toVppRoute(r routesync.Route) (*types.Route, error) {
-	_, dst, err := net.ParseCIDR(r.Prefix)
+func parsePrefix(s string) (*net.IPNet, error) {
+	_, dst, err := net.ParseCIDR(s)
 	if err != nil {
-		return nil, fmt.Errorf("parse prefix %q: %w", r.Prefix, err)
+		return nil, fmt.Errorf("parse prefix %q: %w", s, err)
+	}
+	return dst, nil
+}
+
+// Add installs r via the configured egress interface (resolved fresh each call).
+func (p *Programmer) Add(r routesync.Route) error {
+	dst, err := parsePrefix(r.Prefix)
+	if err != nil {
+		return err
 	}
 	gw := net.ParseIP(r.Via)
 	if gw == nil {
-		return nil, fmt.Errorf("via %q is not an IP", r.Via)
+		return fmt.Errorf("via %q is not an IP", r.Via)
 	}
-	idx, err := p.swIfIndex(r.Interface)
+	idx, err := p.resolveIfIndex(r.Interface)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &types.Route{
+	return p.vpp.RouteAdd(&types.Route{
 		Dst:   dst,
 		Table: r.Table,
 		Paths: []types.RoutePath{{Gw: gw, SwIfIndex: idx}},
-	}, nil
+	})
 }
 
-func (p *Programmer) Add(r routesync.Route) error {
-	vr, err := p.toVppRoute(r)
-	if err != nil {
-		return err
-	}
-	return p.vpp.RouteAdd(vr)
-}
-
+// Del removes r. It prefers the exact path VPP reported for this route in the
+// last dump (so the delete matches what is actually installed even if the
+// configured interface has since drifted); only if that is unavailable does it
+// fall back to resolving the configured interface by name.
 func (p *Programmer) Del(r routesync.Route) error {
-	vr, err := p.toVppRoute(r)
+	dst, err := parsePrefix(r.Prefix)
 	if err != nil {
 		return err
 	}
-	return p.vpp.RouteDel(vr)
+	path, ok := p.installedPaths[r.Key()]
+	if !ok {
+		gw := net.ParseIP(r.Via)
+		if gw == nil {
+			return fmt.Errorf("via %q is not an IP", r.Via)
+		}
+		idx, err := p.resolveIfIndex(r.Interface)
+		if err != nil {
+			return err
+		}
+		path = types.RoutePath{Gw: gw, SwIfIndex: idx}
+	}
+	return p.vpp.RouteDel(&types.Route{
+		Dst:   dst,
+		Table: r.Table,
+		Paths: []types.RoutePath{path},
+	})
 }
 
 // InstalledRoutes dumps the VRF table and keeps the routes whose next-hop is one
-// of our configured upstream peers (the ones this component owns). The egress
-// interface is taken from the peer config rather than resolved back from the
-// swIfIndex: route identity for diffing is (table, prefix), and Del re-resolves
-// the interface, so the configured name is the correct value to carry.
+// of our configured upstream peers (the ones this component owns). It also
+// records each route's exact installed path so a later Del removes precisely
+// that path. Route identity for diffing is (table, prefix); the carried
+// Interface is the configured name, while the recorded path holds VPP's actual
+// swIfIndex used for deletion.
 func (p *Programmer) InstalledRoutes(table uint32, peers map[string]routesync.Upstream) ([]routesync.Route, error) {
 	vppRoutes, err := p.vpp.GetRoutes(table, true /*isIPv6*/)
 	if err != nil {
 		return nil, fmt.Errorf("dump VPP routes table %d: %w", table, err)
 	}
+	// Drop stale recorded paths for this table; we repopulate from the fresh
+	// dump so the map never grows unbounded as prefixes churn.
+	tablePrefix := fmt.Sprintf("%d|", table)
+	for k := range p.installedPaths {
+		if strings.HasPrefix(k, tablePrefix) {
+			delete(p.installedPaths, k)
+		}
+	}
+
 	var owned []routesync.Route
 	for i := range vppRoutes {
 		vr := &vppRoutes[i]
@@ -118,12 +151,14 @@ func (p *Programmer) InstalledRoutes(table uint32, peers map[string]routesync.Up
 			if !ok {
 				continue // next-hop is not one of our upstreams
 			}
-			owned = append(owned, routesync.Route{
+			route := routesync.Route{
 				Prefix:    vr.Dst.String(),
 				Table:     table,
 				Via:       via,
 				Interface: up.Interface,
-			})
+			}
+			p.installedPaths[route.Key()] = path
+			owned = append(owned, route)
 			break // one owned path is enough to claim the prefix
 		}
 	}
