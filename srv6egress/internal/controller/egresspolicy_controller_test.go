@@ -18,6 +18,7 @@ import (
 	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
+	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/vipalloc"
 )
 
@@ -32,8 +33,8 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	}
 	// Register the Calico IPPool CRD as unstructured so the fake client can
 	// serve it via GET.
-	s.AddKnownTypeWithName(calicoIPPoolGVK, &unstructured.Unstructured{})
-	listGVK := calicoIPPoolGVK
+	s.AddKnownTypeWithName(poolvalidator.CalicoIPPoolGVK, &unstructured.Unstructured{})
+	listGVK := poolvalidator.CalicoIPPoolGVK
 	listGVK.Kind = "IPPoolList"
 	s.AddKnownTypeWithName(listGVK, &unstructured.UnstructuredList{})
 	return s
@@ -63,7 +64,7 @@ func egressNode(name string) *corev1.Node {
 
 func ippool(name string, allowedUses ...string) *unstructured.Unstructured {
 	p := &unstructured.Unstructured{}
-	p.SetGroupVersionKind(calicoIPPoolGVK)
+	p.SetGroupVersionKind(poolvalidator.CalicoIPPoolGVK)
 	p.SetName(name)
 	if allowedUses != nil {
 		_ = unstructured.SetNestedStringSlice(p.Object, allowedUses, "spec", "allowedUses")
@@ -107,6 +108,7 @@ func newReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler 
 		Config: testConfig(),
 		VIPs:   vipalloc.NewInMemory(),
 		BGP:    bgp.NewLoggingStub(logr.Discard()),
+		Pools:  poolvalidator.NewCalico(c),
 	}
 }
 
@@ -277,7 +279,7 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec}
+		VIPs: vipalloc.NewInMemory(), BGP: rec, Pools: poolvalidator.NewCalico(c)}
 
 	// Announce with color 100 → status.srPolicy.color = 100.
 	if err := reconcile(t, r, "tenant-a"); err != nil {
