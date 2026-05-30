@@ -31,6 +31,7 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/controller"
+	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/vipalloc"
 )
 
@@ -145,6 +146,7 @@ func main() {
 		Config: cfg,
 		VIPs:   vipAlloc,
 		BGP:    bgpDist,
+		Pools:  poolvalidator.NewCalico(mgr.GetClient()),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "setup EgressPolicy reconciler")
 		os.Exit(1)

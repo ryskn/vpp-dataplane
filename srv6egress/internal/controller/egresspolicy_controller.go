@@ -16,10 +16,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerruntimecfg "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -27,19 +25,9 @@ import (
 	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
+	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/vipalloc"
 )
-
-// calicoIPPoolGVK identifies the Calico IPPool CRD used for egress VIP pools.
-var calicoIPPoolGVK = schema.GroupVersionKind{
-	Group:   "crd.projectcalico.org",
-	Version: "v1",
-	Kind:    "IPPool",
-}
-
-// tunnelAllowedUse is the IPPool allowedUses value that isolates a pool from
-// pod IPAM, making it safe to draw egress VIPs from (see design issue #5 §5.3).
-const tunnelAllowedUse = "Tunnel"
 
 const finalizerName = "srv6egress.ryskn.io/finalizer"
 
@@ -50,6 +38,7 @@ type EgressPolicyReconciler struct {
 	Config *config.ControllerConfig
 	VIPs   vipalloc.Allocator
 	BGP    bgp.Distributor
+	Pools  poolvalidator.Validator
 }
 
 // +kubebuilder:rbac:groups=srv6egress.ryskn.io,resources=egresspolicies,verbs=get;list;watch;update;patch
@@ -117,7 +106,7 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	} else {
 		// Validate the named pool is egress-safe before allocating.
-		if err := r.validateEgressIPPool(ctx, ep.Spec.Egress.EgressIPPool); err != nil {
+		if err := r.Pools.ValidatePool(ctx, ep.Spec.Egress.EgressIPPool); err != nil {
 			return r.markNotReady(ctx, &ep, "InvalidEgressIPPool", err.Error())
 		}
 		vip, err = r.VIPs.Allocate(ctx, policyOwner, ep.Spec.Egress.EgressIPPool)
@@ -242,35 +231,6 @@ func (r *EgressPolicyReconciler) findColorEndpointConflict(ctx context.Context, 
 		}
 	}
 	return "", nil
-}
-
-// validateEgressIPPool verifies the named Calico IPPool exists and carries
-// allowedUses: [Tunnel], so egress VIPs are isolated from pod IPAM. Without
-// this guard a pool with allowedUses: [Workload] would later (once real Calico
-// IPAM is wired in) hand out pod-range addresses as SNAT VIPs (issue #5 §5.3).
-func (r *EgressPolicyReconciler) validateEgressIPPool(ctx context.Context, poolName string) error {
-	if poolName == "" {
-		return fmt.Errorf("egressIPPool is required")
-	}
-	pool := &unstructured.Unstructured{}
-	pool.SetGroupVersionKind(calicoIPPoolGVK)
-	if err := r.Get(ctx, client.ObjectKey{Name: poolName}, pool); err != nil {
-		return fmt.Errorf("get IPPool %q: %w", poolName, err)
-	}
-
-	uses, found, err := unstructured.NestedStringSlice(pool.Object, "spec", "allowedUses")
-	if err != nil {
-		return fmt.Errorf("IPPool %q: read spec.allowedUses: %w", poolName, err)
-	}
-	if !found {
-		return fmt.Errorf("IPPool %q has no spec.allowedUses; egress pools must set allowedUses: [%s]", poolName, tunnelAllowedUse)
-	}
-	for _, u := range uses {
-		if u == tunnelAllowedUse {
-			return nil
-		}
-	}
-	return fmt.Errorf("IPPool %q allowedUses %v must include %q for egress VIP isolation", poolName, uses, tunnelAllowedUse)
 }
 
 func (r *EgressPolicyReconciler) markNotReady(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy, reason, message string) (ctrl.Result, error) {
