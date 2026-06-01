@@ -5,6 +5,11 @@
 # where the operator pins that meaning for our cluster.
 #
 # Loaded by `bgp-controller --config /etc/srv6egress/controller-config.yaml`.
+#
+# `bsid` per color is REQUIRED when running with --bgp-encoding=sr-policy
+# (SR Policy SAFI 73): the receiving headend keys its installed VPP SR Policy on
+# the Binding SID. It must be a unique IPv6 SID per color. The default
+# colored-route encoding ignores `bsid`.
 
 upstreams:
   isp-a:
@@ -20,10 +25,12 @@ colors:
   # color 100 — "low-latency / via ISP-A"
   100:
     upstream: isp-a
+    bsid: "cafe::64"           # Binding SID (SR Policy SAFI); unique per color
     segmentList:
       - "fcff:0:0:e0:a::"
   # color 200 — "best-effort / via ISP-B"
   200:
     upstream: isp-b
+    bsid: "cafe::c8"
     segmentList:
       - "fcff:0:0:e0:b::"

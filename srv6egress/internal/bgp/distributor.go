@@ -1,10 +1,16 @@
 // Package bgp distributes SR Policies (color + endpoint + segment list) from
-// the controller to headends over BGP. The v1alpha1 scope uses BGP IPv6
-// unicast + Color Extended Community (RFC 9012 §3.4.2); RFC 9012 SR Policy
-// SAFI (BGP SAFI 73) integration is future work.
+// the controller to headends over BGP. Two on-the-wire encodings are provided:
 //
-// v1alpha1 ships a logging stub Distributor for unit tests and the initial
-// bring-up; production wires this to a gobgp client (see TODO at bottom).
+//   - colored IPv6 unicast route + Color Extended Community (RFC 9012 §3.4.2):
+//     advertises the terminal SID /128 tagged with the color; a headend that
+//     already holds an SR Policy for that color steers matching traffic into it
+//     (RFC 9256 §8.4). See gobgp.go.
+//   - SR Policy SAFI (AFI IPv6 / SAFI 73): advertises the SR Policy itself —
+//     NLRI <distinguisher, color, endpoint> plus a Tunnel Encapsulation
+//     attribute carrying the full segment list, so a receiving headend installs
+//     the policy. See gobgp_srpolicy.go. This is the backbone-integration path.
+//
+// A logging stub Distributor is used for unit tests and initial bring-up.
 package bgp
 
 import (
@@ -20,7 +26,15 @@ import (
 // and endpoint here.
 type PolicyKey struct {
 	Color    uint32
-	Endpoint string // node name (or address) of the SR Policy endpoint
+	Endpoint string // node name of the SR Policy endpoint (identity / logging)
+	// EndpointAddr is the endpoint's IPv6 address. It forms the endpoint field
+	// of the SR Policy SAFI NLRI (RFC 9256 §2.1); the colored-route encoding
+	// does not use it. Empty when the endpoint node has no resolvable address.
+	EndpointAddr string
+	// BSID is the Binding SID for the SR Policy. The SR Policy SAFI encoding
+	// advertises it (the receiving headend keys its installed VPP SR Policy on
+	// the BSID); the colored-route encoding ignores it.
+	BSID string
 }
 
 // Distributor announces and withdraws SR Policies over BGP.
@@ -66,14 +80,3 @@ func (s *loggingStub) Withdraw(_ context.Context, owner string, key PolicyKey, s
 		"owner", owner, "color", key.Color, "endpoint", key.Endpoint, "segmentList", segmentList)
 	return nil
 }
-
-// TODO(v1alpha1 wiring):
-//   Replace loggingStub with a gobgp-backed Distributor that:
-//   - Maintains a long-lived gobgp client connection
-//   - Announces routes carrying:
-//       * Color Extended Community (RFC 9012 §3.4.2) with key.Color
-//       * Next-hop = key.Endpoint
-//       * Segment-list via Tunnel Encapsulation attribute (RFC 9012)
-//   - Withdraws those routes on Withdraw()
-//   v1alpha2 will additionally adopt SR Policy SAFI 73 (RFC 9012) and
-//   RFC 9252 SRv6 Services for backbone-integration scenarios (#5 §8.5).

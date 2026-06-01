@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,7 +81,7 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 2) Resolve endpoint via NodeSelector — exactly one node.
-	endpoint, err := r.resolveEndpoint(ctx, ep.Spec.Egress.EndpointSelector)
+	endpoint, endpointAddr, err := r.resolveEndpoint(ctx, ep.Spec.Egress.EndpointSelector)
 	if err != nil {
 		return r.markNotReady(ctx, &ep, "EndpointResolution", err.Error())
 	}
@@ -117,8 +118,10 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// 4) Distribute SR Policy.
 	bsid, err := r.BGP.Announce(ctx, policyOwner, bgp.PolicyKey{
-		Color:    ep.Spec.Egress.Color,
-		Endpoint: endpoint,
+		Color:        ep.Spec.Egress.Color,
+		Endpoint:     endpoint,
+		EndpointAddr: endpointAddr,
+		BSID:         cc.BSID,
 	}, cc.SegmentList)
 	if err != nil {
 		return r.markNotReady(ctx, &ep, "BGPDistribution", err.Error())
@@ -129,9 +132,10 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	ep.Status.ActiveEndpoint = endpoint
 	ep.Status.Upstream = cc.Upstream
 	ep.Status.SRPolicy = &srv6egressv1alpha1.SRPolicyStatus{
-		BSID:        bsid,
-		Color:       ep.Spec.Egress.Color,
-		SegmentList: cc.SegmentList,
+		BSID:         bsid,
+		Color:        ep.Spec.Egress.Color,
+		SegmentList:  cc.SegmentList,
+		EndpointAddr: endpointAddr,
 	}
 	setReady(&ep, metav1.ConditionTrue, "Reconciled", "EgressPolicy installed")
 	if err := r.Status().Update(ctx, &ep); err != nil {
@@ -161,6 +165,8 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 	var segs []string
 	if ep.Status.SRPolicy != nil {
 		key.Color = ep.Status.SRPolicy.Color
+		key.EndpointAddr = ep.Status.SRPolicy.EndpointAddr
+		key.BSID = ep.Status.SRPolicy.BSID
 		segs = ep.Status.SRPolicy.SegmentList
 	}
 	if err := r.BGP.Withdraw(ctx, owner, key, segs); err != nil {
@@ -179,31 +185,48 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 }
 
 // resolveEndpoint enforces the v1alpha1 invariant: exactly one node must match.
-func (r *EgressPolicyReconciler) resolveEndpoint(ctx context.Context, es srv6egressv1alpha1.EndpointSelector) (string, error) {
+// It returns the node name (identity) and its IPv6 address (the SR Policy SAFI
+// endpoint). The address is best-effort: an empty string is returned when the
+// node exposes no IPv6 InternalIP, which only the SR Policy SAFI encoding cares
+// about (it then rejects the policy with a clear error).
+func (r *EgressPolicyReconciler) resolveEndpoint(ctx context.Context, es srv6egressv1alpha1.EndpointSelector) (name, addr string, err error) {
 	if es.NodeSelector == nil {
-		return "", fmt.Errorf("endpointSelector.nodeSelector is required")
+		return "", "", fmt.Errorf("endpointSelector.nodeSelector is required")
 	}
 	sel, err := metav1.LabelSelectorAsSelector(es.NodeSelector)
 	if err != nil {
-		return "", fmt.Errorf("invalid nodeSelector: %w", err)
+		return "", "", fmt.Errorf("invalid nodeSelector: %w", err)
 	}
 
 	var nodes corev1.NodeList
 	if err := r.List(ctx, &nodes, &client.ListOptions{LabelSelector: sel}); err != nil {
-		return "", fmt.Errorf("list nodes: %w", err)
+		return "", "", fmt.Errorf("list nodes: %w", err)
 	}
 	switch len(nodes.Items) {
 	case 0:
-		return "", fmt.Errorf("no node matches selector %q", labels.SelectorFromValidatedSet(es.NodeSelector.MatchLabels).String())
+		return "", "", fmt.Errorf("no node matches selector %q", labels.SelectorFromValidatedSet(es.NodeSelector.MatchLabels).String())
 	case 1:
-		return nodes.Items[0].Name, nil
+		return nodes.Items[0].Name, nodeIPv6(&nodes.Items[0]), nil
 	default:
 		names := make([]string, 0, len(nodes.Items))
 		for i := range nodes.Items {
 			names = append(names, nodes.Items[i].Name)
 		}
-		return "", fmt.Errorf("v1alpha1 requires exactly one matching node, got %d: %v", len(nodes.Items), names)
+		return "", "", fmt.Errorf("v1alpha1 requires exactly one matching node, got %d: %v", len(nodes.Items), names)
 	}
+}
+
+// nodeIPv6 returns the node's first IPv6 InternalIP, or "" if it has none.
+func nodeIPv6(node *corev1.Node) string {
+	for _, a := range node.Status.Addresses {
+		if a.Type != corev1.NodeInternalIP {
+			continue
+		}
+		if ip := net.ParseIP(a.Address); ip != nil && ip.To4() == nil {
+			return a.Address
+		}
+	}
+	return ""
 }
 
 // findColorEndpointConflict returns the name of another (non-deleting)

@@ -39,6 +39,13 @@ type UpstreamConfig struct {
 type ColorConfig struct {
 	Upstream    string   `json:"upstream"`
 	SegmentList []string `json:"segmentList"`
+	// BSID is the Binding SID for this color's SR Policy. It is REQUIRED when
+	// distributing over SR Policy SAFI (--bgp-encoding=sr-policy): the receiving
+	// headend keys the installed VPP SR Policy on the BSID, so an absent BSID
+	// yields an unusable all-zero key. Ignored by the colored-route encoding.
+	// Must be an IPv6 SID, unique per color.
+	// +optional
+	BSID string `json:"bsid,omitempty"`
 }
 
 // Load reads a controller config yaml file.
@@ -90,6 +97,11 @@ func (c *ControllerConfig) Validate() error {
 		upstreamSID[name] = sid
 	}
 
+	// Track BSIDs by canonical value to reject duplicates: the BSID is the
+	// receiver's SR Policy install key (VPP keys its sr_policy on it), so two
+	// colors sharing a BSID would collide into one policy at the headend.
+	seenBSID := make(map[string]uint32, len(c.Colors))
+
 	for color, cc := range c.Colors {
 		if cc.Upstream == "" {
 			return fmt.Errorf("color %d: upstream is required", color)
@@ -100,6 +112,19 @@ func (c *ControllerConfig) Validate() error {
 		}
 		if len(cc.SegmentList) == 0 {
 			return fmt.Errorf("color %d: segmentList must not be empty", color)
+		}
+		// BSID is optional in the schema (the colored-route encoding ignores it),
+		// but if set it must be a well-formed IPv6 SID and unique across colors.
+		if cc.BSID != "" {
+			bsid, err := parseSID(cc.BSID)
+			if err != nil {
+				return fmt.Errorf("color %d: bsid %v", color, err)
+			}
+			if other, dup := seenBSID[bsid.String()]; dup {
+				return fmt.Errorf("color %d: bsid %q already used by color %d; BSIDs are the receiver's SR Policy install key and must be unique",
+					color, cc.BSID, other)
+			}
+			seenBSID[bsid.String()] = color
 		}
 		// Every segment must be a syntactically valid IPv6 SID.
 		segs := make([]net.IP, len(cc.SegmentList))

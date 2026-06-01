@@ -115,3 +115,23 @@ func TestValidate_MalformedUpstreamSIDRejected(t *testing.T) {
 		t.Fatal("expected error for malformed upstream SID")
 	}
 }
+
+func TestValidate_DistinctBSIDsOK(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{Upstream: "isp-a", BSID: "cafe::64", SegmentList: []string{"fcff:0:0:e0:a::"}}
+	c.Colors[200] = ColorConfig{Upstream: "isp-b", BSID: "cafe::c8", SegmentList: []string{"fcff:0:0:e0:b::"}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected distinct BSIDs to pass, got: %v", err)
+	}
+}
+
+// The BSID is the receiver's SR Policy install key, so two colors sharing one
+// (even written differently) must be rejected.
+func TestValidate_DuplicateBSIDRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{Upstream: "isp-a", BSID: "cafe::64", SegmentList: []string{"fcff:0:0:e0:a::"}}
+	c.Colors[200] = ColorConfig{Upstream: "isp-b", BSID: "cafe:0:0:0:0:0:0:64", SegmentList: []string{"fcff:0:0:e0:b::"}}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for duplicate BSID across colors")
+	}
+}

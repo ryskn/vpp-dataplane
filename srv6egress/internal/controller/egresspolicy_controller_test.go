@@ -59,6 +59,11 @@ func egressNode(name string) *corev1.Node {
 			Name:   name,
 			Labels: map[string]string{"srv6egress.ryskn.io/role": "egress"},
 		},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "fd00:1::14"},
+			},
+		},
 	}
 }
 
@@ -162,6 +167,24 @@ func TestReconcile_HappyPath(t *testing.T) {
 	cond := getReady(t, r, "tenant-a")
 	if cond.Status != metav1.ConditionTrue {
 		t.Fatalf("expected Ready=True, got %s (%s: %s)", cond.Status, cond.Reason, cond.Message)
+	}
+}
+
+// The endpoint node's IPv6 address must be resolved and persisted in status so
+// the SR Policy SAFI encoding can build the NLRI and Withdraw can rebuild it
+// after a restart.
+func TestReconcile_PersistsEndpointAddr(t *testing.T) {
+	r := newReconciler(t, egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
+		newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool"))
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+	var ep srv6egressv1alpha1.EgressPolicy
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Status.SRPolicy == nil || ep.Status.SRPolicy.EndpointAddr != "fd00:1::14" {
+		t.Fatalf("status.srPolicy.endpointAddr = %+v, want fd00:1::14", ep.Status.SRPolicy)
 	}
 }
 
