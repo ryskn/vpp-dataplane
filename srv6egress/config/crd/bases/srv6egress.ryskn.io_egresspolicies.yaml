@@ -191,6 +191,8 @@ spec:
                     color:
                       type: integer
                       format: int64
+                    endpointAddr:
+                      type: string
                     segmentList:
                       type: array
                       items:

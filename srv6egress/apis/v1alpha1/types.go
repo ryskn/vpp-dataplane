@@ -136,6 +136,12 @@ type SRPolicyStatus struct {
 	// SegmentList is the SR Policy segment list resolved by the controller.
 	// +optional
 	SegmentList []string `json:"segmentList,omitempty"`
+
+	// EndpointAddr is the SR Policy endpoint IPv6 address advertised in the SR
+	// Policy SAFI NLRI. Persisted so Withdraw can rebuild the exact NLRI key
+	// (<distinguisher, color, endpoint>) after a controller restart.
+	// +optional
+	EndpointAddr string `json:"endpointAddr,omitempty"`
 }
 
 func init() {

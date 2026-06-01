@@ -52,6 +52,7 @@ func main() {
 		enableLeaderElection bool
 		vipBackend           string
 		bgpBackend           string
+		bgpEncoding          string
 		gobgpAddr            string
 		kubeconfig           string
 	)
@@ -65,6 +66,8 @@ func main() {
 		"VIP allocator backend: 'calico' (Calico IPAM) or 'memory' (in-memory stub).")
 	flag.StringVar(&bgpBackend, "bgp-backend", "stub",
 		"BGP distributor backend: 'gobgp' (real gRPC) or 'stub' (logging only).")
+	flag.StringVar(&bgpEncoding, "bgp-encoding", "color-route",
+		"gobgp on-the-wire encoding: 'color-route' (colored IPv6 /128 + Color Ext-Community, RFC 9012 §3.4.2) or 'sr-policy' (SR Policy SAFI 73 with full segment list, for SRv6 backbone integration).")
 	flag.StringVar(&gobgpAddr, "gobgp-addr", "127.0.0.1:50051",
 		"gobgp gRPC address (used when --bgp-backend=gobgp).")
 	// NOTE: do not register --kubeconfig here; controller-runtime's
@@ -126,12 +129,25 @@ func main() {
 	var bgpDist bgp.Distributor
 	switch bgpBackend {
 	case "gobgp":
-		bgpDist, err = bgp.NewGoBGP(gobgpAddr, log.WithName("bgp"))
-		if err != nil {
-			log.Error(err, "init gobgp distributor")
+		switch bgpEncoding {
+		case "sr-policy":
+			bgpDist, err = bgp.NewGoBGPSRPolicy(gobgpAddr, bgp.SRPolicyOptions{}, log.WithName("bgp"))
+			if err != nil {
+				log.Error(err, "init gobgp SR Policy distributor")
+				os.Exit(1)
+			}
+			log.Info("BGP backend: gobgp (SR Policy SAFI 73)", "addr", gobgpAddr)
+		case "color-route":
+			bgpDist, err = bgp.NewGoBGP(gobgpAddr, log.WithName("bgp"))
+			if err != nil {
+				log.Error(err, "init gobgp distributor")
+				os.Exit(1)
+			}
+			log.Info("BGP backend: gobgp (colored IPv6 route)", "addr", gobgpAddr)
+		default:
+			log.Error(fmt.Errorf("unknown bgp-encoding %q", bgpEncoding), "invalid flag")
 			os.Exit(1)
 		}
-		log.Info("BGP backend: gobgp", "addr", gobgpAddr)
 	case "stub":
 		bgpDist = bgp.NewLoggingStub(log.WithName("bgp"))
 		log.Info("WARNING: BGP backend is logging stub (no real BGP UPDATE; not for production)")
