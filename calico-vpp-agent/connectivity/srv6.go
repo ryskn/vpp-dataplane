@@ -318,15 +318,50 @@ func (p *SRv6Provider) createLocalSidTunnels(currentLocalSids []*types.SrLocalsi
 	p.log.Infof("SRv6Provider createLocalSidTunnels")
 	endDt4Exist := false
 	endDt6Exist := false
+	// End.DT{4,6} must decap into the pod VRF (PodVRFIndex), not the main table.
+	// The decapped inner packet has to be looked up — and CNAT-reverse-translated
+	// by cnat-output — in the same FIB where the forward DNAT/session was created.
+	// Pod (and pod-backed service) traffic resolves in calico-pods-ip6 ==
+	// PodVRFIndex, so the CNAT session lives there. With FibTable 0 the return
+	// path of a cross-node pod-backed ClusterIP misses the CNAT session: the
+	// SYN-ACK reaches the client sourced from the backend pod IP instead of the
+	// ClusterIP, so the client RSTs and the connection never establishes.
 	for _, localSid := range currentLocalSids {
 		p.log.Debugf("Found existing SRv6Localsid: %s", localSid.String())
 
-		if localSid.Behavior == types.SrBehaviorDT6 && localSid.FibTable == 0 {
-			endDt6Exist = true
+		isDT6 := localSid.Behavior == types.SrBehaviorDT6
+		isDT4 := localSid.Behavior == types.SrBehaviorDT4
+		if !isDT6 && !isDT4 {
+			continue
 		}
 
-		if localSid.Behavior == types.SrBehaviorDT4 && localSid.FibTable == 0 {
-			endDt4Exist = true
+		if localSid.FibTable == common.PodVRFIndex {
+			endDt6Exist = endDt6Exist || isDT6
+			endDt4Exist = endDt4Exist || isDT4
+			continue
+		}
+
+		// Migrate a stale localsid created in the main table (FibTable 0) by an
+		// older agent: delete it and re-add it at the same SID address in
+		// PodVRFIndex, so remote nodes keep encapsulating to the same SID.
+		if localSid.FibTable == 0 {
+			p.log.Infof("SRv6Provider migrating End.DT localsid %s from main table to PodVRFIndex", localSid.Localsid.String())
+			if err := p.vpp.DelSRv6Localsid(localSid); err != nil {
+				p.log.Errorf("SRv6Provider migrate: delete stale localsid %s: %v", localSid.Localsid.String(), err)
+				continue
+			}
+			migrated := &types.SrLocalsid{
+				Localsid: localSid.Localsid,
+				EndPsp:   false,
+				FibTable: common.PodVRFIndex,
+				Behavior: localSid.Behavior,
+			}
+			if err := p.vpp.AddSRv6Localsid(migrated); err != nil {
+				p.log.Errorf("SRv6Provider migrate: re-add localsid %s in PodVRFIndex: %v", localSid.Localsid.String(), err)
+				continue
+			}
+			endDt6Exist = endDt6Exist || isDT6
+			endDt4Exist = endDt4Exist || isDT4
 		}
 	}
 	if !endDt4Exist {
@@ -370,7 +405,9 @@ func (p *SRv6Provider) setEndDT(typeDT int) (newLocalSid *types.SrLocalsid, err 
 	newLocalSid = &types.SrLocalsid{
 		Localsid: newLocalSidAddr,
 		EndPsp:   false,
-		FibTable: 0,
+		// Decap into the pod VRF so the inner packet (and its CNAT reverse
+		// translation) is processed in the same FIB as pod/service routing.
+		FibTable: common.PodVRFIndex,
 		Behavior: behavior,
 	}
 	if err = p.vpp.AddSRv6Localsid(newLocalSid); err != nil {
