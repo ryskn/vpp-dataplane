@@ -13,6 +13,7 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/common"
 	"github.com/projectcalico/vpp-dataplane/v3/config"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
+	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/interface_types"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/ip_types"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
 )
@@ -44,10 +45,16 @@ type SRv6Provider struct {
 	policyIPPool net.IPNet
 	// localSidIPPool is IP pool for LocalSID's SIDs (SID = IPv6 address in SRv6)
 	localSidIPPool net.IPNet
+	// dsrServices tracks the SR policy + steering installed for SRv6-native /
+	// NAT-less (DSR) ClusterIP services, keyed by VIP string.
+	dsrServices map[string]*dsrServiceState
+	// dsrDesired is the desired DSR service set (by VIP) — the source of truth
+	// reconciled against dsrServices, so failed installs AND removals retry.
+	dsrDesired map[string]*common.DSRService
 }
 
 func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
-	p := &SRv6Provider{d, make(map[string]*NodeToPrefixes), make(map[string]*NodeToPolicies), net.IPNet{}, net.IPNet{}}
+	p := &SRv6Provider{d, make(map[string]*NodeToPrefixes), make(map[string]*NodeToPolicies), net.IPNet{}, net.IPNet{}, make(map[string]*dsrServiceState), make(map[string]*common.DSRService)}
 	if *config.GetCalicoVppFeatureGates().SRv6Enabled {
 		p.localSidIPPool = cnet.MustParseNetwork(config.GetCalicoVppSrv6().LocalsidPool).IPNet
 		p.policyIPPool = cnet.MustParseNetwork(config.GetCalicoVppSrv6().PolicyPool).IPNet
@@ -259,6 +266,10 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) (err error) 
 		p.steerNodeIPViaSID(nodeip)
 	}
 
+	// A backend node's End.DT6 SID may have just become available (or a pending
+	// DSR removal may need retrying); reconcile the DSR services.
+	p.reconcileDSRServices()
+
 	return err
 }
 
@@ -319,13 +330,11 @@ func (p *SRv6Provider) createLocalSidTunnels(currentLocalSids []*types.SrLocalsi
 	endDt4Exist := false
 	endDt6Exist := false
 	// End.DT{4,6} must decap into the pod VRF (PodVRFIndex), not the main table.
-	// The decapped inner packet has to be looked up — and CNAT-reverse-translated
-	// by cnat-output — in the same FIB where the forward DNAT/session was created.
-	// Pod (and pod-backed service) traffic resolves in calico-pods-ip6 ==
-	// PodVRFIndex, so the CNAT session lives there. With FibTable 0 the return
-	// path of a cross-node pod-backed ClusterIP misses the CNAT session: the
-	// SYN-ACK reaches the client sourced from the backend pod IP instead of the
-	// ClusterIP, so the client RSTs and the connection never establishes.
+	// The decapped inner packet is looked up there, where pod routes and the
+	// SRv6-native (DSR) ClusterIP delivery routes live. VPP takes the decap VRF
+	// from the localsid's sw_if_index (dumped as SwIfIndex), so a correctly
+	// configured End.DT has SwIfIndex == PodVRFIndex.
+	podVRF := interface_types.InterfaceIndex(common.PodVRFIndex)
 	for _, localSid := range currentLocalSids {
 		p.log.Debugf("Found existing SRv6Localsid: %s", localSid.String())
 
@@ -335,34 +344,32 @@ func (p *SRv6Provider) createLocalSidTunnels(currentLocalSids []*types.SrLocalsi
 			continue
 		}
 
-		if localSid.FibTable == common.PodVRFIndex {
+		if localSid.SwIfIndex == podVRF {
 			endDt6Exist = endDt6Exist || isDT6
 			endDt4Exist = endDt4Exist || isDT4
 			continue
 		}
 
-		// Migrate a stale localsid created in the main table (FibTable 0) by an
-		// older agent: delete it and re-add it at the same SID address in
-		// PodVRFIndex, so remote nodes keep encapsulating to the same SID.
-		if localSid.FibTable == 0 {
-			p.log.Infof("SRv6Provider migrating End.DT localsid %s from main table to PodVRFIndex", localSid.Localsid.String())
-			if err := p.vpp.DelSRv6Localsid(localSid); err != nil {
-				p.log.Errorf("SRv6Provider migrate: delete stale localsid %s: %v", localSid.Localsid.String(), err)
-				continue
-			}
-			migrated := &types.SrLocalsid{
-				Localsid: localSid.Localsid,
-				EndPsp:   false,
-				FibTable: common.PodVRFIndex,
-				Behavior: localSid.Behavior,
-			}
-			if err := p.vpp.AddSRv6Localsid(migrated); err != nil {
-				p.log.Errorf("SRv6Provider migrate: re-add localsid %s in PodVRFIndex: %v", localSid.Localsid.String(), err)
-				continue
-			}
-			endDt6Exist = endDt6Exist || isDT6
-			endDt4Exist = endDt4Exist || isDT4
+		// Migrate a stale localsid created by an older agent to decap into the
+		// main table: delete it and re-add it at the same SID address decapping
+		// into PodVRFIndex, so remote nodes keep encapsulating to the same SID.
+		p.log.Infof("SRv6Provider migrating End.DT localsid %s into PodVRFIndex", localSid.Localsid.String())
+		if err := p.vpp.DelSRv6Localsid(localSid); err != nil {
+			p.log.Errorf("SRv6Provider migrate: delete stale localsid %s: %v", localSid.Localsid.String(), err)
+			continue
 		}
+		migrated := &types.SrLocalsid{
+			Localsid:  localSid.Localsid,
+			EndPsp:    false,
+			SwIfIndex: podVRF,
+			Behavior:  localSid.Behavior,
+		}
+		if err := p.vpp.AddSRv6Localsid(migrated); err != nil {
+			p.log.Errorf("SRv6Provider migrate: re-add localsid %s in PodVRFIndex: %v", localSid.Localsid.String(), err)
+			continue
+		}
+		endDt6Exist = endDt6Exist || isDT6
+		endDt4Exist = endDt4Exist || isDT4
 	}
 	if !endDt4Exist {
 		if localSidDT4, err := p.setEndDT(4); err != nil {
@@ -405,10 +412,12 @@ func (p *SRv6Provider) setEndDT(typeDT int) (newLocalSid *types.SrLocalsid, err 
 	newLocalSid = &types.SrLocalsid{
 		Localsid: newLocalSidAddr,
 		EndPsp:   false,
-		// Decap into the pod VRF so the inner packet (and its CNAT reverse
-		// translation) is processed in the same FIB as pod/service routing.
-		FibTable: common.PodVRFIndex,
-		Behavior: behavior,
+		// End.DT{4,6} read the decap VRF from sw_if_index (dumped as
+		// XconnectIfaceOrVrfTable), not fib_table. Point it at PodVRFIndex so the
+		// decapped inner packet is looked up in the pod VRF, where pod routes and
+		// SRv6-native (DSR) ClusterIP delivery routes live.
+		SwIfIndex: interface_types.InterfaceIndex(common.PodVRFIndex),
+		Behavior:  behavior,
 	}
 	if err = p.vpp.AddSRv6Localsid(newLocalSid); err != nil {
 		p.log.Infof("SRv6Provider Error adding LocalSid")
