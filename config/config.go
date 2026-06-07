@@ -80,6 +80,10 @@ const (
 	KeepOriginalPacketAnnotation string = "cni.projectcalico.org/vppKeepOriginalPacket"
 	HashConfigAnnotation         string = "cni.projectcalico.org/vppHashConfig"
 	LBTypeAnnotation             string = "cni.projectcalico.org/vppLBType"
+	// SRv6NativeAnnotation opts a ClusterIP service into the SRv6-native /
+	// NAT-less (DSR) data path (requires the SRv6NativeServicesEnabled feature
+	// gate). Value "true" enables it.
+	SRv6NativeAnnotation string = "cni.projectcalico.org/vppSRv6Native"
 )
 
 type BGPServerModeType string
@@ -401,6 +405,12 @@ type CalicoVppFeatureGatesConfigType struct {
 	SRv6EgressEnabled *bool `json:"srv6EgressEnabled,omitempty"`
 	IPSecEnabled      *bool `json:"ipsecEnabled,omitempty"`
 	PrometheusEnabled *bool `json:"prometheusEnabled,omitempty"`
+	// SRv6NativeServicesEnabled turns pod-backed ClusterIP services into
+	// SRv6-native / NAT-less (DSR) services instead of cnat translations.
+	// Experimental; requires SRv6Enabled. Only applies to ClusterIP services
+	// whose backends are all pod-backed and use port==targetPort; other
+	// services keep the cnat path.
+	SRv6NativeServicesEnabled *bool `json:"srv6NativeServicesEnabled,omitempty"`
 }
 
 func (cfg *CalicoVppFeatureGatesConfigType) Validate() (err error) {
@@ -411,6 +421,7 @@ func (cfg *CalicoVppFeatureGatesConfigType) Validate() (err error) {
 	cfg.SRv6EgressEnabled = DefaultToPtr(cfg.SRv6EgressEnabled, false)
 	cfg.IPSecEnabled = DefaultToPtr(cfg.IPSecEnabled, false)
 	cfg.PrometheusEnabled = DefaultToPtr(cfg.PrometheusEnabled, false)
+	cfg.SRv6NativeServicesEnabled = DefaultToPtr(cfg.SRv6NativeServicesEnabled, false)
 	return nil
 }
 
