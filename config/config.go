@@ -398,6 +398,7 @@ type CalicoVppFeatureGatesConfigType struct {
 	VCLEnabled        *bool `json:"vclEnabled,omitempty"`
 	MultinetEnabled   *bool `json:"multinetEnabled,omitempty"`
 	SRv6Enabled       *bool `json:"srv6Enabled,omitempty"`
+	SRv6EgressEnabled *bool `json:"srv6EgressEnabled,omitempty"`
 	IPSecEnabled      *bool `json:"ipsecEnabled,omitempty"`
 	PrometheusEnabled *bool `json:"prometheusEnabled,omitempty"`
 }
@@ -407,6 +408,7 @@ func (cfg *CalicoVppFeatureGatesConfigType) Validate() (err error) {
 	cfg.VCLEnabled = DefaultToPtr(cfg.VCLEnabled, false)
 	cfg.MultinetEnabled = DefaultToPtr(cfg.MultinetEnabled, false)
 	cfg.SRv6Enabled = DefaultToPtr(cfg.SRv6Enabled, false)
+	cfg.SRv6EgressEnabled = DefaultToPtr(cfg.SRv6EgressEnabled, false)
 	cfg.IPSecEnabled = DefaultToPtr(cfg.IPSecEnabled, false)
 	cfg.PrometheusEnabled = DefaultToPtr(cfg.PrometheusEnabled, false)
 	return nil

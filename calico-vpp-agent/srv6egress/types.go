@@ -7,15 +7,17 @@ import (
 )
 
 // VPPInterface is the seam between this package and the actual VPP control
-// path (existing connectivity.SRv6Provider). The Manager calls these methods
-// when a steering install is needed or no longer needed.
+// path. The Manager calls these methods when a steering install is needed or
+// no longer needed.
 //
-// Production implementation in calico-vpp-agent/connectivity/srv6.go will
-// wrap getPolicyNode / AddSRv6Steering / DelSRv6Steering, scoping the
-// FibTable to common.PodVRFIndex (PR #1028's pattern).
+// The production implementation lives in the CNI server (it owns the local pod
+// cache): it resolves req.PodIP to that pod's per-pod VRF (V6VrfID) and scopes
+// the SR steering there, so only the selected pod's traffic to DestPrefix is
+// steered into the SR Policy identified by BSID. The SR Policy itself (BSID →
+// segment list) is installed independently by the BGP watcher.
 type VPPInterface interface {
 	// InstallSteering programs a steering entry for the (source pod, dest CIDR)
-	// pair into PodVRFIndex, targeting the SR Policy identified by bsid.
+	// pair into the pod's per-pod VRF, targeting the SR Policy identified by BSID.
 	//
 	// podIP and destPrefix may use either IPv4 or IPv6; v1alpha1 supports IPv6
 	// only (dual-stack End.DT4 / SrSteerIPv4 is future work).
@@ -24,6 +26,17 @@ type VPPInterface interface {
 	// RemoveSteering undoes a previous InstallSteering for the same request key.
 	// Safe to call when no install exists (returns nil).
 	RemoveSteering(req SteeringRequest) error
+}
+
+// PodResolver resolves an EgressPolicy selector to the IPv6 addresses of the
+// pods on THIS node that match it. The production implementation is backed by
+// node-scoped pod + namespace informers (see resolver.go); manager unit tests
+// use a no-op resolver, so computeDesiredInstalls degrades to zero installs.
+type PodResolver interface {
+	// MatchingLocalPodIPs returns the IPv6 addresses of local (this-node) pods
+	// matching sel.NamespaceSelector + sel.PodSelector. A nil selector field
+	// matches everything in its scope (standard k8s LabelSelector semantics).
+	MatchingLocalPodIPs(sel srv6egressv1alpha1.Selector) ([]net.IP, error)
 }
 
 // SteeringRequest carries the information needed to install / remove a single
