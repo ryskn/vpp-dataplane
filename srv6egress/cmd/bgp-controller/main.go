@@ -7,10 +7,10 @@
 //   - Distribute SR Policies over BGP (Color Extended Community / RFC 9012)
 //   - Update EgressPolicy status
 //
-// v1alpha1 scope: stub BGP and VIP allocators are wired in by default so the
-// binary runs without external dependencies; production deployments should
-// flip these to the real gobgp / Calico IPAM backends (see srv6egress/internal/bgp
-// and srv6egress/internal/vipalloc TODOs).
+// Backends default to production: Calico IPAM VIPs + gobgp over SR Policy SAFI
+// (the headend installs the advertised policy and steers on its BSID). Bring-up
+// and tests can fall back to the in-memory / logging stubs with
+// --vip-backend=memory --bgp-backend=stub.
 package main
 
 import (
@@ -62,12 +62,12 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for liveness/readiness probes.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election (set when running multiple controller replicas).")
-	flag.StringVar(&vipBackend, "vip-backend", "memory",
-		"VIP allocator backend: 'calico' (Calico IPAM) or 'memory' (in-memory stub).")
-	flag.StringVar(&bgpBackend, "bgp-backend", "stub",
-		"BGP distributor backend: 'gobgp' (real gRPC) or 'stub' (logging only).")
-	flag.StringVar(&bgpEncoding, "bgp-encoding", "color-route",
-		"gobgp on-the-wire encoding: 'color-route' (colored IPv6 /128 + Color Ext-Community, RFC 9012 §3.4.2) or 'sr-policy' (SR Policy SAFI 73 with full segment list, for SRv6 backbone integration).")
+	flag.StringVar(&vipBackend, "vip-backend", "calico",
+		"VIP allocator backend: 'calico' (Calico IPAM, default) or 'memory' (in-memory stub for bring-up/tests).")
+	flag.StringVar(&bgpBackend, "bgp-backend", "gobgp",
+		"BGP distributor backend: 'gobgp' (real gRPC, default) or 'stub' (logging only, for bring-up/tests).")
+	flag.StringVar(&bgpEncoding, "bgp-encoding", "sr-policy",
+		"gobgp on-the-wire encoding: 'sr-policy' (SR Policy SAFI 73 with full segment list, default — the headend installs the policy and steers on its BSID) or 'color-route' (colored IPv6 /128 + Color Ext-Community, RFC 9012 §3.4.2; requires the SR Policy to be provisioned on the headend out-of-band).")
 	flag.StringVar(&gobgpAddr, "gobgp-addr", "127.0.0.1:50051",
 		"gobgp gRPC address (used when --bgp-backend=gobgp).")
 	// NOTE: do not register --kubeconfig here; controller-runtime's
@@ -107,8 +107,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Select backends. Defaults are the stubs (no external deps); production
-	// deployments pass --vip-backend=calico --bgp-backend=gobgp.
+	// Select backends. Defaults are the production backends (Calico IPAM + gobgp
+	// SR Policy SAFI); bring-up/tests opt into stubs with --vip-backend=memory
+	// --bgp-backend=stub.
 	var vipAlloc vipalloc.Allocator
 	switch vipBackend {
 	case "calico":

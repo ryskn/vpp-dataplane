@@ -41,6 +41,7 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/health"
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/routing"
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/services"
+	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/srv6egress"
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/watchers"
 	"github.com/projectcalico/vpp-dataplane/v3/config"
 )
@@ -267,6 +268,31 @@ func main() {
 	// watch LocalSID if SRv6 is enabled
 	if *config.GetCalicoVppFeatureGates().SRv6Enabled {
 		Go(localSIDWatcher.WatchLocalSID)
+	}
+
+	// SRv6 egress path steering (EgressPolicy CRD) — opt-in, builds on SRv6.
+	// The CNI server is the VPPInterface (it owns the local pod cache → per-pod
+	// VRF); a node-scoped pod/namespace resolver feeds the selector matching.
+	if *config.GetCalicoVppFeatureGates().SRv6Enabled && *config.GetCalicoVppFeatureGates().SRv6EgressEnabled {
+		egressLog := log.WithFields(logrus.Fields{"component": "srv6egress"})
+		egressResolver, err := srv6egress.NewPodResolver(egressLog, clusterConfig, *config.NodeName)
+		if err != nil {
+			log.WithError(err).Error("srv6egress: pod resolver init failed; egress steering disabled")
+		} else {
+			egressManager := srv6egress.NewManagerWithResolver(egressLog, cniServer, egressResolver)
+			egressResolver.OnChange = egressManager.ReconcileAll
+			egressWatcher, err := srv6egress.NewWatcher(egressLog, clusterConfig, egressManager)
+			if err != nil {
+				log.WithError(err).Error("srv6egress: watcher init failed; egress steering disabled")
+			} else {
+				Go(func(t *tomb.Tomb) error {
+					if err := egressResolver.Start(t.Dying()); err != nil {
+						return err
+					}
+					return egressWatcher.Watch(t)
+				})
+			}
+		}
 	}
 
 	healthServer.SetComponentStatus(health.ComponentAgent, true, "Agent ready")
