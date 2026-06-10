@@ -81,7 +81,9 @@ func (r *RouteWatcher) DelRoute(route *netlink.Route) (err error) {
 		return err
 	}
 	for i, watched := range r.routes {
-		if watched.Dst.String() == route.Dst.String() {
+		if watched.Dst.String() == route.Dst.String() &&
+			watched.LinkIndex == route.LinkIndex &&
+			watched.Priority == route.Priority {
 			r.routes[i] = r.routes[len(r.routes)-1]
 			r.routes = r.routes[:len(r.routes)-1]
 			break
@@ -168,6 +170,10 @@ func (r *RouteWatcher) getNetworkRoute(network string, physicalNet string) (rout
 				Protocol: syscall.RTPROT_STATIC,
 				MTU:      GetUplinkMtu(),
 				Priority: priority,
+				// Provide LinkIndex to ensure that we do add the route to the tap
+				// created by VPP and not another interface, e.g. in the case where
+				// VPP has stopped
+				LinkIndex: uplinkStatus.LinkIndex,
 			})
 		}
 	}
@@ -202,6 +208,10 @@ func (r *RouteWatcher) WatchRoutes(t *tomb.Tomb) error {
 				Protocol: syscall.RTPROT_STATIC,
 				MTU:      GetUplinkMtu(),
 				Priority: priority,
+				// Provide LinkIndex to ensure that we do add the route to the tap
+				// created by VPP and not another interface, e.g. in the case where
+				// VPP has stopped
+				LinkIndex: uplinkStatus.LinkIndex,
 			})
 			if err != nil {
 				r.log.Error(err, "cannot add route through vpp tap for service CIDR: %s", serviceCIDR.String())
@@ -326,7 +336,9 @@ func (r *RouteWatcher) WatchRoutes(t *tomb.Tomb) error {
 				if update.Type == syscall.RTM_DELROUTE {
 					for _, route := range r.routes {
 						// See if it is one of our routes
-						if update.Dst != nil && update.Dst.String() == route.Dst.String() {
+						if update.Dst != nil && update.Dst.String() == route.Dst.String() &&
+							update.LinkIndex == route.LinkIndex &&
+							update.Priority == route.Priority {
 							r.log.Infof("Re-adding route %+v", route)
 							err = netlink.RouteReplace(&route)
 							if err != nil {

@@ -20,7 +20,6 @@ type RPCService interface {
 	CreateVlanSubif(ctx context.Context, in *CreateVlanSubif) (*CreateVlanSubifReply, error)
 	DeleteLoopback(ctx context.Context, in *DeleteLoopback) (*DeleteLoopbackReply, error)
 	DeleteSubif(ctx context.Context, in *DeleteSubif) (*DeleteSubifReply, error)
-	GetBuffersStats(ctx context.Context, in *GetBuffersStats) (*GetBuffersStatsReply, error)
 	HwInterfaceSetMtu(ctx context.Context, in *HwInterfaceSetMtu) (*HwInterfaceSetMtuReply, error)
 	InterfaceNameRenumber(ctx context.Context, in *InterfaceNameRenumber) (*InterfaceNameRenumberReply, error)
 	PcapSetFilterFunction(ctx context.Context, in *PcapSetFilterFunction) (*PcapSetFilterFunctionReply, error)
@@ -34,12 +33,14 @@ type RPCService interface {
 	SwInterfaceDump(ctx context.Context, in *SwInterfaceDump) (RPCService_SwInterfaceDumpClient, error)
 	SwInterfaceGetDefaultRxMode(ctx context.Context, in *SwInterfaceGetDefaultRxMode) (*SwInterfaceGetDefaultRxModeReply, error)
 	SwInterfaceGetMacAddress(ctx context.Context, in *SwInterfaceGetMacAddress) (*SwInterfaceGetMacAddressReply, error)
+	SwInterfaceGetSpeedCapa(ctx context.Context, in *SwInterfaceGetSpeedCapa) (*SwInterfaceGetSpeedCapaReply, error)
 	SwInterfaceGetTable(ctx context.Context, in *SwInterfaceGetTable) (*SwInterfaceGetTableReply, error)
 	SwInterfaceRxPlacementDump(ctx context.Context, in *SwInterfaceRxPlacementDump) (RPCService_SwInterfaceRxPlacementDumpClient, error)
 	SwInterfaceSetDefaultRxMode(ctx context.Context, in *SwInterfaceSetDefaultRxMode) (*SwInterfaceSetDefaultRxModeReply, error)
 	SwInterfaceSetFlags(ctx context.Context, in *SwInterfaceSetFlags) (*SwInterfaceSetFlagsReply, error)
 	SwInterfaceSetInterfaceName(ctx context.Context, in *SwInterfaceSetInterfaceName) (*SwInterfaceSetInterfaceNameReply, error)
 	SwInterfaceSetIPDirectedBroadcast(ctx context.Context, in *SwInterfaceSetIPDirectedBroadcast) (*SwInterfaceSetIPDirectedBroadcastReply, error)
+	SwInterfaceSetLinkSpeed(ctx context.Context, in *SwInterfaceSetLinkSpeed) (*SwInterfaceSetLinkSpeedReply, error)
 	SwInterfaceSetMacAddress(ctx context.Context, in *SwInterfaceSetMacAddress) (*SwInterfaceSetMacAddressReply, error)
 	SwInterfaceSetMtu(ctx context.Context, in *SwInterfaceSetMtu) (*SwInterfaceSetMtuReply, error)
 	SwInterfaceSetPromisc(ctx context.Context, in *SwInterfaceSetPromisc) (*SwInterfaceSetPromiscReply, error)
@@ -117,15 +118,6 @@ func (c *serviceClient) DeleteLoopback(ctx context.Context, in *DeleteLoopback) 
 
 func (c *serviceClient) DeleteSubif(ctx context.Context, in *DeleteSubif) (*DeleteSubifReply, error) {
 	out := new(DeleteSubifReply)
-	err := c.conn.Invoke(ctx, in, out)
-	if err != nil {
-		return nil, err
-	}
-	return out, api.RetvalToVPPApiError(out.Retval)
-}
-
-func (c *serviceClient) GetBuffersStats(ctx context.Context, in *GetBuffersStats) (*GetBuffersStatsReply, error) {
-	out := new(GetBuffersStatsReply)
 	err := c.conn.Invoke(ctx, in, out)
 	if err != nil {
 		return nil, err
@@ -230,9 +222,11 @@ func (c *serviceClient) SwInterfaceDump(ctx context.Context, in *SwInterfaceDump
 	}
 	x := &serviceClient_SwInterfaceDumpClient{stream}
 	if err := x.Stream.SendMsg(in); err != nil {
+		x.Stream.Close()
 		return nil, err
 	}
 	if err = x.Stream.SendMsg(&memclnt.ControlPing{}); err != nil {
+		x.Stream.Close()
 		return nil, err
 	}
 	return x, nil
@@ -262,6 +256,7 @@ func (c *serviceClient_SwInterfaceDumpClient) Recv() (*SwInterfaceDetails, error
 		}
 		return nil, io.EOF
 	default:
+		c.Stream.Close()
 		return nil, fmt.Errorf("unexpected message: %T %v", m, m)
 	}
 }
@@ -277,6 +272,15 @@ func (c *serviceClient) SwInterfaceGetDefaultRxMode(ctx context.Context, in *SwI
 
 func (c *serviceClient) SwInterfaceGetMacAddress(ctx context.Context, in *SwInterfaceGetMacAddress) (*SwInterfaceGetMacAddressReply, error) {
 	out := new(SwInterfaceGetMacAddressReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) SwInterfaceGetSpeedCapa(ctx context.Context, in *SwInterfaceGetSpeedCapa) (*SwInterfaceGetSpeedCapaReply, error) {
+	out := new(SwInterfaceGetSpeedCapaReply)
 	err := c.conn.Invoke(ctx, in, out)
 	if err != nil {
 		return nil, err
@@ -300,9 +304,11 @@ func (c *serviceClient) SwInterfaceRxPlacementDump(ctx context.Context, in *SwIn
 	}
 	x := &serviceClient_SwInterfaceRxPlacementDumpClient{stream}
 	if err := x.Stream.SendMsg(in); err != nil {
+		x.Stream.Close()
 		return nil, err
 	}
 	if err = x.Stream.SendMsg(&memclnt.ControlPing{}); err != nil {
+		x.Stream.Close()
 		return nil, err
 	}
 	return x, nil
@@ -332,6 +338,7 @@ func (c *serviceClient_SwInterfaceRxPlacementDumpClient) Recv() (*SwInterfaceRxP
 		}
 		return nil, io.EOF
 	default:
+		c.Stream.Close()
 		return nil, fmt.Errorf("unexpected message: %T %v", m, m)
 	}
 }
@@ -365,6 +372,15 @@ func (c *serviceClient) SwInterfaceSetInterfaceName(ctx context.Context, in *SwI
 
 func (c *serviceClient) SwInterfaceSetIPDirectedBroadcast(ctx context.Context, in *SwInterfaceSetIPDirectedBroadcast) (*SwInterfaceSetIPDirectedBroadcastReply, error) {
 	out := new(SwInterfaceSetIPDirectedBroadcastReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) SwInterfaceSetLinkSpeed(ctx context.Context, in *SwInterfaceSetLinkSpeed) (*SwInterfaceSetLinkSpeedReply, error) {
+	out := new(SwInterfaceSetLinkSpeedReply)
 	err := c.conn.Invoke(ctx, in, out)
 	if err != nil {
 		return nil, err
@@ -460,6 +476,7 @@ func (c *serviceClient) SwInterfaceTxPlacementGet(ctx context.Context, in *SwInt
 	}
 	x := &serviceClient_SwInterfaceTxPlacementGetClient{stream}
 	if err := x.Stream.SendMsg(in); err != nil {
+		x.Stream.Close()
 		return nil, err
 	}
 	return x, nil
@@ -493,6 +510,7 @@ func (c *serviceClient_SwInterfaceTxPlacementGetClient) Recv() (*SwInterfaceTxPl
 		}
 		return nil, m, io.EOF
 	default:
+		c.Stream.Close()
 		return nil, nil, fmt.Errorf("unexpected message: %T %v", m, m)
 	}
 }
