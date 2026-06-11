@@ -286,10 +286,39 @@ func main() {
 				log.WithError(err).Error("srv6egress: watcher init failed; egress steering disabled")
 			} else {
 				Go(func(t *tomb.Tomb) error {
+					// Egress failures are isolated: they are logged and retried,
+					// never returned, so a transient API/watch error cannot tear
+					// down the whole node agent.
 					if err := egressResolver.Start(t.Dying()); err != nil {
-						return err
+						log.WithError(err).Error("srv6egress: resolver start failed; egress steering disabled")
+						return nil
 					}
-					return egressWatcher.Watch(t)
+					// Periodically re-reconcile: a steering install can fail
+					// because the SR Policy (distributed asynchronously over BGP)
+					// is not installed yet when the pod/policy event fires. The
+					// ticker retries until the policy lands.
+					go func() {
+						ticker := time.NewTicker(30 * time.Second)
+						defer ticker.Stop()
+						for {
+							select {
+							case <-t.Dying():
+								return
+							case <-ticker.C:
+								egressManager.ReconcileAll()
+							}
+						}
+					}()
+					for {
+						if err := egressWatcher.Watch(t); err != nil {
+							log.WithError(err).Warn("srv6egress: watcher exited; retrying in 5s")
+						}
+						select {
+						case <-t.Dying():
+							return nil
+						case <-time.After(5 * time.Second):
+						}
+					}
 				})
 			}
 		}
