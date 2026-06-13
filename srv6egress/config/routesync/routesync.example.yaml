@@ -13,3 +13,10 @@ upstreams:
   - peer: "fda2::1"           # sim-isp-b eBGP peer
     table: 200                # VPP VRF for upstream-B (End.DT6 fcff:0:0:e0:b::)
     interface: "virtio-0/0/12/0"
+
+# v1alpha2 BR mode (optional): BSID block for SR policies created from
+# received RFC 9252 service routes (prefixes carrying an SRv6 service SID are
+# installed as `sr policy + sr steer` in the peer's VRF instead of plain FIB
+# entries). Each distinct service SID gets one deterministic BSID inside this
+# block; requires --vpp-backend=govpp. Mask must be /96 or shorter.
+#serviceBsidBlock: "cafe:f::/96"

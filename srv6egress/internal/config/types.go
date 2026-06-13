@@ -22,6 +22,47 @@ type ControllerConfig struct {
 	// Colors maps RFC 9256 color numbers to a target upstream and segment list.
 	// Keyed by color value (uint32 in JSON keys is stringified, accepted both).
 	Colors map[uint32]ColorConfig `json:"colors"`
+
+	// Backbone enables v1alpha2 BR mode: tenant VIPs are additionally announced
+	// toward the SRv6 backbone as RFC 9252 service routes (own End SID +
+	// backbone Color Ext-Comm) on the per-upstream GW↔PE eBGP sessions.
+	// +optional
+	Backbone *BackboneConfig `json:"backbone,omitempty"`
+}
+
+// BackboneConfig declares the cluster⇄backbone stitching (v1alpha2).
+type BackboneConfig struct {
+	// ColorMap maps a cluster color to the backbone Color Ext-Comm value used
+	// on the GW↔PE session. A color absent from the map keeps its value
+	// (identity mapping = the "color continuity" default).
+	// +optional
+	ColorMap map[uint32]uint32 `json:"colorMap,omitempty"`
+
+	// Peers configures the backbone-facing BGP speaker per upstream (keyed by
+	// the upstream name from Upstreams). Only upstreams present here get VIP
+	// service-route announcements.
+	Peers map[string]BackbonePeerConfig `json:"peers"`
+}
+
+// BackbonePeerConfig is one backbone-facing gobgp (per-VRF, on the egress GW).
+type BackbonePeerConfig struct {
+	// GoBGPAddr is the gRPC endpoint of the gobgp instance holding the eBGP
+	// session toward this upstream's backbone PE (e.g. "192.168.1.14:50052").
+	GoBGPAddr string `json:"gobgpAddr"`
+	// Nexthop is the next-hop the advertised VIP routes carry on that session
+	// (the GW's address on the PE link, e.g. "fda1::2").
+	Nexthop string `json:"nexthop"`
+}
+
+// BackboneColor resolves a cluster color to its backbone Color Ext-Comm value.
+func (b *BackboneConfig) BackboneColor(clusterColor uint32) uint32 {
+	if b == nil {
+		return clusterColor
+	}
+	if v, ok := b.ColorMap[clusterColor]; ok {
+		return v
+	}
+	return clusterColor
 }
 
 // UpstreamConfig describes a single egress upstream (per-VRF End.DT6 on the GW).
@@ -142,6 +183,29 @@ func (c *ControllerConfig) Validate() error {
 		if last := segs[len(segs)-1]; !last.Equal(wantSID) {
 			return fmt.Errorf("color %d: last segment %q must equal upstream %q SID %q",
 				color, cc.SegmentList[len(cc.SegmentList)-1], cc.Upstream, c.Upstreams[cc.Upstream].SID)
+		}
+	}
+
+	if c.Backbone != nil {
+		if len(c.Backbone.Peers) == 0 {
+			return fmt.Errorf("backbone: peers must not be empty when backbone is set")
+		}
+		for name, p := range c.Backbone.Peers {
+			if _, ok := c.Upstreams[name]; !ok {
+				return fmt.Errorf("backbone.peers[%q]: upstream not defined in upstreams", name)
+			}
+			if p.GoBGPAddr == "" {
+				return fmt.Errorf("backbone.peers[%q]: gobgpAddr is required", name)
+			}
+			nh := net.ParseIP(p.Nexthop)
+			if nh == nil || nh.To4() != nil {
+				return fmt.Errorf("backbone.peers[%q]: nexthop %q must be an IPv6 address", name, p.Nexthop)
+			}
+		}
+		for cl := range c.Backbone.ColorMap {
+			if _, ok := c.Colors[cl]; !ok {
+				return fmt.Errorf("backbone.colorMap: cluster color %d not defined in colors", cl)
+			}
 		}
 	}
 	return nil

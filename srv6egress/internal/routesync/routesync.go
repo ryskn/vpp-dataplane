@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"net"
 	"regexp"
 	"sort"
 )
@@ -35,6 +37,30 @@ type Upstream struct {
 // Config is the operator-supplied peer->VRF mapping for one egress gateway.
 type Config struct {
 	Upstreams []Upstream `json:"upstreams"`
+	// ServiceBSIDBlock reserves an IPv6 block (mask length <= 96) for the BSIDs
+	// of SR policies created for received SRv6 service routes (RFC 9252). Each
+	// distinct service SID gets one deterministic BSID inside the block, so the
+	// mapping survives restarts without local state. Required only when the
+	// upstream advertises service routes (v1alpha2 BR mode).
+	ServiceBSIDBlock string `json:"serviceBsidBlock,omitempty"`
+}
+
+// ServiceBSIDNet parses ServiceBSIDBlock, or returns nil when unset.
+func (c *Config) ServiceBSIDNet() (*net.IPNet, error) {
+	if c.ServiceBSIDBlock == "" {
+		return nil, nil
+	}
+	_, ipnet, err := net.ParseCIDR(c.ServiceBSIDBlock)
+	if err != nil {
+		return nil, fmt.Errorf("serviceBsidBlock %q: %w", c.ServiceBSIDBlock, err)
+	}
+	if ipnet.IP.To4() != nil {
+		return nil, fmt.Errorf("serviceBsidBlock %q must be IPv6", c.ServiceBSIDBlock)
+	}
+	if ones, _ := ipnet.Mask.Size(); ones > 96 {
+		return nil, fmt.Errorf("serviceBsidBlock %q: mask /%d leaves fewer than 32 bits for BSID derivation (need <= /96)", c.ServiceBSIDBlock, ones)
+	}
+	return ipnet, nil
 }
 
 // byPeer indexes upstreams by peer address.
@@ -52,14 +78,69 @@ type Route struct {
 	Table     uint32
 	Via       string
 	Interface string
+	// ServiceSID, when non-empty, marks this as an SRv6 service route
+	// (RFC 9252): instead of a plain FIB entry via the peer, the prefix is
+	// steered into an SR encap toward this SID (v1alpha2 BR mode). Canonical
+	// IPv6 string.
+	ServiceSID string
 }
 
-// Key uniquely identifies a route for diffing.
+// IsService reports whether this is an SRv6 service route (SR encap action).
+func (r Route) IsService() bool { return r.ServiceSID != "" }
+
+// Key uniquely identifies a route for diffing. ServiceSID is part of the
+// identity so a service route whose SID changed is replaced, not kept stale.
 func (r Route) Key() string {
-	return fmt.Sprintf("%d|%s", r.Table, r.Prefix)
+	return fmt.Sprintf("%d|%s|%s", r.Table, r.Prefix, r.ServiceSID)
+}
+
+// DeriveServiceBSID maps a service SID to its deterministic BSID inside block:
+// the block's prefix with the last 4 bytes set to fnv1a-32(serviceSID). No
+// local state is needed to recover the mapping after a restart. Collisions
+// between distinct service SIDs are possible but vanishingly rare at egress
+// scale; the programmer detects them at install time (policy/SID mismatch).
+func DeriveServiceBSID(block *net.IPNet, serviceSID net.IP) net.IP {
+	h := fnv.New32a()
+	_, _ = h.Write(serviceSID.To16())
+	sum := h.Sum32()
+	bsid := make(net.IP, net.IPv6len)
+	copy(bsid, block.IP.To16())
+	bsid[12] = byte(sum >> 24)
+	bsid[13] = byte(sum >> 16)
+	bsid[14] = byte(sum >> 8)
+	bsid[15] = byte(sum)
+	return bsid
+}
+
+// SplitServiceRoutes partitions routes into plain FIB routes and SRv6 service
+// routes (preserving order).
+func SplitServiceRoutes(routes []Route) (plain, service []Route) {
+	for _, r := range routes {
+		if r.IsService() {
+			service = append(service, r)
+		} else {
+			plain = append(plain, r)
+		}
+	}
+	return plain, service
 }
 
 // --- gobgp RIB JSON parsing ---
+
+// ribPrefixSIDSubTLV is an SRv6 Information Sub-TLV (type 1) as gobgp's native
+// MarshalJSON emits it (the CLI marshals native bgp attr types). SID is []byte
+// → base64 in JSON, decoded transparently by encoding/json.
+type ribPrefixSIDSubTLV struct {
+	Type             int    `json:"type"`
+	SID              []byte `json:"sid"`
+	EndpointBehavior uint16 `json:"endpoint_behavior"`
+}
+
+// ribPrefixSIDTLV is an SRv6 Service TLV (type 5 = L3) in the Prefix-SID attr.
+type ribPrefixSIDTLV struct {
+	Type    int                  `json:"type"`
+	SubTLVs []ribPrefixSIDSubTLV `json:"SubTLVs"`
+}
 
 // ribPath is one path entry in gobgp's `global rib -j` output.
 type ribPath struct {
@@ -69,8 +150,9 @@ type ribPath struct {
 	Best       bool   `json:"best"`
 	NeighborIP string `json:"neighbor-ip"`
 	Attrs      []struct {
-		Type    int    `json:"type"`
-		Nexthop string `json:"nexthop"`
+		Type    int               `json:"type"`
+		Nexthop string            `json:"nexthop"`
+		TLVs    []ribPrefixSIDTLV `json:"TLVs"` // Prefix-SID attr (type 40) only
 	} `json:"attrs"`
 }
 
@@ -85,51 +167,86 @@ func (p ribPath) nexthop() string {
 	return p.NeighborIP
 }
 
-// ParseRIB parses `gobgp global rib -a ipv6 -j` output into prefix->nexthop for
-// the best path of each prefix. An empty RIB (`null` / `{}`) yields an empty map.
-func ParseRIB(b []byte) (map[string]string, error) {
+// serviceSID extracts the SRv6 service SID from a Prefix-SID attribute
+// (type 40 → SRv6 L3 Service TLV (5) → SRv6 Information Sub-TLV (1)), or ""
+// when the path is a plain route (RFC 9252 reception, v1alpha2 BR mode).
+func (p ribPath) serviceSID() string {
+	for _, a := range p.Attrs {
+		if a.Type != 40 {
+			continue
+		}
+		for _, tlv := range a.TLVs {
+			if tlv.Type != 5 {
+				continue
+			}
+			for _, sub := range tlv.SubTLVs {
+				if sub.Type != 1 || len(sub.SID) != net.IPv6len {
+					continue
+				}
+				return net.IP(sub.SID).String()
+			}
+		}
+	}
+	return ""
+}
+
+// RIBEntry is the best-path information routesync needs for one prefix.
+type RIBEntry struct {
+	Nexthop    string
+	ServiceSID string // non-empty for SRv6 service routes (RFC 9252)
+}
+
+// ParseRIB parses `gobgp global rib -a ipv6 -j` output into prefix→best-path
+// info for each prefix. An empty RIB (`null` / `{}`) yields an empty map.
+func ParseRIB(b []byte) (map[string]RIBEntry, error) {
 	if len(b) == 0 {
-		return map[string]string{}, nil
+		return map[string]RIBEntry{}, nil
 	}
 	var raw map[string][]ribPath
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil, fmt.Errorf("parse gobgp rib json: %w", err)
 	}
-	out := make(map[string]string, len(raw))
+	out := make(map[string]RIBEntry, len(raw))
 	for prefix, paths := range raw {
-		nh := ""
-		for _, p := range paths {
-			if p.Best {
-				nh = p.nexthop()
+		var best *ribPath
+		for i := range paths {
+			if paths[i].Best {
+				best = &paths[i]
 				break
 			}
 		}
-		if nh == "" && len(paths) > 0 {
-			nh = paths[0].nexthop()
+		if best == nil && len(paths) > 0 {
+			best = &paths[0]
 		}
-		if nh != "" {
-			out[prefix] = nh
+		if best == nil {
+			continue
+		}
+		if nh := best.nexthop(); nh != "" {
+			out[prefix] = RIBEntry{Nexthop: nh, ServiceSID: best.serviceSID()}
 		}
 	}
 	return out, nil
 }
 
-// DesiredRoutes maps the RIB (prefix->nexthop) to the VPP routes that should be
-// installed, keeping only prefixes whose next-hop is a configured upstream peer.
+// DesiredRoutes maps the RIB (prefix→best-path info) to the VPP routes that
+// should be installed, keeping only prefixes whose next-hop is a configured
+// upstream peer. Paths carrying an SRv6 service SID become service routes
+// (SR encap action) in the peer's VRF; the rest become plain FIB entries.
 // Result is sorted by Key for deterministic diffing/logging.
-func DesiredRoutes(rib map[string]string, cfg *Config) []Route {
+func DesiredRoutes(rib map[string]RIBEntry, cfg *Config) []Route {
 	peers := cfg.byPeer()
 	var routes []Route
-	for prefix, nh := range rib {
-		up, ok := peers[nh]
+	for prefix, e := range rib {
+		up, ok := peers[e.Nexthop]
 		if !ok {
 			continue // next-hop is not one of our upstreams; skip
 		}
 		routes = append(routes, Route{
-			Prefix:    prefix,
-			Table:     up.Table,
-			Via:       up.Peer,
-			Interface: up.Interface,
+			Prefix:     prefix,
+			Table:      up.Table,
+			Via:        up.Peer,
+			Interface:  up.Interface,
+			ServiceSID: e.ServiceSID,
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].Key() < routes[j].Key() })

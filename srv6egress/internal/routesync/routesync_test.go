@@ -2,10 +2,14 @@ package routesync
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net"
 	"reflect"
 	"testing"
 
 	"github.com/go-logr/logr"
+	gobgpb "github.com/osrg/gobgp/v3/pkg/packet/bgp"
 )
 
 func testCfg() *Config {
@@ -32,9 +36,9 @@ func TestParseRIB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{
-		"2001:db8:a::/64": "fda1::1",
-		"2001:db8:b::/64": "fda2::1",
+	want := map[string]RIBEntry{
+		"2001:db8:a::/64": {Nexthop: "fda1::1"},
+		"2001:db8:b::/64": {Nexthop: "fda2::1"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseRIB = %v, want %v", got, want)
@@ -60,16 +64,16 @@ func TestParseRIB_FallbackToNeighborIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m["2001:db8:c::/64"] != "fda1::1" {
-		t.Fatalf("fallback nexthop = %q, want fda1::1", m["2001:db8:c::/64"])
+	if m["2001:db8:c::/64"].Nexthop != "fda1::1" {
+		t.Fatalf("fallback nexthop = %q, want fda1::1", m["2001:db8:c::/64"].Nexthop)
 	}
 }
 
 func TestDesiredRoutes(t *testing.T) {
-	rib := map[string]string{
-		"2001:db8:a::/64": "fda1::1", // → table 100
-		"2001:db8:b::/64": "fda2::1", // → table 200
-		"2001:db8:z::/64": "fdff::9", // next-hop not an upstream → dropped
+	rib := map[string]RIBEntry{
+		"2001:db8:a::/64": {Nexthop: "fda1::1"}, // → table 100
+		"2001:db8:b::/64": {Nexthop: "fda2::1"}, // → table 200
+		"2001:db8:z::/64": {Nexthop: "fdff::9"}, // next-hop not an upstream → dropped
 	}
 	got := DesiredRoutes(rib, testCfg())
 	want := []Route{
@@ -244,7 +248,7 @@ func TestSyncer_RemovesStaleRouteAfterRestart(t *testing.T) {
 	if !foundDel {
 		t.Fatalf("stale route not removed after restart; deleted=%v", fp.deleted)
 	}
-	if _, ok := fp.fib[100]["100|2001:db8:a::/64"]; ok {
+	if _, ok := fp.fib[100][Route{Prefix: "2001:db8:a::/64", Table: 100}.Key()]; ok {
 		t.Fatal("stale route still present in VPP FIB after reconcile")
 	}
 }
@@ -275,6 +279,175 @@ var errFIB = &fibErr{}
 type fibErr struct{}
 
 func (*fibErr) Error() string { return "vpp unreachable" }
+
+// --- SRv6 service routes (RFC 9252, v1alpha2 BR mode) ---
+
+// servicePathJSON renders one RIB path whose Prefix-SID attribute is generated
+// by gobgp's OWN MarshalJSON (the exact code path the gobgp CLI uses for -j),
+// so this is a faithful wire-format regression guard for our parser.
+func servicePathJSON(t *testing.T, prefix, nexthop, sid string, behavior uint16) string {
+	t.Helper()
+	psid := gobgpb.NewPathAttributePrefixSID(&gobgpb.SRv6L3ServiceAttribute{
+		TLV: gobgpb.TLV{Type: gobgpb.TLVType(5)},
+		SubTLVs: []gobgpb.PrefixSIDTLVInterface{
+			&gobgpb.SRv6InformationSubTLV{
+				SubTLV:           gobgpb.SubTLV{Type: gobgpb.SubTLVType(1)},
+				SID:              net.ParseIP(sid).To16(),
+				EndpointBehavior: behavior,
+			},
+		},
+	})
+	b, err := json.Marshal(psid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf(`{"nlri":{"prefix":"%s"},"best":true,"neighbor-ip":"%s",
+		"attrs":[{"type":1,"value":0},{"type":14,"nexthop":"%s","afi":2,"safi":1},%s]}`,
+		prefix, nexthop, nexthop, b)
+}
+
+func TestParseRIB_ServiceSID(t *testing.T) {
+	j := fmt.Sprintf(`{"2001:db8:svc::/64":[%s]}`,
+		servicePathJSON(t, "2001:db8:svc::/64", "fda1::1", "fcff:0:0:b:1::", 18))
+	got, err := ParseRIB([]byte(j))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := got["2001:db8:svc::/64"]
+	if !ok {
+		t.Fatalf("prefix missing: %v", got)
+	}
+	if e.Nexthop != "fda1::1" {
+		t.Fatalf("nexthop = %q, want fda1::1", e.Nexthop)
+	}
+	if e.ServiceSID != "fcff:0:0:b:1::" {
+		t.Fatalf("serviceSID = %q, want fcff:0:0:b:1::", e.ServiceSID)
+	}
+}
+
+func TestDesiredRoutes_ServiceSplit(t *testing.T) {
+	rib := map[string]RIBEntry{
+		"2001:db8:a::/64":   {Nexthop: "fda1::1"},
+		"2001:db8:svc::/64": {Nexthop: "fda1::1", ServiceSID: "fcff:0:0:b:1::"},
+	}
+	plain, service := SplitServiceRoutes(DesiredRoutes(rib, testCfg()))
+	if len(plain) != 1 || plain[0].Prefix != "2001:db8:a::/64" {
+		t.Fatalf("plain = %v", plain)
+	}
+	if len(service) != 1 || service[0].Prefix != "2001:db8:svc::/64" ||
+		service[0].Table != 100 || service[0].ServiceSID != "fcff:0:0:b:1::" {
+		t.Fatalf("service = %v", service)
+	}
+}
+
+func TestDeriveServiceBSID(t *testing.T) {
+	_, block, _ := net.ParseCIDR("cafe:f::/96")
+	a := DeriveServiceBSID(block, net.ParseIP("fcff:0:0:b:1::"))
+	b := DeriveServiceBSID(block, net.ParseIP("fcff:0:0:b:1::"))
+	c := DeriveServiceBSID(block, net.ParseIP("fcff:0:0:b:2::"))
+	if !a.Equal(b) {
+		t.Fatalf("not deterministic: %s vs %s", a, b)
+	}
+	if a.Equal(c) {
+		t.Fatalf("distinct SIDs collided: %s", a)
+	}
+	if !block.Contains(a) || !block.Contains(c) {
+		t.Fatalf("BSID outside block: %s / %s", a, c)
+	}
+}
+
+func TestRouteKey_IncludesServiceSID(t *testing.T) {
+	plain := Route{Prefix: "2001:db8:svc::/64", Table: 100}
+	svc := Route{Prefix: "2001:db8:svc::/64", Table: 100, ServiceSID: "fcff:0:0:b:1::"}
+	if plain.Key() == svc.Key() {
+		t.Fatal("service identity must be part of the route key")
+	}
+}
+
+// fakeServiceProgrammer extends fakeProgrammer with the service interface,
+// mirroring applied service routes per table.
+type fakeServiceProgrammer struct {
+	*fakeProgrammer
+	svcAdded, svcDeleted []Route
+	svc                  map[uint32]map[string]Route
+}
+
+func newFakeServiceProgrammer() *fakeServiceProgrammer {
+	return &fakeServiceProgrammer{
+		fakeProgrammer: newFakeProgrammer(),
+		svc:            map[uint32]map[string]Route{},
+	}
+}
+
+func (f *fakeServiceProgrammer) AddService(r Route) error {
+	f.svcAdded = append(f.svcAdded, r)
+	if f.svc[r.Table] == nil {
+		f.svc[r.Table] = map[string]Route{}
+	}
+	f.svc[r.Table][r.Key()] = r
+	return nil
+}
+
+func (f *fakeServiceProgrammer) DelService(r Route) error {
+	f.svcDeleted = append(f.svcDeleted, r)
+	if f.svc[r.Table] != nil {
+		delete(f.svc[r.Table], r.Key())
+	}
+	return nil
+}
+
+func (f *fakeServiceProgrammer) InstalledServiceRoutes(table uint32) ([]Route, error) {
+	var out []Route
+	for _, r := range f.svc[table] {
+		// VPP-side reconstruction carries only (prefix, table, sid).
+		out = append(out, Route{Prefix: r.Prefix, Table: r.Table, ServiceSID: r.ServiceSID})
+	}
+	return out, nil
+}
+
+func TestSyncer_ServiceRoutesConverge(t *testing.T) {
+	fp := newFakeServiceProgrammer()
+	rib := fmt.Sprintf(`{"2001:db8:svc::/64":[%s]}`,
+		servicePathJSON(t, "2001:db8:svc::/64", "fda1::1", "fcff:0:0:b:1::", 18))
+	s := &Syncer{Cfg: testCfg(), VPP: fp, Log: logr.Discard(),
+		Fetch: func(_ context.Context) ([]byte, error) { return []byte(rib), nil }}
+
+	// Pass 1: service route installed (as a service, not a plain FIB route).
+	s.reconcileOnce(context.Background())
+	if len(fp.svcAdded) != 1 || fp.svcAdded[0].ServiceSID != "fcff:0:0:b:1::" || fp.svcAdded[0].Table != 100 {
+		t.Fatalf("svcAdded = %v", fp.svcAdded)
+	}
+	if len(fp.added) != 0 {
+		t.Fatalf("service route must not be installed as a plain route: %v", fp.added)
+	}
+
+	// Pass 2: idempotent.
+	s.reconcileOnce(context.Background())
+	if len(fp.svcAdded) != 1 || len(fp.svcDeleted) != 0 {
+		t.Fatalf("pass2 svcAdded=%d svcDeleted=%d, want 1/0", len(fp.svcAdded), len(fp.svcDeleted))
+	}
+
+	// Withdraw → service install removed.
+	rib = `{}`
+	s.reconcileOnce(context.Background())
+	if len(fp.svcDeleted) != 1 || fp.svcDeleted[0].Prefix != "2001:db8:svc::/64" {
+		t.Fatalf("svcDeleted = %v", fp.svcDeleted)
+	}
+}
+
+// A backend without service support must not break plain reconciliation when
+// service routes appear (they are reported, not fatal).
+func TestSyncer_ServiceUnsupportedBackend(t *testing.T) {
+	fp := newFakeProgrammer() // plain-only backend
+	rib := fmt.Sprintf(`{"2001:db8:a::/64":[{"nlri":{"prefix":"2001:db8:a::/64"},"best":true,"neighbor-ip":"fda1::1","attrs":[{"type":14,"nexthop":"fda1::1"}]}],"2001:db8:svc::/64":[%s]}`,
+		servicePathJSON(t, "2001:db8:svc::/64", "fda1::1", "fcff:0:0:b:1::", 18))
+	s := &Syncer{Cfg: testCfg(), VPP: fp, Log: logr.Discard(),
+		Fetch: func(_ context.Context) ([]byte, error) { return []byte(rib), nil }}
+	s.reconcileOnce(context.Background())
+	if len(fp.added) != 1 || fp.added[0].Prefix != "2001:db8:a::/64" {
+		t.Fatalf("plain route must still be reconciled: %v", fp.added)
+	}
+}
 
 func TestParseOwnedRoutes(t *testing.T) {
 	raw := []byte(`ipv6-VRF:100, fib_index:11, flow hash:[src dst]

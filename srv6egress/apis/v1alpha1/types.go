@@ -114,6 +114,12 @@ type EgressPolicyStatus struct {
 	// +optional
 	SRPolicy *SRPolicyStatus `json:"srPolicy,omitempty"`
 
+	// Backbone records the RFC 9252 SRv6 service route announced toward the
+	// backbone PE for this policy's VIP (v1alpha2 BR mode). Persisted BEFORE
+	// the announce so deletion can always rebuild the exact withdraw.
+	// +optional
+	Backbone *BackboneStatus `json:"backbone,omitempty"`
+
 	// Conditions describe the current state. Standard k8s condition types:
 	//   - Ready: the policy is installed and traffic is being steered.
 	//   - Degraded: a non-fatal error prevents full operation (e.g. eBGP down).
@@ -142,6 +148,30 @@ type SRPolicyStatus struct {
 	// (<distinguisher, color, endpoint>) after a controller restart.
 	// +optional
 	EndpointAddr string `json:"endpointAddr,omitempty"`
+}
+
+// BackboneStatus describes the SRv6 service route (RFC 9252) advertised to
+// the backbone for this policy's VIP.
+type BackboneStatus struct {
+	// Prefix is the advertised VIP prefix (e.g. "2001:db8:e::42/128").
+	Prefix string `json:"prefix"`
+
+	// EndSID is the gateway's own End.DT6 SID attached to the advertisement
+	// (the SID the backbone uses to SR-reach the VIP).
+	EndSID string `json:"endSID"`
+
+	// Color is the backbone Color Extended Community value (cluster color
+	// mapped through the controller's backbone colorMap).
+	Color uint32 `json:"color"`
+
+	// Upstream names the backbone peering (controller config key) the route
+	// was announced on.
+	// +optional
+	Upstream string `json:"upstream,omitempty"`
+
+	// Nexthop is the next-hop used on the GW-PE session.
+	// +optional
+	Nexthop string `json:"nexthop,omitempty"`
 }
 
 func init() {

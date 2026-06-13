@@ -30,6 +30,9 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("upstreams[%d]: peer, table and interface are required", i)
 		}
 	}
+	if _, err := c.ServiceBSIDNet(); err != nil {
+		return nil, fmt.Errorf("routesync config %s: %w", path, err)
+	}
 	return &c, nil
 }
 
@@ -111,7 +114,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context) {
 		s.Log.Error(err, "parse RIB")
 		return
 	}
-	desired := DesiredRoutes(rib, s.Cfg)
+	plain, services := SplitServiceRoutes(DesiredRoutes(rib, s.Cfg))
 
 	installed, err := s.installedFromVPP()
 	if err != nil {
@@ -121,7 +124,7 @@ func (s *Syncer) reconcileOnce(ctx context.Context) {
 		return
 	}
 
-	add, del := Reconcile(desired, installed)
+	add, del := Reconcile(plain, installed)
 	for _, r := range add {
 		if err := s.VPP.Add(r); err != nil {
 			s.Log.Error(err, "install route", "prefix", r.Prefix, "table", r.Table, "via", r.Via)
@@ -135,5 +138,48 @@ func (s *Syncer) reconcileOnce(ctx context.Context) {
 			continue
 		}
 		s.Log.Info("removed stale route", "prefix", r.Prefix, "table", r.Table, "via", r.Via)
+	}
+
+	s.reconcileServices(services)
+}
+
+// reconcileServices reconciles SRv6 service routes (RFC 9252) when the backend
+// supports them. It runs even with zero desired service routes so installs
+// left over from withdrawn services are cleaned up.
+func (s *Syncer) reconcileServices(desired []Route) {
+	sp, ok := s.VPP.(ServiceVPPProgrammer)
+	if !ok {
+		if len(desired) > 0 {
+			s.Log.Error(nil, "RIB carries SRv6 service routes but the VPP backend does not support them (use --vpp-backend=govpp)",
+				"count", len(desired))
+		}
+		return
+	}
+
+	var installed []Route
+	for _, table := range s.Cfg.Tables() {
+		routes, err := sp.InstalledServiceRoutes(table)
+		if err != nil {
+			// Same rule as plain routes: no deletes based on a partial view.
+			s.Log.Error(err, "read installed service routes from VPP; skipping service pass", "table", table)
+			return
+		}
+		installed = append(installed, routes...)
+	}
+
+	add, del := Reconcile(desired, installed)
+	for _, r := range add {
+		if err := sp.AddService(r); err != nil {
+			s.Log.Error(err, "install service route", "prefix", r.Prefix, "table", r.Table, "sid", r.ServiceSID)
+			continue
+		}
+		s.Log.Info("installed service route", "prefix", r.Prefix, "table", r.Table, "sid", r.ServiceSID)
+	}
+	for _, r := range del {
+		if err := sp.DelService(r); err != nil {
+			s.Log.Error(err, "remove service route", "prefix", r.Prefix, "table", r.Table, "sid", r.ServiceSID)
+			continue
+		}
+		s.Log.Info("removed stale service route", "prefix", r.Prefix, "table", r.Table, "sid", r.ServiceSID)
 	}
 }

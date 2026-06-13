@@ -137,6 +137,9 @@ func (in *EgressPolicyStatus) DeepCopyInto(out *EgressPolicyStatus) {
 	if in.SRPolicy != nil {
 		out.SRPolicy = in.SRPolicy.DeepCopy()
 	}
+	if in.Backbone != nil {
+		out.Backbone = in.Backbone.DeepCopy()
+	}
 	if in.Conditions != nil {
 		out.Conditions = make([]metav1.Condition, len(in.Conditions))
 		for i := range in.Conditions {
@@ -166,6 +169,19 @@ func (in *SRPolicyStatus) DeepCopy() *SRPolicyStatus {
 		return nil
 	}
 	out := new(SRPolicyStatus)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *BackboneStatus) DeepCopyInto(out *BackboneStatus) {
+	*out = *in
+}
+
+func (in *BackboneStatus) DeepCopy() *BackboneStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(BackboneStatus)
 	in.DeepCopyInto(out)
 	return out
 }

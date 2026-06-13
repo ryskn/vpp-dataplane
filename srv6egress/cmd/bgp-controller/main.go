@@ -157,13 +157,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// v1alpha2 BR mode: one service distributor per backbone-stitched upstream
+	// (the per-VRF gobgp on the egress GW holding the eBGP session to the PE).
+	backboneBGP := map[string]bgp.ServiceDistributor{}
+	if cfg.Backbone != nil {
+		for upstream, peer := range cfg.Backbone.Peers {
+			dist, err := bgp.NewGoBGPService(peer.GoBGPAddr, bgp.DefaultSIDStructure, log.WithName("backbone").WithValues("upstream", upstream))
+			if err != nil {
+				log.Error(err, "init backbone service distributor", "upstream", upstream, "addr", peer.GoBGPAddr)
+				os.Exit(1)
+			}
+			backboneBGP[upstream] = dist
+			log.Info("backbone peer wired (RFC 9252 service routes)", "upstream", upstream, "addr", peer.GoBGPAddr)
+		}
+	}
+
 	if err := (&controller.EgressPolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Config: cfg,
-		VIPs:   vipAlloc,
-		BGP:    bgpDist,
-		Pools:  poolvalidator.NewCalico(mgr.GetClient()),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Config:      cfg,
+		VIPs:        vipAlloc,
+		BGP:         bgpDist,
+		Pools:       poolvalidator.NewCalico(mgr.GetClient()),
+		BackboneBGP: backboneBGP,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "setup EgressPolicy reconciler")
 		os.Exit(1)

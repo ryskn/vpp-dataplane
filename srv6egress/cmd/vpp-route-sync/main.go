@@ -82,6 +82,17 @@ func main() {
 	}
 	log.Info("VPP backend selected", "backend", vppBackend)
 
+	// SRv6 service routes (RFC 9252, v1alpha2 BR mode) need a BSID block and
+	// the govpp backend.
+	if block, _ := cfg.ServiceBSIDNet(); block != nil {
+		if p, ok := vpp.(*vpplinkprog.Programmer); ok {
+			p.SetServiceBSIDBlock(block)
+			log.Info("SRv6 service routes enabled", "serviceBsidBlock", block.String())
+		} else {
+			log.Info("serviceBsidBlock configured but --vpp-backend is not govpp; service routes will be reported as unsupported")
+		}
+	}
+
 	s := &routesync.Syncer{
 		Cfg:      cfg,
 		Fetch:    routesync.ExecRIBFetcher(strings.Fields(gobgpCmd)),

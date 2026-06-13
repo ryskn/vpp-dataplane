@@ -21,6 +21,22 @@ type VPPProgrammer interface {
 	InstalledRoutes(table uint32, peers map[string]Upstream) ([]Route, error)
 }
 
+// ServiceVPPProgrammer is the optional extension for SRv6 service routes
+// (RFC 9252, v1alpha2 BR mode): a service route is not a plain FIB entry but
+// an SR policy (segment list = [service SID]) plus an SR steer of the prefix
+// in the VRF. Only the vpplink (govpp) backend implements it; the syncer
+// detects support via a type assertion and reports service routes as
+// unsupported otherwise.
+type ServiceVPPProgrammer interface {
+	AddService(r Route) error
+	DelService(r Route) error
+	// InstalledServiceRoutes returns the service routes installed in the given
+	// VRF table whose BSID lies in the configured service BSID block — i.e. the
+	// ones this component owns. Like InstalledRoutes, an error must NOT be
+	// treated as "empty".
+	InstalledServiceRoutes(table uint32) ([]Route, error)
+}
+
 // ExecProgrammer programs VPP by running a configurable command (the "vpp exec"
 // prefix) with the vppctl argument vector appended. Examples for the prefix:
 //

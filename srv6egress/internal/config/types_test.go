@@ -135,3 +135,67 @@ func TestValidate_DuplicateBSIDRejected(t *testing.T) {
 		t.Fatal("expected error for duplicate BSID across colors")
 	}
 }
+
+// --- v1alpha2 backbone validation ---
+
+func validBackbone() *BackboneConfig {
+	return &BackboneConfig{
+		ColorMap: map[uint32]uint32{100: 1100},
+		Peers: map[string]BackbonePeerConfig{
+			"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
+		},
+	}
+}
+
+func TestValidate_BackboneOK(t *testing.T) {
+	c := baseValid()
+	c.Backbone = validBackbone()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected valid backbone config, got: %v", err)
+	}
+}
+
+func TestValidate_BackbonePeerUnknownUpstream(t *testing.T) {
+	c := baseValid()
+	c.Backbone = validBackbone()
+	c.Backbone.Peers["isp-z"] = BackbonePeerConfig{GoBGPAddr: "x:1", Nexthop: "fda9::2"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for backbone peer referencing unknown upstream")
+	}
+}
+
+func TestValidate_BackboneColorMapUnknownColor(t *testing.T) {
+	c := baseValid()
+	c.Backbone = validBackbone()
+	c.Backbone.ColorMap[999] = 1999
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for colorMap entry without a defined cluster color")
+	}
+}
+
+func TestValidate_BackbonePeerRequiresFields(t *testing.T) {
+	c := baseValid()
+	c.Backbone = validBackbone()
+	c.Backbone.Peers["isp-a"] = BackbonePeerConfig{Nexthop: "fda1::2"} // no gobgpAddr
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for missing gobgpAddr")
+	}
+	c.Backbone.Peers["isp-a"] = BackbonePeerConfig{GoBGPAddr: "x:1", Nexthop: "10.0.0.1"} // v4 NH
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for IPv4 nexthop")
+	}
+}
+
+func TestBackboneColor_IdentityWhenUnmapped(t *testing.T) {
+	b := validBackbone()
+	if got := b.BackboneColor(100); got != 1100 {
+		t.Fatalf("mapped color = %d, want 1100", got)
+	}
+	if got := b.BackboneColor(200); got != 200 {
+		t.Fatalf("unmapped color = %d, want identity 200", got)
+	}
+	var nilB *BackboneConfig
+	if got := nilB.BackboneColor(300); got != 300 {
+		t.Fatalf("nil backbone color = %d, want identity 300", got)
+	}
+}

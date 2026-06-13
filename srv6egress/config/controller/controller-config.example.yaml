@@ -34,3 +34,18 @@ colors:
     bsid: "cafe::c8"
     segmentList:
       - "fcff:0:0:e0:b::"
+
+# v1alpha2 BR mode (optional): stitch the cluster SR domain to an SRv6
+# backbone. Tenant VIPs are additionally announced on the per-upstream GW↔PE
+# eBGP sessions as RFC 9252 service routes (own End SID + Color Ext-Comm),
+# making the VIP SR-reachable from the backbone with the intent color intact.
+#backbone:
+#  colorMap:                   # cluster color -> backbone color (identity if omitted)
+#    100: 100
+#  peers:                      # keyed by upstream name above
+#    isp-a:
+#      gobgpAddr: "192.168.1.14:50052"  # per-VRF gobgp on the GW (eBGP to PE-A)
+#      nexthop: "fda1::2"               # GW address on the PE-A link
+#    isp-b:
+#      gobgpAddr: "192.168.1.14:50053"
+#      nexthop: "fda2::2"

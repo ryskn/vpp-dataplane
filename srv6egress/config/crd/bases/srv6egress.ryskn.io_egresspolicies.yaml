@@ -197,6 +197,28 @@ spec:
                       type: array
                       items:
                         type: string
+                backbone:
+                  description: |
+                    RFC 9252 SRv6 service route announced toward the backbone
+                    PE for this policy's VIP (v1alpha2 BR mode). Persisted
+                    before announcing so deletion can rebuild the withdraw.
+                  type: object
+                  required:
+                    - prefix
+                    - endSID
+                    - color
+                  properties:
+                    prefix:
+                      type: string
+                    endSID:
+                      type: string
+                    color:
+                      type: integer
+                      format: int64
+                    upstream:
+                      type: string
+                    nexthop:
+                      type: string
                 conditions:
                   type: array
                   items:
