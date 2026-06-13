@@ -5,6 +5,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"gopkg.in/tomb.v2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -52,9 +53,24 @@ func (w *Watcher) Watch(t *tomb.Tomb) error {
 		cancel()
 	}()
 
+	// List-then-watch: feed the current state, prune policies deleted while no
+	// watch was running (their Deleted events are gone for good), then watch
+	// from the list's resourceVersion so nothing in between is missed.
 	var list srv6egressv1alpha1.EgressPolicyList
+	if err := w.client.List(ctx, &list); err != nil {
+		return err
+	}
+	live := make(map[string]struct{}, len(list.Items))
+	for i := range list.Items {
+		ep := &list.Items[i]
+		live[string(ep.UID)] = struct{}{}
+		w.manager.OnPolicyUpdate(ep)
+	}
+	w.manager.PruneExcept(live)
+
 	wi, err := w.client.Watch(ctx, &list, &ctrlclient.ListOptions{
 		FieldSelector: fields.Everything(),
+		Raw:           &metav1.ListOptions{ResourceVersion: list.ResourceVersion},
 	})
 	if err != nil {
 		return err

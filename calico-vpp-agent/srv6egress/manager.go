@@ -221,6 +221,28 @@ func isReady(ep *srv6egressv1alpha1.EgressPolicy) bool {
 	return false
 }
 
+// PruneExcept tears down every tracked policy whose UID is not in live.
+// Called with the UID set from a fresh List on watch (re)connect: Deleted
+// events that fired while no watch was running are lost for good (a new watch
+// only replays current objects as ADDED), so this is the only way their
+// steering gets cleaned up.
+func (m *Manager) PruneExcept(live map[string]struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for uid, st := range m.policies {
+		if _, ok := live[uid]; ok {
+			continue
+		}
+		for _, req := range st.installs {
+			if err := m.vpp.RemoveSteering(req); err != nil {
+				m.log.WithError(err).WithField("uid", uid).
+					Warn("prune: RemoveSteering failed; continuing")
+			}
+		}
+		delete(m.policies, uid)
+	}
+}
+
 // Reset clears all installs (used during agent shutdown). Best-effort; errors
 // from VPP are logged but do not stop the loop.
 func (m *Manager) Reset() {

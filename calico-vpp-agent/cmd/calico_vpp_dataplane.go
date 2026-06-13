@@ -315,6 +315,10 @@ func main() {
 						}
 						select {
 						case <-t.Dying():
+							// Graceful shutdown: clear our steering so the next agent
+							// generation starts from clean VPP state. Crash paths are
+							// covered by the List+prune Watch performs on (re)start.
+							egressManager.Reset()
 							return nil
 						case <-time.After(5 * time.Second):
 						}
