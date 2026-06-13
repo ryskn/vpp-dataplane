@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ryskn <ryosuke.nakayama@ryskn.com>
+Date: Sat, 13 Jun 2026 03:11:46 +0900
+Subject: [PATCH] sr: add End.DT6.In behavior (decap + ip6-input re-injection)
+
+End.DT6 does the inner lookup straight in the configured FIB, bypassing the
+ip6-unicast feature arc. Features that NAT the inner packet (cnat input /
+snat) therefore never run on SRv6-decapsulated traffic, while the same
+services compose fine with VXLAN (whose decap re-enters ip6-input on the
+tunnel interface).
+
+Add End.DT6.In: identical to End.DT6, but the decapsulated packet re-enters
+ip6-input attributed to a configured RX interface. The interface's
+ip6-unicast features (e.g. cnat) run on the inner packet and the lookup uses
+the interface's FIB, giving SRv6 decap the same composition model as a VXLAN
+tunnel. CLI: sr localsid address <sid> behavior end.dt6.in <interface>.
+
+CLI-only for now (no binary API enum addition); the interface is expected to
+live in the target VRF with the desired features enabled.
+
+Signed-off-by: Ryosuke Nakayama <ryosuke.nakayama@ryskn.com>
+---
+ {a => b}/src/vnet/srv6/sr.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+ {a => b}/src/vnet/srv6/sr_localsid.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/vnet/srv6/sr.h b/src/vnet/srv6/sr.h
+index cf23fa5..6d2164e 100644
+--- a/src/vnet/srv6/sr.h
++++ b/src/vnet/srv6/sr.h
+@@ -43,13 +43,18 @@
+ #define SR_BEHAVIOR_END_UN_PERF 11
+ #define SR_BEHAVIOR_END_UN	12
+ #define SR_BEHAVIOR_UA		13
++/* End.DT6, but the decapsulated packet re-enters ip6-input attributed to a
++ * configured RX interface, so the interface's ip6-unicast feature arc (e.g.
++ * cnat) runs and the lookup happens in the interface's FIB. Same composition
++ * model as a VXLAN tunnel decap. */
++#define SR_BEHAVIOR_DT6_IN 14
+ 
+ /**
+  * SR_BEHAVIOR_CURRENT_LAST
+  * MUST be updated everytime we add new behaviors.
+  * MUST be set to value of last added behavior + 1.
+  * */
+-#define SR_BEHAVIOR_CURRENT_LAST 14
++#define SR_BEHAVIOR_CURRENT_LAST 15
+ 
+ #define SR_STEER_L2 2
+ #define SR_STEER_IPV4 4
+diff --git a/src/vnet/srv6/sr_localsid.c b/src/vnet/srv6/sr_localsid.c
+index d035aff..2f91e32 100644
+--- a/src/vnet/srv6/sr_localsid.c
++++ b/src/vnet/srv6/sr_localsid.c
+@@ -236,6 +236,9 @@ sr_cli_localsid (char is_del, ip6_address_t *localsid_addr, u16 localsid_prefix_
+     case SR_BEHAVIOR_DT6:
+       ls->vrf_index = fib_table_find (FIB_PROTOCOL_IP6, sw_if_index);
+       break;
++    case SR_BEHAVIOR_DT6_IN:
++      ls->sw_if_index = sw_if_index;
++      break;
+     case SR_BEHAVIOR_DT4:
+       ls->vrf_index = fib_table_find (FIB_PROTOCOL_IP4, sw_if_index);
+       break;
+@@ -400,6 +403,9 @@ sr_cli_localsid_command_fn (vlib_main_t * vm, unformat_input_t * input,
+ 	  else if (unformat (input, "end.dx2 %U",
+ 			     unformat_vnet_sw_interface, vnm, &sw_if_index))
+ 	    behavior = SR_BEHAVIOR_DX2;
++	  else if (unformat (input, "end.dt6.in %U",
++			     unformat_vnet_sw_interface, vnm, &sw_if_index))
++	    behavior = SR_BEHAVIOR_DT6_IN;
+ 	  else if (unformat (input, "end.dt6 %u", &sw_if_index))
+ 	    behavior = SR_BEHAVIOR_DT6;
+ 	  else if (unformat (input, "end.dt4 %u", &sw_if_index))
+@@ -660,6 +666,15 @@ show_sr_localsid_command_fn (vlib_main_t * vm, unformat_input_t * input,
+ 			   fib_table_get_table_id (ls->vrf_index,
+ 						   FIB_PROTOCOL_IP4));
+ 	  break;
++	case SR_BEHAVIOR_DT6_IN:
++	  vlib_cli_output (vm,
++			   "\tAddress: \t%U/%u\n\tBehavior: \tDT6.In (Endpoint with decapsulation and"
++			   " ip6-input re-injection on RX interface)"
++			   "\n\tIface:  \t%U",
++			   format_ip6_address, &ls->localsid,
++			   ls->localsid_prefix_len,
++			   format_vnet_sw_if_index_name, vnm, ls->sw_if_index);
++	  break;
+ 	default:
+ 	  if (ls->behavior >= SR_BEHAVIOR_CURRENT_LAST)
+ 	    {
+@@ -763,6 +778,7 @@ static char *sr_localsid_error_strings[] = {
+   _ (IP4_LOOKUP, "ip4-lookup")                                                                     \
+   _ (IP6_REWRITE, "ip6-rewrite")                                                                   \
+   _ (IP4_REWRITE, "ip4-rewrite")                                                                   \
++  _ (IP6_INPUT, "ip6-input")                                                                       \
+   _ (L2_OUTPUT, "l2-output")
+ 
+ typedef enum
+@@ -817,6 +833,9 @@ format_sr_localsid_trace (u8 * s, va_list * args)
+     case SR_BEHAVIOR_DT6:
+       s = format (s, "\tBehavior: Decapsulation with IPv6 Table lookup\n");
+       break;
++    case SR_BEHAVIOR_DT6_IN:
++      s = format (s, "\tBehavior: Decapsulation with ip6-input re-injection\n");
++      break;
+     case SR_BEHAVIOR_DT4:
+       s = format (s, "\tBehavior: Decapsulation with IPv4 Table lookup\n");
+       break;
+@@ -1139,6 +1158,17 @@ end_decaps_srh_processing (vlib_node_runtime_t * node,
+ 	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = ls0->vrf_index;
+ 	  return;
+ 	}
++      else if (ls0->behavior == SR_BEHAVIOR_DT6_IN)
++	{
++	  /* Decap and re-enter ip6-input as if received on the configured
++	   * interface: its ip6-unicast features (e.g. cnat) run on the
++	   * inner packet and the lookup uses the interface's FIB. */
++	  vlib_buffer_advance (b0, total_size);
++	  vnet_buffer (b0)->sw_if_index[VLIB_RX] = ls0->sw_if_index;
++	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = ~(u32) 0;
++	  *next0 = SR_LOCALSID_NEXT_IP6_INPUT;
++	  return;
++	}
+       break;
+     case IP_PROTOCOL_IP_IN_IP:
+       /* Encap-End IPv4. Pop outer IPv6 header */
