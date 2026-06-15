@@ -135,6 +135,7 @@ git_apply_private 0003-ip-neighbor-preserve-interface-LL-receive-DPO-for-se.patc
 git_apply_private 0004-npol-add-matched-rule-id-to-acl-trace.patch
 git_apply_private 0005-interface-add-buffer-stats-api.patch
 git_apply_private 0006-sr-add-End.DT6.In-behavior-decap-ip6-input-re-inject.patch
+git_apply_private 0007-cnat-per-fib-snat-address.patch
 # VPP Private plugins:
 copy_private_plugin ip_ttl_fixup
 copy_private_plugin pbl
