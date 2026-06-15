@@ -285,6 +285,23 @@ func main() {
 			if err != nil {
 				log.WithError(err).Error("srv6egress: watcher init failed; egress steering disabled")
 			} else {
+				// Endpoint (egress gateway) provisioning: only when this node is
+				// configured as a gateway (it has the upstream→VRF table map). On
+				// other nodes the gateway manager is not wired, so it stays idle.
+				srv6cfg := config.GetCalicoVppSrv6()
+				var egressGateway *srv6egress.GatewayManager
+				if len(srv6cfg.EgressUpstreamTables) > 0 {
+					vrfBase := srv6cfg.EgressVrfBase
+					if vrfBase == 0 {
+						vrfBase = 1000
+					}
+					egressGateway = srv6egress.NewGatewayManager(egressLog,
+						srv6egress.NewVPPGateway(vpp, egressLog), *config.NodeName,
+						srv6cfg.EgressUpstreamTables, vrfBase)
+					egressWatcher.SetGatewayManager(egressGateway)
+					egressLog.WithField("upstreamTables", srv6cfg.EgressUpstreamTables).
+						Info("egress gateway provisioning enabled on this node")
+				}
 				Go(func(t *tomb.Tomb) error {
 					// Egress failures are isolated: they are logged and retried,
 					// never returned, so a transient API/watch error cannot tear
@@ -306,6 +323,9 @@ func main() {
 								return
 							case <-ticker.C:
 								egressManager.ReconcileAll()
+								if egressGateway != nil {
+									egressGateway.ReconcileAll()
+								}
 							}
 						}
 					}()
@@ -319,6 +339,9 @@ func main() {
 							// generation starts from clean VPP state. Crash paths are
 							// covered by the List+prune Watch performs on (re)start.
 							egressManager.Reset()
+							if egressGateway != nil {
+								egressGateway.Reset()
+							}
 							return nil
 						case <-time.After(5 * time.Second):
 						}

@@ -422,6 +422,15 @@ func (cfg *CalicoVppFeatureGatesConfigType) String() string {
 type CalicoVppSrv6ConfigType struct {
 	LocalsidPool string `json:"localsidPool"`
 	PolicyPool   string `json:"policyPool"`
+	// EgressUpstreamTables maps an egress upstream name (EgressPolicy
+	// status.upstream) to the VPP VRF table id holding that upstream's routes
+	// on the egress gateway. Set on egress gateway nodes for v1alpha2 SNAT: the
+	// per-tenant VRF forwards to / returns from this table. Empty on
+	// non-gateway nodes (the gateway provisioner then stays idle there).
+	EgressUpstreamTables map[string]uint32 `json:"egressUpstreamTables,omitempty"`
+	// EgressVrfBase is the first VPP VRF table id used for per-tenant egress
+	// VRFs on the gateway (allocated upward). Defaults to 1000 when 0.
+	EgressVrfBase uint32 `json:"egressVrfBase,omitempty"`
 }
 
 func (cfg *CalicoVppSrv6ConfigType) Validate() (err error) { return nil }

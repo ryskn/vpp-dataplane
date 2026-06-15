@@ -24,7 +24,14 @@ type Watcher struct {
 	log     *logrus.Entry
 	client  ctrlclient.WithWatch
 	manager *Manager
+	// gateway is the optional endpoint-side provisioner. It is fed the same
+	// cluster-wide events and acts only on policies whose endpoint is this node.
+	gateway *GatewayManager
 }
+
+// SetGatewayManager wires an endpoint-side GatewayManager to receive the same
+// EgressPolicy events as the headend Manager. Optional; nil = headend only.
+func (w *Watcher) SetGatewayManager(g *GatewayManager) { w.gateway = g }
 
 // NewWatcher constructs a Watcher backed by the given Manager and rest.Config
 // (typically obtained from rest.InClusterConfig in the agent's main).
@@ -65,8 +72,14 @@ func (w *Watcher) Watch(t *tomb.Tomb) error {
 		ep := &list.Items[i]
 		live[string(ep.UID)] = struct{}{}
 		w.manager.OnPolicyUpdate(ep)
+		if w.gateway != nil {
+			w.gateway.OnPolicyUpdate(ep)
+		}
 	}
 	w.manager.PruneExcept(live)
+	if w.gateway != nil {
+		w.gateway.PruneExcept(live)
+	}
 
 	wi, err := w.client.Watch(ctx, &list, &ctrlclient.ListOptions{
 		FieldSelector: fields.Everything(),
@@ -101,6 +114,9 @@ func (w *Watcher) handleEvent(ev watch.Event) {
 			return
 		}
 		w.manager.OnPolicyUpdate(ep)
+		if w.gateway != nil {
+			w.gateway.OnPolicyUpdate(ep)
+		}
 	case watch.Deleted:
 		ep, ok := ev.Object.(*srv6egressv1alpha1.EgressPolicy)
 		if !ok {
@@ -108,6 +124,9 @@ func (w *Watcher) handleEvent(ev watch.Event) {
 			return
 		}
 		w.manager.OnPolicyDelete(string(ep.UID))
+		if w.gateway != nil {
+			w.gateway.OnPolicyDelete(string(ep.UID))
+		}
 	case watch.Bookmark, watch.Error:
 		w.log.WithField("type", ev.Type).Debug("watch meta-event")
 	default:
