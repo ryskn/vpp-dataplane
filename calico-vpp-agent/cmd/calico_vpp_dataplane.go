@@ -298,6 +298,11 @@ func main() {
 					egressGateway = srv6egress.NewGatewayManager(egressLog,
 						srv6egress.NewVPPGateway(vpp, egressLog), *config.NodeName,
 						srv6cfg.EgressUpstreamTables, vrfBase)
+					// Advertise provisioned tenant SIDs over BGP so headend nodes
+					// can route the SR-encapsulated packet to this gateway.
+					if spec, ok := ourBGPSpec.(*common.LocalNodeSpec); ok && spec != nil {
+						egressGateway.SetSIDAdvertiser(srv6egress.NewBGPSIDAdvertiser(spec))
+					}
 					egressWatcher.SetGatewayManager(egressGateway)
 					egressLog.WithField("upstreamTables", srv6cfg.EgressUpstreamTables).
 						Info("egress gateway provisioning enabled on this node")

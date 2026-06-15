@@ -50,6 +50,55 @@ func newGWManager(vpp VPPGateway) *GatewayManager {
 		map[string]uint32{"isp-a": 100, "isp-b": 200}, 1000)
 }
 
+type fakeAdvertiser struct {
+	advertised map[string]struct{}
+	withdrawn  map[string]struct{}
+}
+
+func newFakeAdvertiser() *fakeAdvertiser {
+	return &fakeAdvertiser{advertised: map[string]struct{}{}, withdrawn: map[string]struct{}{}}
+}
+func (f *fakeAdvertiser) AdvertiseSID(sid net.IP) error {
+	f.advertised[sid.String()] = struct{}{}
+	return nil
+}
+func (f *fakeAdvertiser) WithdrawSID(sid net.IP) error {
+	f.withdrawn[sid.String()] = struct{}{}
+	return nil
+}
+
+// The gateway must advertise the tenant SID on install (so headend nodes can
+// route to it) and withdraw it on teardown.
+func TestGateway_AdvertisesAndWithdrawsSID(t *testing.T) {
+	vpp := newFakeGW()
+	adv := newFakeAdvertiser()
+	m := newGWManager(vpp)
+	m.SetSIDAdvertiser(adv)
+
+	m.OnPolicyUpdate(gwPolicy("a", "uid-a", "gw-node", "fcff:0:0:e0:a:1::", "2001:db8:e::a", "isp-a"))
+	if !contains(adv.advertised, "fcff:0:0:e0:a:1::") {
+		t.Fatalf("SID not advertised on install: %v", adv.advertised)
+	}
+	m.OnPolicyDelete("uid-a")
+	if !contains(adv.withdrawn, "fcff:0:0:e0:a:1::") {
+		t.Fatalf("SID not withdrawn on teardown: %v", adv.withdrawn)
+	}
+}
+
+func contains(m map[string]struct{}, k string) bool {
+	if _, ok := m[k]; ok {
+		return true
+	}
+	// net.IP.String may canonicalize differently; match by parsed equality.
+	want := net.ParseIP(k)
+	for s := range m {
+		if net.ParseIP(s).Equal(want) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGateway_InstallsForLocalEndpoint(t *testing.T) {
 	vpp := newFakeGW()
 	m := newGWManager(vpp)

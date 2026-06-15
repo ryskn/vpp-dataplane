@@ -30,6 +30,17 @@ type VPPGateway interface {
 	RemoveGateway(req GatewayRequest) error
 }
 
+// SIDAdvertiser makes a gateway tenant SID reachable cluster-wide by
+// advertising a BGP route to it (next-hop = this node). Calico advertises a
+// node's own localsid SIDs via their IPAM block; the egress gateway's
+// controller-assigned terminal SID is in no block, so the gateway advertises
+// it directly. Optional: nil means the SID must be made reachable by other
+// means (e.g. a static route).
+type SIDAdvertiser interface {
+	AdvertiseSID(sid net.IP) error
+	WithdrawSID(sid net.IP) error
+}
+
 // GatewayRequest is the resolved per-policy gateway provisioning intent on the
 // endpoint node.
 type GatewayRequest struct {
@@ -85,6 +96,15 @@ type GatewayManager struct {
 	mu       sync.Mutex
 	policies map[string]*gwState // key = EgressPolicy.UID
 	vrfs     *vrfAllocator
+	sids     SIDAdvertiser // optional; advertises the tenant SID over BGP
+}
+
+// SetSIDAdvertiser wires BGP advertisement of provisioned tenant SIDs. Call
+// before the watcher starts. Optional; nil keeps SIDs un-advertised.
+func (m *GatewayManager) SetSIDAdvertiser(a SIDAdvertiser) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sids = a
 }
 
 // NewGatewayManager builds a GatewayManager for nodeName. upstreamTables gives
@@ -179,6 +199,14 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 	}
 	cp := req
 	st.install = &cp
+	// Advertise the tenant SID so headend nodes can route the SR-encapsulated
+	// packet to this gateway (best-effort; the data path is already installed).
+	if m.sids != nil {
+		if err := m.sids.AdvertiseSID(req.TenantSID); err != nil {
+			m.log.WithError(err).WithField("sid", req.TenantSID).
+				Warn("failed to advertise gateway SID; reachability may be incomplete")
+		}
+	}
 	m.log.WithFields(logrus.Fields{
 		"uid": uid, "sid": req.TenantSID, "vip": req.VIP,
 		"vrf": req.VrfTable, "upstream": req.Upstream,
@@ -188,6 +216,12 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 func (m *GatewayManager) teardownLocked(uid string, st *gwState) {
 	if st.install == nil {
 		return
+	}
+	if m.sids != nil && st.install.TenantSID != nil {
+		if err := m.sids.WithdrawSID(st.install.TenantSID); err != nil {
+			m.log.WithError(err).WithField("sid", st.install.TenantSID).
+				Warn("failed to withdraw gateway SID; continuing")
+		}
 	}
 	if err := m.vpp.RemoveGateway(*st.install); err != nil {
 		m.log.WithError(err).WithField("uid", uid).Warn("RemoveGateway failed; continuing")
