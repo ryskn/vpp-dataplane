@@ -1,0 +1,55 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram name="two-spine-clos" id="clos01">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1380" pageHeight="720" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="whitebox ×2 → 2-spine leaf-spine CLOS fabric。SRv6 が 2 spine を HW ECMP。fabric failover + underlay VRF 分離。SID 機能は依然ソフト。" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="14" width="1320" height="26" as="geometry" />
+        </mxCell>
+
+        <!-- spines -->
+        <mxCell id="spgrp" value="CLOS spine 層（whitebox ×2, SONiC）— L3 ECMP underlay。VRF: cluster-underlay + backbone-underlay。eBGP CLOS で loopback + SID locator を学習し HW 転送。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=11;arcSize=3;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="220" y="60" width="940" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="sp1" value="Spine-1（DCS201 / SONiC）&#10;L3 ECMP / underlay VRF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="260" y="100" width="380" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="sp2" value="Spine-2（DCS201 / SONiC）&#10;冗長 / ECMP（同一構成）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="100" width="380" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- servers (leaves, dual-homed) -->
+        <mxCell id="s1" value="Server-1（Dell, leaf）— cluster + egress GW（BR）&#10;FRR underlay（両 spine へ dual-home, ECMP）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;align=left;fontStyle=1;fontSize=11;arcSize=3;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="120" y="350" width="480" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="s1in" value="cluster（master + worker, Calico-VPP）&#10;+ egress GW = Border Router（VPP + patch 0006/0007）&#10;cluster SID decap → SNAT(pod→VIP) → backbone SID re-encap&#10;cluster-underlay VRF と backbone-underlay VRF の橋渡し（overlay SR）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;align=left;verticalAlign=top;fontSize=10;spacingLeft=6;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="140" y="400" width="440" height="150" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s2" value="Server-2（Dell, leaf）— operator SRv6 backbone（FRR + Linux kernel）&#10;FRR underlay（両 spine へ dual-home, ECMP）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=top;align=left;fontStyle=1;fontSize=11;arcSize=3;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="780" y="350" width="480" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="s2in" value="PE-A(color100) / PE-B(color200) / P / service-X,Y&#10;End.DT6 + RFC 9252 L3VPN + Color（seg6local）&#10;backbone-underlay VRF に locator を広告" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=left;verticalAlign=top;fontSize=10;spacingLeft=6;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="800" y="400" width="440" height="150" as="geometry" />
+        </mxCell>
+
+        <!-- CLOS links: each server to both spines -->
+        <mxCell id="c11" value="ECMP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="s1" target="sp1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="c12" value="ECMP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="s1" target="sp2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="c21" value="ECMP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="s2" target="sp1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="c22" value="ECMP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="s2" target="sp2"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- overlay SR path (dashed, through fabric) -->
+        <mxCell id="ov" value="SRv6 overlay: pod → GW → [2 spine を HW ECMP] → PE → service。SID hop ごとに spine 層を物理経由。color 連続。" style="endArrow=block;html=1;dashed=1;strokeColor=#b85450;strokeWidth=2;fontSize=9;fontColor=#b85450;rounded=1;" edge="1" parent="1" source="s1in" target="s2in"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="690" y="620" /></Array></mxGeometry></mxCell>
+
+        <!-- legend -->
+        <mxCell id="legend" value="2 台目で増えること:&#10;① 2-spine ECMP（独立ハード2台をまたぐ真のマルチパス）― SRv6 パケットを spine 層が HW ECMP。実 DC CLOS そのもの。&#10;② fabric-level failover ― spine を1台 down → eBGP/ECMP が HW 再収束。SR candidate-path / eBGP withdraw とは別レイヤの failover をデモ。&#10;③ underlay VRF 分離 ― 同一 CLOS に cluster-underlay VRF と backbone-underlay VRF。k8s DC fabric と operator backbone を別 underlay にしつつ冗長 spine で運ぶ＝実 DC 構造。GW がその境界(BR)。&#10;④ サーバ = routing-on-host(FRR)で両 spine へ dual-home、eBGP CLOS。&#10;正直な限界（不変）: 両機 Trident3 = SRv6 endpoint 不可。SID 機能はソフト(VPP/kernel)。2 台目が上げるのは underlay fabric の realism(CLOS/ECMP/冗長/VRF)で、SRv6-in-HW ではない。SID をハードでやるには DNX(Jericho2)。&#10;別案: 2 台を『DC fabric』と『backbone fabric』に分け、GW を物理境界(BR)にする構成も可（BR を物理化）。ECMP 冗長は犠牲。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="1300" height="110" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

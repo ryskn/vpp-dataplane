@@ -1,0 +1,147 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram name="v1alpha2-lo-stitch" id="lostitch01">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1500" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===== Title ===== -->
+        <mxCell id="title" value="srv6egress v1alpha2 — egress GW (BR)：tenant VRF × transport/path VRF を lo で stitch（交差は route。VRF は T + P 本、直積ではない）" style="text;html=1;align=left;verticalAlign=middle;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="24" width="1420" height="36" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Region: Cluster SR domain ===== -->
+        <mxCell id="r_cluster" value="cluster SR domain" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=12;arcSize=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="250" height="500" as="geometry" />
+        </mxCell>
+        <!-- ===== Region: egress GW (BR) ===== -->
+        <mxCell id="r_gw" value="egress GW (= Border Router)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;verticalAlign=top;fontStyle=1;fontSize=13;arcSize=2;" vertex="1" parent="1">
+          <mxGeometry x="320" y="90" width="760" height="690" as="geometry" />
+        </mxCell>
+        <!-- ===== Region: Backbone ===== -->
+        <mxCell id="r_bb" value="operator SRv6 backbone" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;fontSize=12;arcSize=4;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="110" width="300" height="500" as="geometry" />
+        </mxCell>
+
+        <!-- ===== GW: ingress decap band ===== -->
+        <mxCell id="decap" value="GW 入口: End.DT6.In decap（patch 0006）&#10;inner を sw_if_index[RX]=lo にして ip6-input へ再注入 → cnat arc が走る" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="345" y="135" width="710" height="56" as="geometry" />
+        </mxCell>
+
+        <!-- ===== GW: (A) tenant VRF band ===== -->
+        <mxCell id="r_tenant" value="(A) tenant VRF 系列 = L3VPN / RFC 9252 — membership・隔離（T 本）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=12;arcSize=3;" vertex="1" parent="1">
+          <mxGeometry x="340" y="205" width="720" height="215" as="geometry" />
+        </mxCell>
+        <mxCell id="vrf_t1" value="tenant VRF (t1)&#10;&#10;• dst → service SID 解決（per-tenant）&#10;• SNAT  podIP → tenant VIP&#10;• return  un-SNAT  VIP → podIP&#10;• VIP /128 を own End SID で 9252 advertise" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="238" width="330" height="125" as="geometry" />
+        </mxCell>
+        <mxCell id="lo_t1" value="loop-t1（ip6 enable）— RX 帰属 + stitch 錨" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f4ea;strokeColor=#82b366;align=center;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="372" y="372" width="306" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="vrf_t2" value="tenant VRF (t2)&#10;&#10;• dst → service SID 解決（per-tenant）&#10;• SNAT  podIP → tenant VIP&#10;• return  un-SNAT  VIP → podIP&#10;• VIP /128 を own End SID で 9252 advertise" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="710" y="238" width="330" height="125" as="geometry" />
+        </mxCell>
+        <mxCell id="lo_t2" value="loop-t2（ip6 enable）— RX 帰属 + stitch 錨" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f4ea;strokeColor=#82b366;align=center;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="722" y="372" width="306" height="36" as="geometry" />
+        </mxCell>
+
+        <!-- ===== stitch label ===== -->
+        <mxCell id="stitch_lbl" value="lo stitch ＝「テナント t を path p で出す」組み合わせは route（テーブルの直積ではない）" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontStyle=2;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="345" y="425" width="710" height="24" as="geometry" />
+        </mxCell>
+
+        <!-- ===== GW: (B) transport / path VRF band ===== -->
+        <mxCell id="r_transport" value="(B) transport / path VRF 系列 = steering（color / SR Policy）（P 本）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;verticalAlign=top;fontStyle=1;fontSize=12;arcSize=3;" vertex="1" parent="1">
+          <mxGeometry x="340" y="455" width="720" height="190" as="geometry" />
+        </mxCell>
+        <mxCell id="vrf_p1" value="path VRF100（color100）&#10;&#10;• backbone SR encap（color / SR Policy SAFI 73）&#10;• per-upstream eBGP RIB&#10;• → PE-edge A（fda1::1）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="490" width="330" height="135" as="geometry" />
+        </mxCell>
+        <mxCell id="vrf_p2" value="path VRF200（color200）&#10;&#10;• backbone SR encap（color / SR Policy SAFI 73）&#10;• per-upstream eBGP RIB&#10;• → PE-edge B（fda2::1）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="710" y="490" width="330" height="135" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Cluster children ===== -->
+        <mxCell id="pod" value="Pod&#10;src = podIP&#10;intent = color100" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="70" y="180" width="190" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="headend" value="Headend（pod node）&#10;SrSteer（src=pod, dst∈destCIDR）&#10;→ SRv6 encap&#10;outer = cluster SID&#10;（tenant 識別は src podIP で GW demux）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="70" y="320" width="190" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="cl_note" value="RFC 8402: per-flow state は headend に限定" style="text;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#3b5b8f;" vertex="1" parent="1">
+          <mxGeometry x="55" y="500" width="220" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Backbone children ===== -->
+        <mxCell id="pe_a" value="Backbone PE-edge A&#10;own End SID + 9252 / 9012&#10;AS64500  fda1::1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="190" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="pe_b" value="Backbone PE-edge B&#10;own End SID + 9252 / 9012&#10;AS64600  fda2::1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="300" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="fabric" value="SRv6 backbone fabric&#10;(color steering, L3VPN)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="410" width="260" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="svcx" value="service-X&#10;2001:db8:svc-x::/64&#10;（per-tenant service SID）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="500" width="260" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Forward edges (solid) ===== -->
+        <mxCell id="e_pod_he" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#3b5b8f;strokeWidth=2;" edge="1" parent="1" source="pod" target="headend">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_he_decap" value="SRv6 [outer = cluster SID]" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#3b5b8f;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="headend" target="decap">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_decap_t1" value="src podIP → tenant VRF（demux）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#666666;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="decap" target="vrf_t1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_stitch1" value="lo stitch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#82b366;strokeWidth=2;fontSize=10;fontStyle=1;" edge="1" parent="1" source="lo_t1" target="vrf_p1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_stitch2" value="lo stitch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#82b366;strokeWidth=2;fontSize=10;fontStyle=1;" edge="1" parent="1" source="lo_t2" target="vrf_p2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_p1_pea" value="SR encap&#10;color100 ⇄ backbone color100&#10;（Color Ext-Comm 連続）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#d79b00;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="vrf_p1" target="pe_a">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_p2_peb" value="SR encap&#10;color200 連続" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#d79b00;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="vrf_p2" target="pe_b">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_pea_fab" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9673a6;strokeWidth=1;" edge="1" parent="1" source="pe_a" target="fabric">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_peb_fab" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9673a6;strokeWidth=1;" edge="1" parent="1" source="pe_b" target="fabric">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fab_svc" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9673a6;strokeWidth=1;" edge="1" parent="1" source="fabric" target="svcx">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Control-plane: VIP advertise (dashed) ===== -->
+        <mxCell id="e_vip" value="VIP /128 を own End SID 付きで 9252 advertise" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=open;dashed=1;strokeColor=#6c8ebf;strokeWidth=1.5;fontSize=10;fontColor=#3b5b8f;" edge="1" parent="1" source="vrf_t1" target="pe_a">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1090" y="300" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===== Return path (dashed) ===== -->
+        <mxCell id="e_return" value="return 対称：backbone SID decap → un-SNAT（VIP→podIP）→ cluster SID で SR back → pod" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;strokeColor=#b85450;strokeWidth=2;fontSize=10;fontColor=#b85450;" edge="1" parent="1" source="svcx" target="vrf_t2">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="875" y="700" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===== Legend ===== -->
+        <mxCell id="legend" value="凡例 / 設計の肝&#10;━━ forward（data）   ┄┄ control-plane（9252 advertise）/ return 対称&#10;• VRF は 2 軸：(A) tenant = L3VPN/隔離（RFC 9252） ×  (B) path = color steering。交差は route で表現 → テーブルは T + P 本（直積 T×P ではない）。&#10;• stitch 点 = 各 tenant VRF の loopback（A2 で cnat RX 帰属用にどのみち要る lo を、tenant VRF↔transport VRF の錨に格上げ）。&#10;• tenant VRF を分けて効くのは「テナント間で dst prefix が重なり、別 service SID に解決したい」とき（= 真の L3VPN）。重ならないなら per-tenant VIP で機能的には足りる。&#10;• tenant 識別：当面は GW で src podIP demux（cluster 無改造）。将来 cluster SID に tenant を載せる案（per-(tenant,color) End SID）もあり。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=11;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="640" width="1380" height="180" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

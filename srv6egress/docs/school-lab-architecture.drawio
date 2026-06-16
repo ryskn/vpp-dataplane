@@ -1,0 +1,78 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram name="school-lab-2srv" id="schoollab02">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="760" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="学校ラボ構成 — Dell ×2 + DCS201 ×1。Server間の GW↔PE リンクが DCS201 を物理経由（本物の cluster⇄backbone 境界）。SRv6 は全て VPP VM。" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="14" width="1380" height="26" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Server-1 ===== -->
+        <mxCell id="s1" value="Server-1（Dell / Proxmox）— cluster + egress GW" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=12;arcSize=3;" vertex="1" parent="1">
+          <mxGeometry x="40" y="56" width="560" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="pod" value="Pod（tenant-a）&#10;intent: color 100" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="70" y="110" width="220" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="worker" value="Headend = worker-1/2&#10;Calico-VPP&#10;SR encap（cluster SID）&#10;SrSteer dst → BSID cafe::e0a" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="70" y="210" width="220" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="master" value="+ master（k8s control-plane）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f9ff;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="350" width="220" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="infra" value="infra: DNS + bgp-controller&#10;（cluster⇄backbone color map）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;align=center;verticalAlign=middle;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="420" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="gw" value="egress GW = Border Router&#10;srte-egress-1（VPP + patch 0006/0007）&#10;&#10;• End.DT6.In decap（cluster SID）&#10;• cnat SNAT  podIP → tenant VIP&#10;• SR re-encap（backbone SID, color）&#10;• eBGP 9252 / 9012 / Color → PE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="320" y="210" width="260" height="190" as="geometry" />
+        </mxCell>
+
+        <!-- ===== DCS201 (center, physical link between servers) ===== -->
+        <mxCell id="sw" value="DCS201 / AS5835-54X&#10;（Broadcom Trident3）&#10;&#10;物理 underlay&#10;L2 VLAN bridging のみ&#10;（SRv6 非解釈：&#10;素の IPv6 を中継）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=11;arcSize=4;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="640" y="56" width="190" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="vl20" value="VLAN20  GW↔PE&#10;fda1::/64（color100）&#10;★ Server1 ↔ Server2 を&#10;物理的に渡る backbone リンク" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="655" y="250" width="160" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="vl_other" value="VLAN10 cluster fd00:1::/64&#10;VLAN30 backbone+svc&#10;VLAN99 mgmt" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;align=center;verticalAlign=middle;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="655" y="400" width="160" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Server-2 ===== -->
+        <mxCell id="s2" value="Server-2（Dell / Proxmox）— operator SRv6 backbone（VPP VM = 本物の 2nd SR domain）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;fontSize=12;arcSize=3;" vertex="1" parent="1">
+          <mxGeometry x="870" y="56" width="530" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="pe" value="backbone PE-A（VPP + gobgp）&#10;• own End / End.DT6 SID&#10;• 9252 で VIP を受信&#10;• Color 100（cluster と連続）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="895" y="150" width="250" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="p" value="backbone P（VPP）&#10;SRv6 transit&#10;（PE と統合も可）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="895" y="320" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="svc" value="service-X（VM）&#10;2001:db8:svc-x::/64&#10;service SID の裏" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="320" width="200" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ===== SR forward flow ===== -->
+        <mxCell id="f1" value="color 100" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#3b5b8f;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="pod" target="worker"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="f2" value="cluster SID&#10;fcff:0:0:e0:a::" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#3b5b8f;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="worker" target="gw"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="f3" value="backbone SID&#10;+ Color 100" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#d79b00;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="gw" target="vl20"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="f4" value="VLAN20（物理）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#d79b00;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="vl20" target="pe"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="f5" value="SR transit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9673a6;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="pe" target="p"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="f6" value="service SID" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#9673a6;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="p" target="svc"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="fret" value="return 対称（GW で un-SNAT VIP→pod / color 連続）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;strokeColor=#b85450;strokeWidth=1.5;fontSize=10;fontColor=#b85450;" edge="1" parent="1" source="svc" target="pod"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="1270" y="560" /><mxPoint x="180" y="560" /></Array></mxGeometry></mxCell>
+
+        <!-- underlay connectors -->
+        <mxCell id="u_cl" value="VLAN10" style="endArrow=none;dashed=1;html=1;strokeColor=#6c8ebf;fontSize=9;" edge="1" parent="1" source="worker" target="vl_other"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="u_bb" value="VLAN30" style="endArrow=none;dashed=1;html=1;strokeColor=#9673a6;fontSize=9;" edge="1" parent="1" source="p" target="vl_other"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- legend -->
+        <mxCell id="legend" value="設計メモ:&#10;• 2 サーバ分割の利点: GW(Server-1) ↔ PE(Server-2) の backbone リンク(VLAN20)が DCS201 を物理経由 → cluster⇄backbone 境界が“本物の物理リンク”に。1台時の「同一 NIC で bridge 内短絡」問題が解消。&#10;• なぜスイッチが underlay 専任: Trident3 は SRv6 endpoint 非対応(VXLAN/NVGRE のみ)。さらに独自 VPP behavior(End.DT6.In/per-fib cnat)は ASIC 不可=VPP 専用。→ GW も PE も VPP VM、SRv6 は全て VM で再現、DCS201 は VLAN L2 で中継。&#10;• 立証: backbone を VPP の PE-A/P/service-X として建て、9252(VIP own End SID) + 9012/Color(color100 連続) + SR re-encap を実機 SRv6 で立証(#35 の IP stub からの前進)。&#10;• 住所: cluster SID=fcff:0:0:e0:a:: / BSID=cafe::e0a / tenant VIP=2001:db8:e:0:b91:… / backbone link fda1::/64 / service 2001:db8:svc-x::/64。&#10;• 2 color デモにするなら PE-B(color200 / VLAN21 fda2::/64)を Server-2 に追加。bgp-controller 復活が前提(PE と 9252 session を張る主体)。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="1360" height="140" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

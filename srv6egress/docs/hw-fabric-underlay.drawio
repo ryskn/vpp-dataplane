@@ -1,0 +1,58 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram name="hw-fabric-underlay" id="hwfab01">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="780" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="DCS201 を本物のハードウェア DC fabric(underlay)に — SID locator を ASIC で L3 ECMP 転送。SR function(decap 等)はノード(VPP/FRR+kernel)。" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="14" width="1380" height="26" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Spine: DCS201 hardware fabric ===== -->
+        <mxCell id="fab" value="DCS201 / AS5835-54X（SONiC）= Hardware L3 ECMP fabric（underlay）&#10;underlay BGP/OSPFv3 で各ノードの loopback + SID locator prefix を学習 → 外側 IPv6(=SID) を ASIC でライン
+レート ECMP 転送（SR function は非解釈）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=middle;align=center;fontStyle=1;fontSize=12;arcSize=3;spacingLeft=10;spacingRight=10;" vertex="1" parent="1">
+          <mxGeometry x="220" y="64" width="1000" height="92" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Leaves (SR nodes) ===== -->
+        <mxCell id="gw" value="egress GW（Server-1, VPP + 独自 patch）&#10;&#10;• cluster SID を End.DT6.In decap&#10;• SNAT podIP → tenant VIP&#10;• backbone SID へ SR re-encap&#10;• VIP を 9252(own End SID)で advertise&#10;locator  fcff:0:0:e0::/64" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="60" y="300" width="300" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="p" value="backbone P（Server-2, FRR + Linux kernel SRv6）&#10;&#10;• End（SR transit, seg6local）&#10;• underlay BGP で locator 広告&#10;locator  fcbb:0:c::/48" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="560" y="300" width="300" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="pe" value="backbone PE-A（Server-2, FRR + Linux kernel SRv6）&#10;&#10;• End.DT6（service VRF, seg6local）&#10;• RFC 9252 L3VPN + Color 100&#10;• 9252 で GW の VIP を学習&#10;locator  fcbb:0:a::/48" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=left;verticalAlign=top;fontSize=11;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="300" width="320" height="170" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cluster" value="cluster（Server-1）&#10;pod(tenant-a) + headend(worker, Calico-VPP)&#10;→ cluster SID で GW へ" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="60" y="520" width="300" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="svc" value="service-X（Server-2, PE-A の VRF）&#10;2001:db8:svc-x::/64" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="520" width="320" height="64" as="geometry" />
+        </mxCell>
+
+        <!-- physical L3 links to spine (solid, thick) -->
+        <mxCell id="l_gw1" value="L3 P2P ×2&#10;(ECMP)&#10;underlay BGP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="gw" target="fab"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="180" y="220" /></Array></mxGeometry></mxCell>
+        <mxCell id="l_gw2" value="" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;dashPattern=8 4;" edge="1" parent="1" source="gw" target="fab"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="240" y="240" /></Array></mxGeometry></mxCell>
+        <mxCell id="l_p" value="L3 P2P / underlay BGP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="p" target="fab"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="l_pe" value="L3 P2P / underlay BGP" style="endArrow=none;html=1;strokeColor=#82b366;strokeWidth=3;fontSize=9;" edge="1" parent="1" source="pe" target="fab"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="l_cl" value="" style="endArrow=none;html=1;strokeColor=#6c8ebf;strokeWidth=1.5;" edge="1" parent="1" source="cluster" target="gw"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="l_svc" value="" style="endArrow=none;html=1;strokeColor=#9673a6;strokeWidth=1.5;" edge="1" parent="1" source="svc" target="pe"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- overlay SR hops (dashed) -->
+        <mxCell id="o1" value="SR: 外側 DA = P の End SID&#10;(switch が HW ECMP 転送)" style="endArrow=block;html=1;dashed=1;strokeColor=#b85450;strokeWidth=2;fontSize=9;fontColor=#b85450;rounded=1;" edge="1" parent="1" source="gw" target="p"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="410" y="290" /></Array></mxGeometry></mxCell>
+        <mxCell id="o2" value="SR: 外側 DA = PE-A の End.DT6 SID&#10;(switch が HW ECMP 転送)" style="endArrow=block;html=1;dashed=1;strokeColor=#b85450;strokeWidth=2;fontSize=9;fontColor=#b85450;rounded=1;" edge="1" parent="1" source="p" target="pe"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="910" y="290" /></Array></mxGeometry></mxCell>
+        <mxCell id="o3" value="End.DT6 → VRF" style="endArrow=block;html=1;dashed=1;strokeColor=#b85450;strokeWidth=2;fontSize=9;fontColor=#b85450;" edge="1" parent="1" source="pe" target="svc"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- legend -->
+        <mxCell id="legend" value="設計の肝 / 構成メモ:&#10;• underlay vs overlay 分離: SID は IPv6 アドレス → スイッチ(素の L3 ルータ)は SID の locator prefix を ASIC で longest-match + ECMP 転送できる。SID の“機能”(End/End.DT6/decap)だけが locator を所有するノードで走る。これが SRv6-over-IP-fabric の標準形。&#10;• 役割: DCS201(SONiC)=spine/underlay。BGP/OSPFv3 で各ノードの loopback + SID locator(fcff:0:0:e0::/64, fcbb:0:a::/48, fcbb:0:c::/48 …)を学習し、外側 IPv6 を HW ECMP 転送。SR node=leaf(GW=VPP独自 / PE・P=FRR+Linux kernel seg6local=標準 SRv6)。&#10;• overlay(SR): GW↔PE で RFC 9252 L3VPN + Color 100 連続。GW は cluster SID decap → SNAT → backbone segment list[P-End, PE-End.DT6] を push。各 SID hop の間は必ず DCS201 を物理経由(HW転送)。&#10;• ECMP の見せ方: (a) GW↔spine を 2 物理リンク → flow hash で分散、(b) P を 2 台(P1/P2 anycast-SID or 等コスト2経路)→ spine が ECMP。pcap/counter で立証。&#10;• HW で再現できる部分=DC fabric の transport(L3 ECMP, ライン
+レート, 実 ASIC)。SW のまま=SID 機能(VPP/kernel)。SID 機能を ASIC でやるには DNX(Jericho2)系が要る(将来 1 台あれば P/PE をハード SRv6 化可能)。&#10;• これで #35 の『素の IP stub』→『実ハード fabric を流れる標準 SRv6 backbone + 異実装(VPP⇄FRR)相互運用』に格上げ。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="620" width="1360" height="150" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
