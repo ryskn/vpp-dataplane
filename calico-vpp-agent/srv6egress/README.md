@@ -52,5 +52,5 @@ the integration:
 
 ## References
 
-- Design: ryskn/vpp-dataplane-research#5 §3 / §9
+- Design: see srv6egress/docs/ (architecture diagrams)
 - Pattern reference: PR projectcalico/vpp-dataplane#1028 (`steerNodeIPViaSID`)

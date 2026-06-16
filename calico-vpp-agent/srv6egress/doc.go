@@ -22,5 +22,5 @@
 //   - main() integration in calico-vpp-agent's lifecycle
 //   - Correlation with BGP-received SR Policy in SRv6Provider
 //
-// Design reference: ryskn/vpp-dataplane-research#5 §3, §9
+// Design notes: see srv6egress/docs/.
 package srv6egress

@@ -38,7 +38,7 @@ func TestAllocate_EmptyPoolRejected(t *testing.T) {
 	}
 }
 
-// Finding #1 (SPECA PROP-rfc-8402-seg-inv-003): after a controller restart the
+// After a controller restart the
 // allocator is recreated blank. Register lets the reconciler re-seed existing
 // VIPs from status so a fresh Allocate never collides with them.
 func TestRegister_PreventsReissueAfterRestart(t *testing.T) {

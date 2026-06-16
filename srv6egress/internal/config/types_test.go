@@ -45,7 +45,7 @@ func TestValidate_EmptySegmentList(t *testing.T) {
 	}
 }
 
-// Finding #4 (SPECA PROP-rfc-8402-seg-inv-008): the last segment of a color's
+// The last segment of a color's
 // segment list must equal the target upstream's End.DT6 SID. A mismatch passed
 // validation previously and would steer traffic to the wrong SID.
 func TestValidate_LastSegmentMustMatchUpstreamSID(t *testing.T) {

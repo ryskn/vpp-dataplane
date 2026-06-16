@@ -4,7 +4,7 @@ EgressPolicy CRD v1alpha1 — **BGP-driven SRv6 Egress Path Steering** for Kuber
 
 This directory contains the research add-on to Calico-VPP for declarative,
 per-tenant SR-TE egress path selection. Design documented in
-[ryskn/vpp-dataplane-research#5](https://github.com/ryskn/vpp-dataplane-research/issues/5).
+the architecture diagrams and design notes under srv6egress/docs/.
 
 ## What
 

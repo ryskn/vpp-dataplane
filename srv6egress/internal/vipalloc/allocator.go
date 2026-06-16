@@ -127,4 +127,4 @@ func parseSyntheticVIP(vip string) (pool string, n uint64, ok bool) {
 // TODO(v1alpha1 → v1alpha1.1): replace inMemory with a CalicoIPAM allocator
 // that calls projectcalico/calico's libcalico IPAM client to allocate /128
 // from the named IPPool (which carries allowedUses: [Tunnel] for isolation
-// from pod IPAM). See research issue #5 §5.3 / §9.
+// from pod IPAM).

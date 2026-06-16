@@ -36,7 +36,7 @@ These are TODOs marked at the bottom of `srv6egress/internal/vipalloc/allocator.
 
 ## Architecture references
 
-- Design: ryskn/vpp-dataplane-research#5
+- Design: see srv6egress/docs/
 - Color = intent: [RFC 9256 §2.1](https://www.rfc-editor.org/rfc/rfc9256#section-2.1)
 - Color Extended Community mechanism: [RFC 9012 §3.4.2](https://www.rfc-editor.org/rfc/rfc9012)
 - Operator-side abstraction necessity (defense): #5 §0.3

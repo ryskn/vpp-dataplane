@@ -1,6 +1,6 @@
 // Package v1alpha1 defines the EgressPolicy CRD types.
 //
-// Design reference: ryskn/vpp-dataplane-research#5
+// Design notes: see srv6egress/docs/.
 package v1alpha1
 
 import (

@@ -192,7 +192,7 @@ func TestReconcile_PersistsEndpointAddr(t *testing.T) {
 	}
 }
 
-// Finding #2 (RFC 9256 §2 uniqueness): two policies with the same
+// RFC 9256 §2 (uniqueness): two policies with the same
 // <color, endpoint> must not both go Ready.
 func TestReconcile_DuplicateColorEndpointRejected(t *testing.T) {
 	r := newReconciler(t,
@@ -218,7 +218,7 @@ func TestReconcile_DuplicateColorEndpointRejected(t *testing.T) {
 	}
 }
 
-// Finding #5: an egressIPPool without allowedUses:[Tunnel] must be rejected.
+// An egressIPPool without allowedUses:[Tunnel] must be rejected.
 func TestReconcile_IPPoolWithoutTunnelRejected(t *testing.T) {
 	r := newReconciler(t,
 		egressNode("egress-1"),
@@ -249,7 +249,7 @@ func TestReconcile_IPPoolMissingRejected(t *testing.T) {
 	}
 }
 
-// Finding #1 (order-independence): RehydrateVIPs must register every existing
+// Order-independence: RehydrateVIPs must register every existing
 // VIP from status before any reconcile, so a newly created policy reconciled
 // BEFORE the old policy is re-seen still cannot be handed a colliding VIP.
 func TestRehydrateVIPs_RegistersExistingThenNoCollision(t *testing.T) {
