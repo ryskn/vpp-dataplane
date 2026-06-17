@@ -36,6 +36,11 @@ Two orthogonal layers:
 | `two-spine-clos.drawio` | 2-spine CLOS variant (multi-spine ECMP + fabric failover; needs a 2nd switch) |
 | `v1alpha2-lo-stitch.drawio` | tenant-VRF × path-VRF stitch model (loopback as the stitch anchor) |
 
+`testbed-runbook.md` is the concrete build runbook for `full-feature-testbed`:
+per-tier config (spine SONiC / leaf FRR / egress-GW VPP+gobgp / PE·P
+FRR+kernel SRv6), AS + address + SID plan, bring-up order, and the
+feature→verification matrix.
+
 `motivation*.pptx` / `motivation_script.md` are background slides on the
 problem framing.
 

@@ -5,7 +5,7 @@
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
 
-        <mxCell id="title" value="egress GW フル機能テストベッド — 2 テナント × 2 color × backbone(BR) × failover × 動的 CRUD を 1 環境で。Dell ×2 + DCS201 ×1。" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="title" value="egress GW フル機能テストベッド — 2 テナント × 2 color × backbone(BR) × anycast service × failover × 動的 CRUD を 1 環境で。Dell ×2 + DCS201 ×1。" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="40" y="14" width="1400" height="26" as="geometry" />
         </mxCell>
 
@@ -28,9 +28,12 @@
         <mxCell id="gw" value="egress GW = Border Router（VPP + patch 0006/0007）&#10;&#10;• End.DT6.In decap（cluster SID）&#10;• per-tenant SNAT（VRF-a→VIP-a / VRF-b→VIP-b）&#10;  ＝テナント隔離&#10;• per-VRF eBGP（upstream FIB / VIP advertise）&#10;• BR: 9252(VIP own End SID) + 9012 + Color&#10;• cluster SID decap → backbone SID re-encap&#10;• return: un-SNAT → cluster SR で pod へ" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;fontSize=10;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
           <mxGeometry x="300" y="150" width="260" height="240" as="geometry" />
         </mxCell>
+        <mxCell id="pea2" value="PE-A2（PE-A の anycast ペア / FRR + kernel SRv6）&#10;同一 locator fcbb:0:a::/48・同一 End.DT6 SID fcbb:0:a:1::&#10;vrf-c100 / service-X echo #2&#10;→ S1 側からも locator を広告（spine が 2-path ECMP）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5fff5;strokeColor=#82b366;align=left;verticalAlign=top;fontSize=9;spacingLeft=6;spacingTop=4;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="408" width="260" height="128" as="geometry" />
+        </mxCell>
 
         <!-- ===== DCS201 ===== -->
-        <mxCell id="sw" value="DCS201&#10;（SONiC）&#10;&#10;HW L3 ECMP&#10;fabric&#10;（underlay）&#10;&#10;SID locator を&#10;ASIC で転送" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=middle;align=center;fontStyle=1;fontSize=10;arcSize=4;" vertex="1" parent="1">
+        <mxCell id="sw" value="DCS201&#10;（SONiC）&#10;&#10;HW L3 ECMP&#10;fabric&#10;（underlay）&#10;&#10;SID locator を&#10;ASIC で転送&#10;&#10;★ anycast&#10;fcbb:0:a::/48&#10;= 2-path&#10;HW ECMP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=middle;align=center;fontStyle=1;fontSize=10;arcSize=4;" vertex="1" parent="1">
           <mxGeometry x="600" y="56" width="150" height="490" as="geometry" />
         </mxCell>
 
@@ -69,9 +72,13 @@
         <mxCell id="e_p_pe1" style="endArrow=block;html=1;strokeColor=#82b366;strokeWidth=2;" edge="1" parent="1" source="pp" target="pe1"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="e_p_pe2" style="endArrow=block;html=1;strokeColor=#d79b00;strokeWidth=2;" edge="1" parent="1" source="pp" target="pe2"><mxGeometry relative="1" as="geometry" /></mxCell>
 
+        <!-- anycast: same locator advertised from both servers -->
+        <mxCell id="e_any_s2" value="anycast fcbb:0:a::/48 (S2 側)" style="endArrow=block;html=1;dashed=1;strokeColor=#82b366;strokeWidth=2;fontSize=9;fontColor=#2d7a2d;" edge="1" parent="1" source="pe1" target="sw"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_any_s1" value="anycast fcbb:0:a::/48 (S1 側)" style="endArrow=block;html=1;dashed=1;strokeColor=#82b366;strokeWidth=2;fontSize=9;fontColor=#2d7a2d;" edge="1" parent="1" source="pea2" target="sw"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="585" y="472" /></Array></mxGeometry></mxCell>
+
         <!-- legend -->
-        <mxCell id="legend" value="この環境で exercise できる egress GW 機能（緑=tenant-a/color100→PE-A→service-X、橙=tenant-b/color200→PE-B→service-Y）:&#10;① headend SR steering（selector×destCIDR）  ② color パス選択（100/200 で別 PE/service）  ③ End.DT6.In decap  ④ per-tenant SNAT 隔離（VIP-a≠VIP-b）  ⑤ VIP 自動払い出し(Calico IPAM)+advertise&#10;⑥ per-VRF eBGP（upstream FIB / VIP advertise）  ⑦ BR: 9252(VIP own End SID)+9012+Color 連続  ⑧ cluster SID decap→backbone SID re-encap  ⑨ return 対称(un-SNAT)  ⑩ ICMP+TCP(stateful)&#10;⑪ failover（P1/P2 ECMP・eBGP withdraw・SR Policy candidate-path）  ⑫ 動的 CRUD（EgressPolicy 作成/更新/削除→controller→agent）  ⑬ resilience（persist-then-announce #19 / watch 再接続 prune #20 / install retry）&#10;⑭(future) uSID 符号化比較 / HA endpoint。&#10;DCS201=SONiC の HW L3 ECMP fabric が SID locator を ASIC 転送（underlay）。SR 機能は GW=VPP(独自) / PE・P=FRR+kernel(標準)＝異実装相互運用も同時に検証。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
-          <mxGeometry x="40" y="560" width="1380" height="170" as="geometry" />
+        <mxCell id="legend" value="この環境で exercise できる egress GW 機能（緑=tenant-a/color100→PE-A→service-X、橙=tenant-b/color200→PE-B→service-Y）:&#10;① headend SR steering（selector×destCIDR）  ② color パス選択（100/200 で別 PE/service）  ③ End.DT6.In decap  ④ per-tenant SNAT 隔離（VIP-a≠VIP-b）  ⑤ VIP 自動払い出し(Calico IPAM)+advertise&#10;⑥ per-VRF eBGP（upstream FIB / VIP advertise）  ⑦ BR: 9252(VIP own End SID)+9012+Color 連続  ⑧ cluster SID decap→backbone SID re-encap  ⑨ return 対称(un-SNAT)  ⑩ ICMP+TCP(stateful)&#10;⑪ failover（P1/P2 ECMP・eBGP withdraw・SR Policy candidate-path）  ⑫ 動的 CRUD（EgressPolicy 作成/更新/削除→controller→agent）  ⑬ resilience（persist-then-announce / watch 再接続 prune / install retry）&#10;⑭ anycast service（PE-A/PE-A2 が同一 locator/SID fcbb:0:a:1:: を S1/S2 両方から広告→DCS201 が HW ECMP、片側 down で fabric 収束=GW 透過。service-Y は single-homed で対比）&#10;⑮(future) uSID 符号化比較 / HA endpoint。&#10;DCS201=SONiC の HW L3 ECMP fabric が SID locator を ASIC 転送（underlay）。SR 機能は GW=VPP(独自) / PE・P=FRR+kernel(標準)＝異実装相互運用も同時に検証。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="560" width="1380" height="192" as="geometry" />
         </mxCell>
 
       </root>

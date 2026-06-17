@@ -48,7 +48,7 @@
 
         <!-- legend -->
         <mxCell id="legend" value="設計の肝 / 構成メモ:&#10;• underlay vs overlay 分離: SID は IPv6 アドレス → スイッチ(素の L3 ルータ)は SID の locator prefix を ASIC で longest-match + ECMP 転送できる。SID の“機能”(End/End.DT6/decap)だけが locator を所有するノードで走る。これが SRv6-over-IP-fabric の標準形。&#10;• 役割: DCS201(SONiC)=spine/underlay。BGP/OSPFv3 で各ノードの loopback + SID locator(fcff:0:0:e0::/64, fcbb:0:a::/48, fcbb:0:c::/48 …)を学習し、外側 IPv6 を HW ECMP 転送。SR node=leaf(GW=VPP独自 / PE・P=FRR+Linux kernel seg6local=標準 SRv6)。&#10;• overlay(SR): GW↔PE で RFC 9252 L3VPN + Color 100 連続。GW は cluster SID decap → SNAT → backbone segment list[P-End, PE-End.DT6] を push。各 SID hop の間は必ず DCS201 を物理経由(HW転送)。&#10;• ECMP の見せ方: (a) GW↔spine を 2 物理リンク → flow hash で分散、(b) P を 2 台(P1/P2 anycast-SID or 等コスト2経路)→ spine が ECMP。pcap/counter で立証。&#10;• HW で再現できる部分=DC fabric の transport(L3 ECMP, ライン
-レート, 実 ASIC)。SW のまま=SID 機能(VPP/kernel)。SID 機能を ASIC でやるには DNX(Jericho2)系が要る(将来 1 台あれば P/PE をハード SRv6 化可能)。&#10;• これで #35 の『素の IP stub』→『実ハード fabric を流れる標準 SRv6 backbone + 異実装(VPP⇄FRR)相互運用』に格上げ。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+レート, 実 ASIC)。SW のまま=SID 機能(VPP/kernel)。SID 機能を ASIC でやるには DNX(Jericho2)系が要る(将来 1 台あれば P/PE をハード SRv6 化可能)。&#10;• これで『素の IP stub』backbone →『実ハード fabric を流れる標準 SRv6 backbone + 異実装(VPP⇄FRR)相互運用』に格上げ。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f8f8;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
           <mxGeometry x="40" y="620" width="1360" height="150" as="geometry" />
         </mxCell>
 
