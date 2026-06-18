@@ -1,10 +1,10 @@
 # srv6egress
 
-EgressPolicy CRD v1alpha1 — **BGP-driven SRv6 Egress Path Steering** for Kubernetes on Calico-VPP.
+EgressPolicy CRD — **BGP-driven SRv6 Egress Path Steering** for Kubernetes on Calico-VPP.
 
-This directory contains the research add-on to Calico-VPP for declarative,
-per-tenant SR-TE egress path selection. Design documented in
-the architecture diagrams and design notes under srv6egress/docs/.
+This directory is an experimental add-on to Calico-VPP for declarative,
+per-tenant SR-TE egress path selection. Design is documented in the
+architecture diagrams, design notes and testbed runbook under srv6egress/docs/.
 
 ## What
 
@@ -18,30 +18,51 @@ Color follows [RFC 9256 §2.1](https://www.rfc-editor.org/rfc/rfc9256#section-2.
 > *"The color is an unsigned non-zero 32-bit integer value that associates the
 > SR Policy with an intent or objective (e.g., low latency)."*
 
-The bgp-controller resolves `<color, endpoint>` to a concrete segment list and
-distributes the SR Policy over BGP; the agent on the pod node (headend)
-installs the SR steering in VPP.
+The bgp-controller resolves `<color, endpoint>` to a concrete segment list,
+allocates a per-tenant VIP, and distributes the SR Policy over BGP; the agent
+on the pod node (headend) installs the SR steering in VPP, and the agent on the
+egress gateway provisions the decap + per-tenant SNAT data path.
+
+### v1alpha1 and the "v1alpha2" BR mode
+
+The API version is `v1alpha1` — there is no separate v1alpha2 API. What the
+design notes call **v1alpha2** is the *Border Router* capability delivered
+through the same v1alpha1 CRD: the egress gateway additionally stitches the
+cluster SR domain to an operator SRv6 backbone (RFC 9252 service routes + RFC
+9012 Color), announced by the controller and recorded in
+`status.backbone`. It is opt-in via the controller config's `backbone:` section.
 
 ## Layout
 
 ```
 srv6egress/
-├── apis/v1alpha1/                     # Go types + DeepCopy
-│   ├── doc.go                         # (collapsed into types.go)
+├── apis/v1alpha1/                     # Go types + DeepCopy (EgressPolicy, incl. BackboneStatus)
 │   ├── groupversion_info.go
 │   ├── types.go
 │   └── zz_generated.deepcopy.go
+├── cmd/
+│   ├── bgp-controller/                # central reconciler (VIP alloc + SR Policy / BR announce)
+│   └── vpp-route-sync/                # program upstream-learned routes into the GW's per-VRF FIBs
+├── internal/
+│   ├── bgp/                           # gobgp distributors: SR Policy SAFI, colored route, RFC 9252 service
+│   ├── config/                        # controller config (upstreams, colors, backbone)
+│   ├── controller/                    # EgressPolicy reconciler
+│   ├── poolvalidator/                 # IPPool (allowedUses) validation
+│   ├── routesync/                     # vpp-route-sync internals (govpp / vppctl backends)
+│   └── vipalloc/                      # VIP allocator (Calico IPAM / in-memory)
 ├── config/
 │   ├── crd/bases/                     # CRD manifest
-│   │   └── srv6egress.ryskn.io_egresspolicies.yaml
-│   └── rbac/                          # ClusterRoles for controller + agent
-│       └── role.yaml
-├── examples/                          # Example EgressPolicy YAML
-│   └── tenant-a-via-isp-a.yaml
+│   ├── rbac/                          # ClusterRoles for controller + agent
+│   ├── controller/                    # controller-config example
+│   └── routesync/                     # routesync example
+├── docs/                              # architecture diagrams, design notes, testbed runbook
+├── examples/                          # example EgressPolicy YAML
 └── README.md
 ```
 
-## Quick install (validation only — no controller/agent yet)
+The per-node agent integration lives in `calico-vpp-agent/srv6egress/`.
+
+## Quick install (CRD only)
 
 ```sh
 kubectl apply -f srv6egress/config/crd/bases/srv6egress.ryskn.io_egresspolicies.yaml
@@ -50,18 +71,26 @@ kubectl apply -f srv6egress/examples/tenant-a-via-isp-a.yaml
 kubectl get egresspolicies   # ← shows Color / Upstream / EgressIP columns
 ```
 
-The CRD installs cleanly without controller/agent; the policy object will sit
-with empty status until the controller (Task #28) reconciles it.
+The CRD installs cleanly on its own; a policy object sits with empty status
+until the bgp-controller reconciles it and the calico-vpp-agent (with the
+`SRv6Enabled` + `SRv6EgressEnabled` feature gates) programs the data path.
 
 ## Status
 
-| Component | Issue | Status |
-|---|---|---|
-| CRD types & schema | #11 | **this PR** |
-| bgp-controller VM skeleton | #12 | next |
-| calico-vpp-agent EgressPolicy hook | #13 | after #12 |
-| Verification environment (sim-ISP, etc.) | #6 - #10 | deferred (needs infra) |
-| v1alpha2 PoC (backbone integration) | #14 | optional / future |
+| Component | Status |
+|---|---|
+| EgressPolicy CRD + schema (v1alpha1, incl. `status.backbone`) | implemented |
+| bgp-controller (Calico IPAM VIPs + gobgp SR Policy SAFI 73, default production) | implemented |
+| bgp-controller BR mode (RFC 9252 service announce, persist-then-announce) | implemented (config-gated by `backbone:`) |
+| calico-vpp-agent headend steering | implemented (gate: `SRv6EgressEnabled`) |
+| calico-vpp-agent egress gateway / BR provisioning (End.DT6.In + per-fib SNAT) | implemented (on nodes with upstream→VRF tables) |
+| vpp-route-sync (program upstream FIB routes into the GW) | implemented |
+| routesync: build SR policies from *received* RFC 9252 service routes | designed, disabled (`serviceBsidBlock` commented out) |
+| HA endpoint, dual-stack, no-SNAT mode, PathProfile CRD | future |
+
+The gateway data path depends on two private local VPP patches under
+`vpplink/generated/patches/`: **0006** (`End.DT6.In`, decap + ip6-input
+re-inject) and **0007** (per-fib cnat SNAT).
 
 ## Regenerating the deepcopy
 
@@ -80,7 +109,9 @@ controller-gen crd paths=./srv6egress/apis/v1alpha1/... output:crd:dir=./srv6egr
 - Per-tenant IPv6 egress VIP allocated from a Calico IPPool (`allowedUses: [Tunnel]`)
 - Single egress endpoint (HA = future work)
 - SNAT to VIP is mandatory (not a CRD field)
+- Optional Border Router mode: inter-domain SR-TE via RFC 9252 service routes
+  (controller `backbone:` config)
 
-Out of scope here (future): PathProfile CRD, no-SNAT mode, dual-stack,
-inter-domain SR-TE via RFC 9252 services SAFI (= v1alpha2 backbone
-integration).
+Future work: PathProfile CRD, no-SNAT mode, dual-stack, HA endpoints, and the
+reverse routesync direction (installing SR policies from received service
+routes).

@@ -1,26 +1,26 @@
 // Package srv6egress integrates the EgressPolicy CRD into calico-vpp-agent.
+// It is opt-in behind the SRv6Enabled + SRv6EgressEnabled feature gates and is
+// wired into the agent lifecycle in cmd/calico_vpp_dataplane.go.
 //
-// On each node, the agent watches EgressPolicy resources and reacts when:
-//   - A matching pod exists on this node (selector → local pod), AND
-//   - The bgp-controller has distributed the corresponding SR Policy
-//     (color + endpoint + segment list) via BGP, AND
-//   - The agent's SRv6Provider has the resolved SR Policy ready.
+// A node plays one or both of two roles:
 //
-// The agent then installs an SR steering entry in VPP's PodVRFIndex (table 2)
-// for the pod source / destination CIDR pair, pointing at the SR Policy's
-// BSID. This is conceptually the same mechanism used by `steerNodeIPViaSID`
-// (PR #1028) but driven by an EgressPolicy selector instead of node-to-node
-// reachability.
+// Headend (pod node): the agent watches EgressPolicy resources and steers when
+//   - a matching pod exists on this node (selector → local pod), AND
+//   - the bgp-controller has distributed the SR Policy and marked the policy
+//     Ready with status.srPolicy.bsid populated.
+// It then installs an SR steering entry in the pod's per-pod VRF for the pod
+// source / destination CIDR pair, pointing at the SR Policy's BSID. This is
+// the same mechanism as `steerNodeIPViaSID` (PR #1028) but driven by an
+// EgressPolicy selector instead of node-to-node reachability.
 //
-// v1alpha1 scope (this skeleton):
-//   - Type definitions and Manager state machine
-//   - Watcher entrypoint (controller-runtime informer-driven)
-//   - VPPInterface seam for SR steering install/remove (production wires this
-//     to the existing connectivity.SRv6Provider)
-//
-// Out of scope for this PR (follow-up wiring):
-//   - main() integration in calico-vpp-agent's lifecycle
-//   - Correlation with BGP-received SR Policy in SRv6Provider
+// Egress gateway / Border Router (endpoint node): when this node is the
+// policy's resolved endpoint, GatewayManager provisions the per-tenant data
+// path — a dedicated VRF with End.DT6.In decap, per-fib cnat SNAT (pod → VIP),
+// and inter-VRF stitch to the upstream VRF — and advertises the tenant SID over
+// BGP for cluster reachability. End.DT6.In and per-fib SNAT are private local
+// VPP patches (0006/0007), so this path is driven via CLI. The backbone (BR)
+// leg — RFC 9252 VIP service routes + Color — is announced by the
+// bgp-controller, not by the agent.
 //
 // Design notes: see srv6egress/docs/.
 package srv6egress
