@@ -99,59 +99,86 @@ func (g *vppGateway) cliOK(cmd string, okSubstrings ...string) error {
 	return err
 }
 
+// InstallGateway provisions the per-tenant gateway data path as a sequence of
+// named steps: find/create the loopback, bind the VRFs, resolve the FIB index
+// the cnat SNAT keys on, bring the loopback up, then install the localsid +
+// inter-VRF routing + SNAT. Each step is idempotent so a retry converges.
 func (g *vppGateway) InstallGateway(req GatewayRequest) error {
 	if req.TenantSID == nil || req.VIP == nil {
 		return fmt.Errorf("gateway install: incomplete request %+v", req)
 	}
-	sid := req.TenantSID.String()
-	vip := req.VIP.String()
 	vrf := req.VrfTable
 
-	// Deterministic per-VRF loopback (instance == VRF table id) so a retry
-	// reuses the same loop<vrf> rather than leaking a new loopback (and
-	// colliding on its address) on every attempt. It is the End.DT6.In RX
-	// interface; ip6-input runs its features (cnat-snat) on the decapped packet.
-	loName := fmt.Sprintf("loop%d", vrf)
-	created := false
-	if _, err := g.vpp.SearchInterfaceWithName(loName); err != nil {
-		if cerr := g.cli(fmt.Sprintf("create loopback interface instance %d", vrf)); cerr != nil {
-			return fmt.Errorf("create %s: %w", loName, cerr)
-		}
-		created = true
-	}
-
-	// Ensure the shared upstream VRF and the tenant VRF exist (add is tolerated
-	// if already present), then bind the loopback into the tenant VRF.
-	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", req.UpstreamTable), "already"); err != nil {
+	loName, created, err := g.ensureLoopback(vrf)
+	if err != nil {
 		return err
 	}
-	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", vrf), "already"); err != nil {
+	if err := g.bindVRFs(loName, vrf, req.UpstreamTable); err != nil {
 		return err
 	}
-	if err := g.cli(fmt.Sprintf("set interface ip6 table %s %d", loName, vrf)); err != nil {
-		return err
-	}
-
 	// cnat snat-policy keys on the FIB INDEX of the tenant VRF, not its table id.
 	fibIdx, err := g.fibIndex(vrf)
 	if err != nil {
 		return err
 	}
+	if err := g.enableLoopback(loName, vrf, created); err != nil {
+		return err
+	}
+	return g.installTenantDataPath(req, loName, fibIdx)
+}
 
+// ensureLoopback finds or creates the deterministic per-VRF loopback (instance
+// == VRF table id) so a retry reuses the same loop<vrf> rather than leaking a
+// new loopback (and colliding on its address) on every attempt. It is the
+// End.DT6.In RX interface; ip6-input runs its features (cnat-snat) on the
+// decapped packet. created=true means it was freshly created (its address must
+// still be assigned by enableLoopback).
+func (g *vppGateway) ensureLoopback(vrf uint32) (loName string, created bool, err error) {
+	loName = fmt.Sprintf("loop%d", vrf)
+	if _, serr := g.vpp.SearchInterfaceWithName(loName); serr != nil {
+		if cerr := g.cli(fmt.Sprintf("create loopback interface instance %d", vrf)); cerr != nil {
+			return "", false, fmt.Errorf("create %s: %w", loName, cerr)
+		}
+		created = true
+	}
+	return loName, created, nil
+}
+
+// bindVRFs ensures the shared upstream VRF and the tenant VRF exist (add is
+// tolerated if already present) and binds the loopback into the tenant VRF.
+func (g *vppGateway) bindVRFs(loName string, vrf, upstreamTable uint32) error {
+	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", upstreamTable), "already"); err != nil {
+		return err
+	}
+	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", vrf), "already"); err != nil {
+		return err
+	}
+	return g.cli(fmt.Sprintf("set interface ip6 table %s %d", loName, vrf))
+}
+
+// enableLoopback brings the loopback up, assigns its address once (only when
+// freshly created — re-setting it on an existing loop<vrf> would fail as a
+// conflict), and attaches the cnat-snat feature so the re-injected inner packet
+// is SNAT'd.
+func (g *vppGateway) enableLoopback(loName string, vrf uint32, created bool) error {
 	if err := g.cli(fmt.Sprintf("set interface state %s up", loName)); err != nil {
 		return err
 	}
 	if created {
-		// The address only needs setting once (it ip6-enables the loopback);
-		// re-setting it on the existing loop<vrf> would fail as a conflict.
 		if err := g.cli(fmt.Sprintf("set interface ip address %s %s", loName, loopV6(vrf))); err != nil {
 			return err
 		}
 	}
 	// cnat-snat feature add is idempotent in VPP.
-	if err := g.cli(fmt.Sprintf("set interface feature %s cnat-snat-ip6 arc ip6-unicast", loName)); err != nil {
-		return err
-	}
+	return g.cli(fmt.Sprintf("set interface feature %s cnat-snat-ip6 arc ip6-unicast", loName))
+}
+
+// installTenantDataPath installs the End.DT6.In localsid, the inter-VRF
+// forward/return routing, and the per-fib SNAT of the pod source to the VIP.
+func (g *vppGateway) installTenantDataPath(req GatewayRequest, loName string, fibIdx uint32) error {
+	sid := req.TenantSID.String()
+	vip := req.VIP.String()
+	vrf := req.VrfTable
 	// sr localsid add reports "identical localsid already exists" on a retry,
 	// which cli() does not treat as an error.
 	if err := g.cli(fmt.Sprintf("sr localsid address %s behavior end.dt6.in %s", sid, loName)); err != nil {
@@ -168,10 +195,7 @@ func (g *vppGateway) InstallGateway(req GatewayRequest) error {
 		return err
 	}
 	// bounce the return (dst=VIP on the shared uplink VRF) into the tenant VRF.
-	if err := g.cliOK(fmt.Sprintf("ip route add %s/128 table %d via ip6-lookup-in-table %d", vip, req.UpstreamTable, vrf), "already", "exist"); err != nil {
-		return err
-	}
-	return nil
+	return g.cliOK(fmt.Sprintf("ip route add %s/128 table %d via ip6-lookup-in-table %d", vip, req.UpstreamTable, vrf), "already", "exist")
 }
 
 func (g *vppGateway) RemoveGateway(req GatewayRequest) error {

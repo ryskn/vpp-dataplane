@@ -147,8 +147,8 @@ func (s *Syncer) reconcileOnce(ctx context.Context) {
 // supports them. It runs even with zero desired service routes so installs
 // left over from withdrawn services are cleaned up.
 func (s *Syncer) reconcileServices(desired []Route) {
-	sp, ok := s.VPP.(ServiceVPPProgrammer)
-	if !ok {
+	sp := s.VPP.ServiceProgrammer()
+	if sp == nil {
 		if len(desired) > 0 {
 			s.Log.Error(nil, "RIB carries SRv6 service routes but the VPP backend does not support them (use --vpp-backend=govpp)",
 				"count", len(desired))

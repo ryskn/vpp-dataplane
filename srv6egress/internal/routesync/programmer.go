@@ -6,10 +6,15 @@ import (
 	"os/exec"
 )
 
-// VPPProgrammer applies/removes a route in VPP and reads back the routes it
-// owns in a VRF. Implementations back this with vppctl (ExecProgrammer:
+// VPPProgrammer applies/removes a plain FIB route in VPP and reads back the
+// routes it owns in a VRF. Implementations back this with vppctl (ExecProgrammer:
 // standalone / off-box via kubectl exec) or govpp/vpplink (the native VPP
 // binary API, in-pod; see internal/routesync/vpplinkprog).
+//
+// A backend that can also program SRv6 service routes (RFC 9252) exposes that
+// capability through ServiceProgrammer; one that cannot returns nil there. This
+// keeps service support a first-class, explicitly-declared capability rather
+// than something the syncer discovers by reflection.
 type VPPProgrammer interface {
 	Add(r Route) error
 	Del(r Route) error
@@ -19,14 +24,17 @@ type VPPProgrammer interface {
 	// is not lost across a restart. Returning an error must NOT be treated as
 	// "table is empty" (that would delete still-wanted routes).
 	InstalledRoutes(table uint32, peers map[string]Upstream) ([]Route, error)
+	// ServiceProgrammer returns this backend's SRv6 service-route programmer, or
+	// nil if the backend cannot program service routes. When nil, the syncer
+	// reports any received service routes as unsupported (it never downgrades
+	// them to plain FIB entries).
+	ServiceProgrammer() ServiceVPPProgrammer
 }
 
-// ServiceVPPProgrammer is the optional extension for SRv6 service routes
-// (RFC 9252, v1alpha2 BR mode): a service route is not a plain FIB entry but
-// an SR policy (segment list = [service SID]) plus an SR steer of the prefix
-// in the VRF. Only the vpplink (govpp) backend implements it; the syncer
-// detects support via a type assertion and reports service routes as
-// unsupported otherwise.
+// ServiceVPPProgrammer programs SRv6 service routes (RFC 9252): a service route
+// is not a plain FIB entry but an SR policy (segment list = [service SID]) plus
+// an SR steer of the prefix in the VRF. A VPPProgrammer that supports them
+// returns a non-nil ServiceProgrammer; only the vpplink (govpp) backend does.
 type ServiceVPPProgrammer interface {
 	AddService(r Route) error
 	DelService(r Route) error
@@ -93,6 +101,10 @@ func routeArgs(r Route, op string) []string {
 
 func (p *ExecProgrammer) Add(r Route) error { return p.run(routeArgs(r, "add")) }
 func (p *ExecProgrammer) Del(r Route) error { return p.run(routeArgs(r, "del")) }
+
+// ServiceProgrammer reports that the vppctl backend cannot program SRv6 service
+// routes (no typed SR policy / steering API over the CLI seam).
+func (p *ExecProgrammer) ServiceProgrammer() ServiceVPPProgrammer { return nil }
 
 // InstalledRoutes runs `show ip6 fib table <table>` and parses the routes this
 // component owns. The text-parsing is an ExecProgrammer-internal detail; the

@@ -160,6 +160,9 @@ func (f *fakeProgrammer) Del(r Route) error {
 	return nil
 }
 
+// ServiceProgrammer returns nil: the plain fake does not support service routes.
+func (f *fakeProgrammer) ServiceProgrammer() ServiceVPPProgrammer { return nil }
+
 // InstalledRoutes renders the fake table in the real `show ip6 fib table N`
 // shape and runs it through the actual ParseOwnedRoutes parser, so the syncer
 // path still exercises the ownership filter.
@@ -280,7 +283,7 @@ type fibErr struct{}
 
 func (*fibErr) Error() string { return "vpp unreachable" }
 
-// --- SRv6 service routes (RFC 9252, v1alpha2 BR mode) ---
+// --- SRv6 service routes (RFC 9252, backbone stitching) ---
 
 // servicePathJSON renders one RIB path whose Prefix-SID attribute is generated
 // by gobgp's OWN MarshalJSON (the exact code path the gobgp CLI uses for -j),
@@ -404,6 +407,10 @@ func (f *fakeServiceProgrammer) InstalledServiceRoutes(table uint32) ([]Route, e
 	}
 	return out, nil
 }
+
+// ServiceProgrammer overrides the embedded plain fake to advertise service
+// support (it returns itself, the ServiceVPPProgrammer).
+func (f *fakeServiceProgrammer) ServiceProgrammer() ServiceVPPProgrammer { return f }
 
 func TestSyncer_ServiceRoutesConverge(t *testing.T) {
 	fp := newFakeServiceProgrammer()

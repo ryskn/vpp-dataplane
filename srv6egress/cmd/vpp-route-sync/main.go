@@ -31,6 +31,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -75,21 +76,21 @@ func main() {
 	}
 	log.Info("config loaded", "upstreams", len(cfg.Upstreams), "interval", interval.String())
 
-	vpp, err := newProgrammer(vppBackend, vppExec, vppSocket)
+	// SRv6 service routes (RFC 9252) need a BSID block; the block is handed to
+	// the backend at construction so the capability is set up once, up front.
+	block, _ := cfg.ServiceBSIDNet() // already validated in LoadConfig
+	vpp, err := newProgrammer(vppBackend, vppExec, vppSocket, block)
 	if err != nil {
 		log.Error(err, "init VPP backend", "backend", vppBackend)
 		os.Exit(1)
 	}
 	log.Info("VPP backend selected", "backend", vppBackend)
 
-	// SRv6 service routes (RFC 9252, v1alpha2 BR mode) need a BSID block and
-	// the govpp backend.
-	if block, _ := cfg.ServiceBSIDNet(); block != nil {
-		if p, ok := vpp.(*vpplinkprog.Programmer); ok {
-			p.SetServiceBSIDBlock(block)
+	if block != nil {
+		if vpp.ServiceProgrammer() != nil {
 			log.Info("SRv6 service routes enabled", "serviceBsidBlock", block.String())
 		} else {
-			log.Info("serviceBsidBlock configured but --vpp-backend is not govpp; service routes will be reported as unsupported")
+			log.Info("serviceBsidBlock configured but the VPP backend cannot program service routes (use --vpp-backend=govpp); they will be reported as unsupported")
 		}
 	}
 
@@ -112,11 +113,13 @@ func main() {
 }
 
 // newProgrammer selects the VPP programming backend. govpp is the production
-// path (native binary API); vppctl is kept for standalone / off-box bring-up.
-func newProgrammer(backend, vppExec, vppSocket string) (routesync.VPPProgrammer, error) {
+// path (native binary API) and the only one that can program SRv6 service
+// routes (when block is non-nil); vppctl is kept for standalone / off-box
+// bring-up and ignores block (it reports service routes as unsupported).
+func newProgrammer(backend, vppExec, vppSocket string, block *net.IPNet) (routesync.VPPProgrammer, error) {
 	switch backend {
 	case "govpp":
-		return vpplinkprog.New(vppSocket, logrus.WithField("component", "vpp-route-sync"))
+		return vpplinkprog.New(vppSocket, logrus.WithField("component", "vpp-route-sync"), block)
 	case "vppctl":
 		return routesync.NewExecProgrammer(strings.Fields(vppExec)), nil
 	default:

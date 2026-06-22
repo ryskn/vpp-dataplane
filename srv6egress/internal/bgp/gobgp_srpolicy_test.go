@@ -8,8 +8,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func testSRDist() *srPolicyDistributor {
-	return &srPolicyDistributor{opts: (&SRPolicyOptions{}).withDefaults()}
+func testSRDist() *srPolicyEncoder {
+	return &srPolicyEncoder{opts: (&SRPolicyOptions{}).withDefaults()}
 }
 
 var testBSID = net.ParseIP("cafe::64").To16()

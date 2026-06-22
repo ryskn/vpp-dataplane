@@ -35,8 +35,8 @@ func (f *fakeVPP) RemoveSteering(req SteeringRequest) error {
 }
 
 // readyPolicy returns an EgressPolicy with Ready=True and a populated BSID.
-// computeDesiredInstalls is a placeholder in the skeleton, so this test only
-// verifies the policy state lifecycle (add → delete).
+// The manager uses a no-op pod resolver here, so this test only verifies the
+// policy state lifecycle (add → delete).
 func readyPolicy(name, uid, bsid string) *srv6egressv1alpha1.EgressPolicy {
 	return &srv6egressv1alpha1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{
@@ -82,7 +82,7 @@ func TestManager_NotReadyDeferred(t *testing.T) {
 			Name: "tenant-pending",
 			UID:  types.UID("uid-p"),
 		},
-		// no Ready condition; skeleton must not crash and must not call VPP
+		// no Ready condition; the manager must not crash and must not call VPP
 	}
 	m.OnPolicyUpdate(ep)
 	if len(vpp.installs) != 0 {

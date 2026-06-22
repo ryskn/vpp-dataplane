@@ -1,9 +1,8 @@
 // Package vipalloc allocates per-tenant egress VIPs from a Calico IPPool.
 //
-// v1alpha1 scope: stub in-memory allocator suitable for unit tests and
-// initial bring-up. Production integration with Calico IPAM is TODO and
-// will replace InMemory with an implementation backed by
-// projectcalico.org/v3 IPAM (see TODO at the bottom of this file).
+// It provides two backends behind one Allocator interface: a stub in-memory
+// allocator for unit tests and bring-up, and the Calico IPAM-backed production
+// allocator (calico.go).
 package vipalloc
 
 import (

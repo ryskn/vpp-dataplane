@@ -136,7 +136,7 @@ func TestValidate_DuplicateBSIDRejected(t *testing.T) {
 	}
 }
 
-// --- v1alpha2 backbone validation ---
+// --- backbone stitching validation ---
 
 func validBackbone() *BackboneConfig {
 	return &BackboneConfig{

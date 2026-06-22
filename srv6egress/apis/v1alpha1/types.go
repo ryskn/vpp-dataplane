@@ -115,7 +115,8 @@ type EgressPolicyStatus struct {
 	SRPolicy *SRPolicyStatus `json:"srPolicy,omitempty"`
 
 	// Backbone records the RFC 9252 SRv6 service route announced toward the
-	// backbone PE for this policy's VIP (v1alpha2 BR mode). Persisted BEFORE
+	// backbone PE for this policy's VIP. Set only when the policy's upstream is
+	// stitched to a backbone (the backbone-stitch capability). Persisted BEFORE
 	// the announce so deletion can always rebuild the exact withdraw.
 	// +optional
 	Backbone *BackboneStatus `json:"backbone,omitempty"`

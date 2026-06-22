@@ -1,14 +1,10 @@
 package bgp
 
 import (
-	"context"
 	"fmt"
 	"net"
 
-	"github.com/go-logr/logr"
 	api "github.com/osrg/gobgp/v3/api"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	apb "google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -17,21 +13,13 @@ const EndDT6 = 18
 
 // ServiceRoute is one RFC 9252 SRv6 service advertisement: a prefix made
 // SR-reachable through the gateway's own End SID, colored for backbone TE
-// class selection (v1alpha2 BR mode: the tenant VIP toward the backbone PE).
+// class selection (the tenant VIP toward the backbone PE).
 type ServiceRoute struct {
 	Prefix   string // e.g. "2001:db8:e::42/128"
 	EndSID   string // the GW's End.DT6 SID for the tenant VRF
 	Behavior uint16 // IANA endpoint behavior; use EndDT6
 	Color    uint32 // backbone Color Extended Community value
 	Nexthop  string // next-hop on the GW-PE eBGP session
-}
-
-// ServiceDistributor announces/withdraws SRv6 service routes (RFC 9252) on a
-// backbone-facing BGP speaker.
-type ServiceDistributor interface {
-	AnnounceService(ctx context.Context, owner string, route ServiceRoute) error
-	WithdrawService(ctx context.Context, owner string, route ServiceRoute) error
-	Close() error
 }
 
 // SIDStructure is the SRv6 SID Structure Sub-Sub-TLV (RFC 9252 §3.2.1)
@@ -46,30 +34,6 @@ type SIDStructure struct {
 // DefaultSIDStructure matches the lab locator plan (fcff::/40 block + 24-bit
 // node + 16-bit function).
 var DefaultSIDStructure = SIDStructure{LocatorBlockBits: 40, LocatorNodeBits: 24, FunctionBits: 16}
-
-// goBGPServiceDistributor injects service routes into a gobgp instance (the
-// per-VRF gobgp on the egress GW holding the eBGP session to a backbone PE)
-// over its gRPC API.
-type goBGPServiceDistributor struct {
-	log       logr.Logger
-	cli       api.GobgpApiClient
-	conn      *grpc.ClientConn
-	structure SIDStructure
-}
-
-// NewGoBGPService dials the backbone-facing gobgp gRPC endpoint.
-func NewGoBGPService(addr string, structure SIDStructure, log logr.Logger) (ServiceDistributor, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial gobgp %s: %w", addr, err)
-	}
-	return &goBGPServiceDistributor{
-		log:       log,
-		cli:       api.NewGobgpApiClient(conn),
-		conn:      conn,
-		structure: structure,
-	}, nil
-}
 
 // serviceRoutePath builds the IPv6-unicast path for route: MP_REACH + Color
 // Extended Community + Prefix-SID attribute carrying the SRv6 L3 Service TLV
@@ -156,35 +120,22 @@ func serviceRoutePath(route ServiceRoute, structure SIDStructure) (*api.Path, er
 	}, nil
 }
 
-func (d *goBGPServiceDistributor) AnnounceService(ctx context.Context, owner string, route ServiceRoute) error {
-	path, err := serviceRoutePath(route, d.structure)
-	if err != nil {
-		return fmt.Errorf("build service path: %w", err)
-	}
-	// AddPath is idempotent for the same NLRI; re-announce just refreshes it.
-	if _, err := d.cli.AddPath(ctx, &api.AddPathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
-		return fmt.Errorf("gobgp AddPath (SRv6 service): %w", err)
-	}
-	d.log.Info("announced SRv6 service route (RFC 9252)",
-		"owner", owner, "prefix", route.Prefix, "endSID", route.EndSID,
-		"behavior", route.Behavior, "color", route.Color)
-	return nil
+// ServiceAdvert is an RFC 9252 SRv6 L3 service route advertised toward the
+// backbone: a tenant VIP made SR-reachable via the gateway's own End SID,
+// colored for backbone TE class selection.
+type ServiceAdvert struct {
+	Route     ServiceRoute
+	Structure SIDStructure
 }
 
-// WithdrawService rebuilds the path from the persisted route (no in-memory
-// state) and deletes it, so it works across controller restarts. Withdrawing
-// a path that was never announced is a no-op at the BGP layer.
-func (d *goBGPServiceDistributor) WithdrawService(ctx context.Context, owner string, route ServiceRoute) error {
-	path, err := serviceRoutePath(route, d.structure)
-	if err != nil {
-		return fmt.Errorf("build service path: %w", err)
-	}
-	if _, err := d.cli.DeletePath(ctx, &api.DeletePathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
-		return fmt.Errorf("gobgp DeletePath (SRv6 service): %w", err)
-	}
-	d.log.Info("withdrew SRv6 service route (RFC 9252)",
-		"owner", owner, "prefix", route.Prefix, "color", route.Color)
-	return nil
+func (a ServiceAdvert) BuildPath() (*api.Path, error) {
+	return serviceRoutePath(a.Route, a.Structure)
 }
 
-func (d *goBGPServiceDistributor) Close() error { return d.conn.Close() }
+// BSID is empty: RFC 9252 service routes carry no Binding SID.
+func (a ServiceAdvert) BSID() string { return "" }
+
+func (a ServiceAdvert) String() string {
+	return fmt.Sprintf("service-route prefix=%s endSID=%s color=%d",
+		a.Route.Prefix, a.Route.EndSID, a.Route.Color)
+}

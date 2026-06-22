@@ -13,11 +13,13 @@ import (
 // Manager is the per-node coordinator. It holds the current set of active
 // EgressPolicies and the steering entries each has installed; it diffs and
 // reconciles installs on every change (policy add/update/delete, pod
-// add/delete, SR Policy add/withdraw).
+// add/delete, SR Policy add/withdraw). The desired-state calculation is
+// delegated to a steeringComputer, keeping the Manager a lean lifecycle/diff
+// coordinator.
 type Manager struct {
-	log  *logrus.Entry
-	vpp  VPPInterface
-	pods PodResolver
+	log      *logrus.Entry
+	vpp      VPPInterface
+	steering *steeringComputer
 
 	mu       sync.Mutex
 	policies map[string]*policyState // key = EgressPolicy.UID
@@ -33,10 +35,11 @@ func NewManager(log *logrus.Entry, vpp VPPInterface) *Manager {
 // local pod IPs via pods. The caller wires vpp (the CNI server) and pods (the
 // informer-backed resolver) and feeds events via the On* methods.
 func NewManagerWithResolver(log *logrus.Entry, vpp VPPInterface, pods PodResolver) *Manager {
+	l := log.WithField("component", "srv6egress-manager")
 	return &Manager{
-		log:      log.WithField("component", "srv6egress-manager"),
+		log:      l,
 		vpp:      vpp,
-		pods:     pods,
+		steering: &steeringComputer{pods: pods, log: l},
 		policies: make(map[string]*policyState),
 	}
 }
@@ -92,13 +95,9 @@ func (m *Manager) ReconcileAll() {
 	}
 }
 
-// reconcileLocked recomputes the desired install set for one policy and
-// diffs it against the previously installed set. m.mu must be held.
-//
-// v1alpha1 skeleton: this function lays out the diff logic. The actual
-// "which pods match the selector on this node" and "is the BSID ready"
-// queries are TODOs marked inline — wiring happens when integrated with
-// the agent's local pod cache and the BGP-side SR Policy store.
+// reconcileLocked recomputes the desired install set for one policy (via the
+// steeringComputer) and diffs it against the previously installed set, applying
+// the difference through the VPP seam. m.mu must be held.
 func (m *Manager) reconcileLocked(st *policyState) {
 	if st.policy == nil {
 		return
@@ -110,7 +109,7 @@ func (m *Manager) reconcileLocked(st *policyState) {
 		return
 	}
 
-	desired := m.computeDesiredInstalls(st.policy)
+	desired := m.steering.desired(st.policy)
 	desiredKeys := make(map[string]struct{}, len(desired))
 	for _, req := range desired {
 		desiredKeys[req.key()] = struct{}{}
@@ -140,67 +139,6 @@ func (m *Manager) reconcileLocked(st *policyState) {
 		}
 		st.installs[k] = req
 	}
-}
-
-// computeDesiredInstalls builds the (pod × dest) SteeringRequest set for one
-// policy on this node: every local pod matching the selector, crossed with
-// every IPv6 destinationCIDR, steered into the policy's SR Policy (BSID).
-func (m *Manager) computeDesiredInstalls(ep *srv6egressv1alpha1.EgressPolicy) []SteeringRequest {
-	if ep.Status.SRPolicy == nil || ep.Status.SRPolicy.BSID == "" {
-		return nil
-	}
-	bsid := net.ParseIP(ep.Status.SRPolicy.BSID)
-	if bsid == nil {
-		m.log.WithField("bsid", ep.Status.SRPolicy.BSID).Warn("status.srPolicy.bsid is not a valid IP")
-		return nil
-	}
-
-	// v1alpha1: an explicit IPv6 destinationCIDR list is required. Empty means
-	// "all off-cluster destinations" in the CRD, but steering ::/0 would also
-	// catch in-cluster traffic; that needs cluster-CIDR exclusion (future work).
-	dests := parseV6DestCIDRs(ep.Spec.DestinationCIDRs)
-	if len(dests) == 0 {
-		m.log.WithField("name", ep.Name).Warn("no usable IPv6 destinationCIDRs; empty (all off-cluster) not yet supported, skipping")
-		return nil
-	}
-
-	podIPs, err := m.pods.MatchingLocalPodIPs(ep.Spec.Selector)
-	if err != nil {
-		m.log.WithError(err).WithField("name", ep.Name).Warn("resolving local pods for selector failed")
-		return nil
-	}
-
-	reqs := make([]SteeringRequest, 0, len(podIPs)*len(dests))
-	for _, ip := range podIPs {
-		if ip.To4() != nil {
-			continue // IPv6 only for v1alpha1
-		}
-		for _, dst := range dests {
-			reqs = append(reqs, SteeringRequest{
-				PolicyUID:  string(ep.UID),
-				PodIP:      ip,
-				DestPrefix: dst,
-				Color:      ep.Spec.Egress.Color,
-				BSID:       bsid,
-			})
-		}
-	}
-	return reqs
-}
-
-// parseV6DestCIDRs parses the policy's destinationCIDRs, keeping only valid
-// IPv6 prefixes. Invalid / IPv4 entries are dropped (the controller validates
-// these at admission; this is defence in depth on the agent side).
-func parseV6DestCIDRs(cidrs []string) []*net.IPNet {
-	out := make([]*net.IPNet, 0, len(cidrs))
-	for _, c := range cidrs {
-		_, ipnet, err := net.ParseCIDR(c)
-		if err != nil || ipnet == nil || ipnet.IP.To4() != nil {
-			continue
-		}
-		out = append(out, ipnet)
-	}
-	return out
 }
 
 // nopResolver matches no pods. Used by NewManager (unit tests) so the policy

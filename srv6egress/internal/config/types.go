@@ -23,14 +23,17 @@ type ControllerConfig struct {
 	// Keyed by color value (uint32 in JSON keys is stringified, accepted both).
 	Colors map[uint32]ColorConfig `json:"colors"`
 
-	// Backbone enables v1alpha2 BR mode: tenant VIPs are additionally announced
-	// toward the SRv6 backbone as RFC 9252 service routes (own End SID +
-	// backbone Color Ext-Comm) on the per-upstream GW↔PE eBGP sessions.
+	// Backbone enables backbone stitching: tenant VIPs are additionally
+	// announced toward the SRv6 backbone as RFC 9252 service routes (own End
+	// SID + backbone Color Ext-Comm) on the per-upstream GW↔PE eBGP sessions.
+	// Optional — when unset the controller simply skips the backbone-stitch
+	// stage. It is a composable capability layered on the same cluster-egress
+	// pipeline, not a separate operating mode.
 	// +optional
 	Backbone *BackboneConfig `json:"backbone,omitempty"`
 }
 
-// BackboneConfig declares the cluster⇄backbone stitching (v1alpha2).
+// BackboneConfig declares the cluster⇄backbone stitching.
 type BackboneConfig struct {
 	// ColorMap maps a cluster color to the backbone Color Ext-Comm value used
 	// on the GW↔PE session. A color absent from the map keeps its value

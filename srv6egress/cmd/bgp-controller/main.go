@@ -127,28 +127,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Cluster SR Policy encoding (colored route or SR Policy SAFI) is selected
+	// here; the controller stays encoding-agnostic and the transport below is
+	// independent of it.
+	var encoder bgp.Encoder
+	switch bgpEncoding {
+	case "sr-policy":
+		encoder = bgp.NewSRPolicyEncoder(bgp.SRPolicyOptions{})
+	case "color-route":
+		encoder = bgp.NewColoredEncoder()
+	default:
+		log.Error(fmt.Errorf("unknown bgp-encoding %q", bgpEncoding), "invalid flag")
+		os.Exit(1)
+	}
+
 	var bgpDist bgp.Distributor
 	switch bgpBackend {
 	case "gobgp":
-		switch bgpEncoding {
-		case "sr-policy":
-			bgpDist, err = bgp.NewGoBGPSRPolicy(gobgpAddr, bgp.SRPolicyOptions{}, log.WithName("bgp"))
-			if err != nil {
-				log.Error(err, "init gobgp SR Policy distributor")
-				os.Exit(1)
-			}
-			log.Info("BGP backend: gobgp (SR Policy SAFI 73)", "addr", gobgpAddr)
-		case "color-route":
-			bgpDist, err = bgp.NewGoBGP(gobgpAddr, log.WithName("bgp"))
-			if err != nil {
-				log.Error(err, "init gobgp distributor")
-				os.Exit(1)
-			}
-			log.Info("BGP backend: gobgp (colored IPv6 route)", "addr", gobgpAddr)
-		default:
-			log.Error(fmt.Errorf("unknown bgp-encoding %q", bgpEncoding), "invalid flag")
+		bgpDist, err = bgp.NewGoBGPDistributor(gobgpAddr, log.WithName("bgp"))
+		if err != nil {
+			log.Error(err, "init gobgp distributor")
 			os.Exit(1)
 		}
+		log.Info("BGP backend: gobgp", "encoding", bgpEncoding, "addr", gobgpAddr)
 	case "stub":
 		bgpDist = bgp.NewLoggingStub(log.WithName("bgp"))
 		log.Info("WARNING: BGP backend is logging stub (no real BGP UPDATE; not for production)")
@@ -157,14 +158,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// v1alpha2 BR mode: one service distributor per backbone-stitched upstream
-	// (the per-VRF gobgp on the egress GW holding the eBGP session to the PE).
-	backboneBGP := map[string]bgp.ServiceDistributor{}
+	// One backbone-facing distributor per stitched upstream (the per-VRF gobgp
+	// on the egress GW holding the eBGP session to the PE). Empty when no
+	// backbone is configured — the VIP service advertisement is then skipped.
+	backboneBGP := map[string]bgp.Distributor{}
 	if cfg.Backbone != nil {
 		for upstream, peer := range cfg.Backbone.Peers {
-			dist, err := bgp.NewGoBGPService(peer.GoBGPAddr, bgp.DefaultSIDStructure, log.WithName("backbone").WithValues("upstream", upstream))
+			dist, err := bgp.NewGoBGPDistributor(peer.GoBGPAddr, log.WithName("backbone").WithValues("upstream", upstream))
 			if err != nil {
-				log.Error(err, "init backbone service distributor", "upstream", upstream, "addr", peer.GoBGPAddr)
+				log.Error(err, "init backbone distributor", "upstream", upstream, "addr", peer.GoBGPAddr)
 				os.Exit(1)
 			}
 			backboneBGP[upstream] = dist
@@ -178,6 +180,7 @@ func main() {
 		Config:      cfg,
 		VIPs:        vipAlloc,
 		BGP:         bgpDist,
+		Encoder:     encoder,
 		Pools:       poolvalidator.NewCalico(mgr.GetClient()),
 		BackboneBGP: backboneBGP,
 	}).SetupWithManager(mgr); err != nil {
