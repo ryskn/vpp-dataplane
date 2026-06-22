@@ -1,38 +1,19 @@
 package bgp
 
 import (
-	"context"
 	"fmt"
 
-	"github.com/go-logr/logr"
 	api "github.com/osrg/gobgp/v3/api"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	apb "google.golang.org/protobuf/types/known/anypb"
 )
 
-// goBGPDistributor distributes SR Policies by injecting routes into a running
-// gobgp instance over its gRPC API. For each announced SR Policy it adds an
-// IPv6 unicast route for the terminal SID (End.DT6) carrying a Color Extended
-// Community (RFC 9012 §3.4.2) — the headend matches on color to install SR
-// steering (RFC 9256 §8.4).
-type goBGPDistributor struct {
-	log  logr.Logger
-	cli  api.GobgpApiClient
-	conn *grpc.ClientConn
-}
-
-// NewGoBGP dials a gobgp gRPC endpoint (e.g. "127.0.0.1:50051").
-func NewGoBGP(addr string, log logr.Logger) (Distributor, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial gobgp %s: %w", addr, err)
-	}
-	return &goBGPDistributor{
-		log:  log,
-		cli:  api.NewGobgpApiClient(conn),
-		conn: conn,
-	}, nil
+// Encoder builds the Advertisement for distributing an SR Policy to headends,
+// per a chosen on-the-wire encoding (colored route or SR Policy SAFI). The
+// controller is given one Encoder at startup (--bgp-encoding) and stays
+// encoding-agnostic; the Distributor transport is independent of the encoding.
+type Encoder interface {
+	// ClusterAdvert builds the SR Policy advertisement for (key, segmentList).
+	ClusterAdvert(key PolicyKey, segmentList []string) Advertisement
 }
 
 var v6family = &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}
@@ -73,44 +54,41 @@ func coloredHostPath(sid string, color uint32) (*api.Path, error) {
 	}, nil
 }
 
-func (d *goBGPDistributor) Announce(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) (string, error) {
-	if len(segmentList) == 0 {
-		return "", fmt.Errorf("segmentList must not be empty")
-	}
-	sid := segmentList[len(segmentList)-1] // terminal End.DT6 SID
-	path, err := coloredHostPath(sid, key.Color)
-	if err != nil {
-		return "", fmt.Errorf("build path: %w", err)
-	}
-	// AddPath is idempotent for the same NLRI (re-announce after a restart just
-	// updates the existing path), so no local bookkeeping is needed.
-	if _, err := d.cli.AddPath(ctx, &api.AddPathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
-		return "", fmt.Errorf("gobgp AddPath: %w", err)
-	}
-	d.log.Info("announced SR Policy via gobgp",
-		"owner", policyOwner, "color", key.Color, "endpoint", key.Endpoint, "sid", sid)
-	return sid, nil
+// coloredEncoder encodes SR Policies as a colored IPv6 /128 host route for the
+// terminal SID (End.DT6) carrying a Color Extended Community (RFC 9012 §3.4.2).
+// The SR Policy must be provisioned on the headend out of band; the route only
+// carries the color the headend steers on.
+type coloredEncoder struct{}
+
+// NewColoredEncoder returns an Encoder using the colored-route encoding.
+func NewColoredEncoder() Encoder { return coloredEncoder{} }
+
+func (coloredEncoder) ClusterAdvert(key PolicyKey, segmentList []string) Advertisement {
+	return &ColoredAdvert{Key: key, SegmentList: segmentList}
 }
 
-// Withdraw rebuilds the route from the key + segmentList (no in-memory state),
-// so it works even after a controller restart — the reconciler replays it from
-// the EgressPolicy's persisted status, leaving no stale gobgp route.
-func (d *goBGPDistributor) Withdraw(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) error {
-	if len(segmentList) == 0 {
-		return nil // nothing was announced (policy never went Ready)
-	}
-	sid := segmentList[len(segmentList)-1]
-	path, err := coloredHostPath(sid, key.Color)
-	if err != nil {
-		return fmt.Errorf("build path: %w", err)
-	}
-	if _, err := d.cli.DeletePath(ctx, &api.DeletePathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
-		return fmt.Errorf("gobgp DeletePath: %w", err)
-	}
-	d.log.Info("withdrew SR Policy via gobgp",
-		"owner", policyOwner, "color", key.Color, "sid", sid)
-	return nil
+// ColoredAdvert is an SR Policy advertised as a colored IPv6 host route.
+type ColoredAdvert struct {
+	Key         PolicyKey
+	SegmentList []string
 }
 
-// Close releases the gRPC connection.
-func (d *goBGPDistributor) Close() error { return d.conn.Close() }
+func (a *ColoredAdvert) BuildPath() (*api.Path, error) {
+	if len(a.SegmentList) == 0 {
+		return nil, fmt.Errorf("segmentList must not be empty")
+	}
+	return coloredHostPath(a.SegmentList[len(a.SegmentList)-1], a.Key.Color) // terminal End.DT6 SID
+}
+
+// BSID reports the terminal SID, which the colored encoding effectively keys on
+// (it carries no separate Binding SID).
+func (a *ColoredAdvert) BSID() string {
+	if len(a.SegmentList) == 0 {
+		return ""
+	}
+	return a.SegmentList[len(a.SegmentList)-1]
+}
+
+func (a *ColoredAdvert) String() string {
+	return fmt.Sprintf("colored-route color=%d sid=%s", a.Key.Color, a.BSID())
+}

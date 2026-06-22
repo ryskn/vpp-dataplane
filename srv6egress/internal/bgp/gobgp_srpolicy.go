@@ -1,14 +1,10 @@
 package bgp
 
 import (
-	"context"
 	"fmt"
 	"net"
 
-	"github.com/go-logr/logr"
 	api "github.com/osrg/gobgp/v3/api"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	apb "google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -37,32 +33,21 @@ func (o *SRPolicyOptions) withDefaults() SRPolicyOptions {
 	return out
 }
 
-// srPolicyDistributor distributes SR Policies natively over BGP SR Policy SAFI
-// (AFI IPv6 / SAFI 73, RFC 9012). Unlike the colored-route encoding it
-// advertises the policy itself: an NLRI of <distinguisher, color, endpoint>
-// plus a Tunnel Encapsulation attribute carrying the FULL segment list, so a
-// receiving headend installs the SR Policy end to end. This is what lets the
-// controller integrate with an SRv6 backbone that consumes SR Policy SAFI.
-type srPolicyDistributor struct {
-	log  logr.Logger
-	cli  api.GobgpApiClient
-	conn *grpc.ClientConn
-	opts SRPolicyOptions
+// srPolicyEncoder encodes SR Policies natively over BGP SR Policy SAFI (AFI
+// IPv6 / SAFI 73, RFC 9012). Unlike the colored-route encoding it advertises
+// the policy itself: an NLRI of <distinguisher, color, endpoint> plus a Tunnel
+// Encapsulation attribute carrying the FULL segment list, so a receiving
+// headend installs the SR Policy end to end. This is what lets the controller
+// integrate with an SRv6 backbone that consumes SR Policy SAFI.
+type srPolicyEncoder struct{ opts SRPolicyOptions }
+
+// NewSRPolicyEncoder returns an Encoder using the SR Policy SAFI encoding.
+func NewSRPolicyEncoder(opts SRPolicyOptions) Encoder {
+	return &srPolicyEncoder{opts: opts.withDefaults()}
 }
 
-// NewGoBGPSRPolicy dials a gobgp gRPC endpoint and distributes SR Policies over
-// SR Policy SAFI (SAFI 73).
-func NewGoBGPSRPolicy(addr string, opts SRPolicyOptions, log logr.Logger) (Distributor, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial gobgp %s: %w", addr, err)
-	}
-	return &srPolicyDistributor{
-		log:  log,
-		cli:  api.NewGobgpApiClient(conn),
-		conn: conn,
-		opts: opts.withDefaults(),
-	}, nil
+func (e *srPolicyEncoder) ClusterAdvert(key PolicyKey, segmentList []string) Advertisement {
+	return &SRPolicyAdvert{enc: e, Key: key, SegmentList: segmentList}
 }
 
 // srPolicyFamily is AFI IPv6 / SAFI 73.
@@ -87,7 +72,7 @@ func parseV6SID(s string) (net.IP, error) {
 // The Binding SID sub-TLV is mandatory: the receiving headend keys its VPP SR
 // Policy on the BSID, so omitting it would advertise an SR Policy the receiver
 // installs under an all-zero, unusable BSID.
-func (d *srPolicyDistributor) srPolicyPath(color uint32, endpoint, bsid net.IP, segmentList []string) (*api.Path, error) {
+func (d *srPolicyEncoder) srPolicyPath(color uint32, endpoint, bsid net.IP, segmentList []string) (*api.Path, error) {
 	nlri, err := apb.New(&api.SRPolicyNLRI{
 		Length:        192, // bits: 4 (distinguisher) + 4 (color) + 16 (endpoint) octets
 		Distinguisher: d.opts.Distinguisher,
@@ -164,7 +149,7 @@ func (d *srPolicyDistributor) srPolicyPath(color uint32, endpoint, bsid net.IP, 
 	}, nil
 }
 
-func (d *srPolicyDistributor) endpointIP(key PolicyKey) (net.IP, error) {
+func (d *srPolicyEncoder) endpointIP(key PolicyKey) (net.IP, error) {
 	ip, err := parseV6SID(key.EndpointAddr)
 	if err != nil {
 		return nil, fmt.Errorf("SR Policy endpoint address %q: %w", key.EndpointAddr, err)
@@ -172,7 +157,7 @@ func (d *srPolicyDistributor) endpointIP(key PolicyKey) (net.IP, error) {
 	return ip, nil
 }
 
-func (d *srPolicyDistributor) bindingSID(key PolicyKey) (net.IP, error) {
+func (d *srPolicyEncoder) bindingSID(key PolicyKey) (net.IP, error) {
 	if key.BSID == "" {
 		return nil, fmt.Errorf("SR Policy SAFI requires a BSID (set colors.<n>.bsid in the controller config)")
 	}
@@ -183,60 +168,34 @@ func (d *srPolicyDistributor) bindingSID(key PolicyKey) (net.IP, error) {
 	return ip, nil
 }
 
-func (d *srPolicyDistributor) Announce(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) (string, error) {
-	if len(segmentList) == 0 {
-		return "", fmt.Errorf("segmentList must not be empty")
-	}
-	endpoint, err := d.endpointIP(key)
-	if err != nil {
-		return "", err
-	}
-	bsid, err := d.bindingSID(key)
-	if err != nil {
-		return "", err
-	}
-	path, err := d.srPolicyPath(key.Color, endpoint, bsid, segmentList)
-	if err != nil {
-		return "", fmt.Errorf("build SR Policy path: %w", err)
-	}
-	// AddPath is idempotent for the same NLRI key, so re-announcing after a
-	// restart just refreshes the existing policy — no local bookkeeping needed.
-	if _, err := d.cli.AddPath(ctx, &api.AddPathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
-		return "", fmt.Errorf("gobgp AddPath (SR Policy SAFI): %w", err)
-	}
-	d.log.Info("announced SR Policy via gobgp (SAFI 73)",
-		"owner", policyOwner, "color", key.Color, "endpoint", key.EndpointAddr,
-		"bsid", key.BSID, "segments", len(segmentList))
-	return key.BSID, nil
+// SRPolicyAdvert is an SR Policy advertised natively over SR Policy SAFI. Its
+// NLRI key is <distinguisher, color, endpoint>; the segment list is replayed
+// from the EgressPolicy's persisted status so Withdraw is correct across a
+// controller restart.
+type SRPolicyAdvert struct {
+	Key         PolicyKey
+	SegmentList []string
+	enc         *srPolicyEncoder
 }
 
-// Withdraw rebuilds the SR Policy from the key + segment list (no in-memory
-// state) and deletes it. The NLRI key is <distinguisher, color, endpoint>; the
-// segment list is replayed from the EgressPolicy's persisted status so the
-// teardown is correct across a controller restart.
-func (d *srPolicyDistributor) Withdraw(ctx context.Context, policyOwner string, key PolicyKey, segmentList []string) error {
-	if len(segmentList) == 0 {
-		return nil // nothing was announced (policy never went Ready)
+func (a *SRPolicyAdvert) BuildPath() (*api.Path, error) {
+	if len(a.SegmentList) == 0 {
+		return nil, fmt.Errorf("segmentList must not be empty")
 	}
-	endpoint, err := d.endpointIP(key)
+	endpoint, err := a.enc.endpointIP(a.Key)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	bsid, err := d.bindingSID(key)
+	bsid, err := a.enc.bindingSID(a.Key)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	path, err := d.srPolicyPath(key.Color, endpoint, bsid, segmentList)
-	if err != nil {
-		return fmt.Errorf("build SR Policy path: %w", err)
-	}
-	if _, err := d.cli.DeletePath(ctx, &api.DeletePathRequest{TableType: api.TableType_GLOBAL, Path: path}); err != nil {
-		return fmt.Errorf("gobgp DeletePath (SR Policy SAFI): %w", err)
-	}
-	d.log.Info("withdrew SR Policy via gobgp (SAFI 73)",
-		"owner", policyOwner, "color", key.Color, "endpoint", key.EndpointAddr)
-	return nil
+	return a.enc.srPolicyPath(a.Key.Color, endpoint, bsid, a.SegmentList)
 }
 
-// Close releases the gRPC connection.
-func (d *srPolicyDistributor) Close() error { return d.conn.Close() }
+func (a *SRPolicyAdvert) BSID() string { return a.Key.BSID }
+
+func (a *SRPolicyAdvert) String() string {
+	return fmt.Sprintf("sr-policy color=%d endpoint=%s bsid=%s segments=%d",
+		a.Key.Color, a.Key.EndpointAddr, a.Key.BSID, len(a.SegmentList))
+}

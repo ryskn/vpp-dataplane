@@ -243,13 +243,13 @@ func (m *GatewayManager) desired(ep *srv6egressv1alpha1.EgressPolicy) (bool, Gat
 	if sp == nil || len(sp.SegmentList) == 0 {
 		return false, GatewayRequest{}
 	}
-	sid := net.ParseIP(sp.SegmentList[len(sp.SegmentList)-1])
-	if sid == nil || sid.To4() != nil {
+	sid := parseV6(sp.SegmentList[len(sp.SegmentList)-1])
+	if sid == nil {
 		m.log.WithField("name", ep.Name).Warn("terminal SID is not IPv6; skipping gateway install")
 		return false, GatewayRequest{}
 	}
-	vip := net.ParseIP(ep.Status.EgressIP)
-	if vip == nil || vip.To4() != nil {
+	vip := parseV6(ep.Status.EgressIP)
+	if vip == nil {
 		m.log.WithField("name", ep.Name).Warn("egressIP is not IPv6; skipping gateway install")
 		return false, GatewayRequest{}
 	}

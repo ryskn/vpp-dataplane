@@ -1,0 +1,123 @@
+# bgp-controller — in-cluster deployment of the EgressPolicy reconciler.
+#
+# Prereqs (apply first):
+#   kubectl apply -f srv6egress/config/crd/bases/srv6egress.ryskn.io_egresspolicies.yaml
+#   kubectl apply -f srv6egress/config/rbac/role.yaml   # defines the ClusterRole srv6egress-controller
+#
+# EDIT before applying:
+#   - the container image tag (set to the tag CI published for your branch/sha)
+#   - the controller-config ConfigMap below (upstreams / colors / backbone) to
+#     match your testbed — do NOT ship the lab example values to production
+#   - --gobgp-addr: the gRPC endpoint of the cluster-facing gobgp speaker the
+#     controller injects SR Policies into (sidecar or external; testbed-specific)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: srv6egress-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: srv6egress-controller
+  namespace: srv6egress-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: srv6egress-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: srv6egress-controller # from srv6egress/config/rbac/role.yaml
+subjects:
+  - kind: ServiceAccount
+    name: srv6egress-controller
+    namespace: srv6egress-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srv6egress-controller-config
+  namespace: srv6egress-system
+data:
+  # Template — replace with your testbed's color/upstream mapping. See
+  # srv6egress/config/controller/controller-config.example.yaml for the full
+  # schema (incl. the optional backbone stitching section).
+  controller-config.yaml: |
+    upstreams:
+      isp-a:
+        sid: "fcff:0:0:e0:a::"
+        vrf: upstream-a
+      isp-b:
+        sid: "fcff:0:0:e0:b::"
+        vrf: upstream-b
+    colors:
+      100:
+        upstream: isp-a
+        bsid: "cafe::64"
+        segmentList:
+          - "fcff:0:0:e0:a::"
+      200:
+        upstream: isp-b
+        bsid: "cafe::c8"
+        segmentList:
+          - "fcff:0:0:e0:b::"
+    # backbone:  # optional — uncomment to enable backbone stitching
+    #   peers:
+    #     isp-a:
+    #       gobgpAddr: "192.0.2.14:50052"
+    #       nexthop: "fda1::2"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srv6egress-bgp-controller
+  namespace: srv6egress-system
+  labels:
+    app: srv6egress-bgp-controller
+spec:
+  replicas: 1 # leader election off; keep a single replica
+  selector:
+    matchLabels:
+      app: srv6egress-bgp-controller
+  template:
+    metadata:
+      labels:
+        app: srv6egress-bgp-controller
+    spec:
+      serviceAccountName: srv6egress-controller
+      containers:
+        - name: bgp-controller
+          # EDIT: set to the CI-published tag (branch tag or sha-<commit>).
+          image: ghcr.io/ryskn/srv6egress-bgp-controller:srv6egress-solid-refactor
+          imagePullPolicy: IfNotPresent # IPv6-only cluster imports via `ctr images import`
+          args:
+            - --config=/etc/srv6egress/controller-config.yaml
+            - --vip-backend=calico # Calico IPAM VIPs (uses the SA above)
+            - --bgp-backend=gobgp
+            - --bgp-encoding=sr-policy
+            - --gobgp-addr=127.0.0.1:50051 # EDIT: cluster-facing gobgp gRPC
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+          ports:
+            - { name: metrics, containerPort: 8080 }
+            - { name: probe, containerPort: 8081 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: probe }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: probe }
+            initialDelaySeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/srv6egress
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap:
+            name: srv6egress-controller-config

@@ -112,32 +112,39 @@ func newReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler 
 		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
 		Build()
 	return &EgressPolicyReconciler{
-		Client: c,
-		Scheme: s,
-		Config: testConfig(),
-		VIPs:   vipalloc.NewInMemory(),
-		BGP:    bgp.NewLoggingStub(logr.Discard()),
-		Pools:  poolvalidator.NewCalico(c),
+		Client:  c,
+		Scheme:  s,
+		Config:  testConfig(),
+		VIPs:    vipalloc.NewInMemory(),
+		BGP:     bgp.NewLoggingStub(logr.Discard()),
+		Encoder: bgp.NewColoredEncoder(),
+		Pools:   poolvalidator.NewCalico(c),
 	}
 }
 
-// recordingBGP records the args of the last Announce/Withdraw.
+// recordingBGP records the args of the last Announce/Withdraw. Cluster adverts
+// are colored-route encoded (see newReconciler), so it decodes the PolicyKey +
+// segment list straight off the recorded Advertisement.
 type recordingBGP struct {
 	wOwner string
 	wKey   bgp.PolicyKey
 	wSegs  []string
 }
 
-func (b *recordingBGP) Announce(_ context.Context, _ string, key bgp.PolicyKey, segs []string) (string, error) {
-	if len(segs) == 0 {
+func (b *recordingBGP) Announce(_ context.Context, _ string, adv bgp.Advertisement) (string, error) {
+	if adv == nil {
 		return "", nil
 	}
-	return segs[len(segs)-1], nil
+	return adv.BSID(), nil
 }
-func (b *recordingBGP) Withdraw(_ context.Context, owner string, key bgp.PolicyKey, segs []string) error {
-	b.wOwner, b.wKey, b.wSegs = owner, key, segs
+func (b *recordingBGP) Withdraw(_ context.Context, owner string, adv bgp.Advertisement) error {
+	b.wOwner = owner
+	if ca, ok := adv.(*bgp.ColoredAdvert); ok {
+		b.wKey, b.wSegs = ca.Key, ca.SegmentList
+	}
 	return nil
 }
+func (b *recordingBGP) Close() error { return nil }
 
 func reconcile(t *testing.T, r *EgressPolicyReconciler, name string) error {
 	t.Helper()
@@ -306,7 +313,7 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec, Pools: poolvalidator.NewCalico(c)}
+		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
 
 	// Announce with color 100 → status.srPolicy.color = 100.
 	if err := reconcile(t, r, "tenant-a"); err != nil {
@@ -341,7 +348,7 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 	}
 }
 
-// --- v1alpha2 backbone (BR mode) ---
+// --- backbone stitching ---
 
 // fixedVIPAllocator hands out one real IPv6 VIP (backbone advertise requires
 // a parseable address, unlike the synthetic in-memory pool strings).
@@ -351,7 +358,7 @@ func (f fixedVIPAllocator) Allocate(_ context.Context, _, _ string) (string, err
 	return f.vip, nil
 }
 func (f fixedVIPAllocator) Register(_ context.Context, _, _ string) error { return nil }
-func (f fixedVIPAllocator) Release(_ context.Context, _ string) error    { return nil }
+func (f fixedVIPAllocator) Release(_ context.Context, _ string) error     { return nil }
 
 // recordingServiceBGP records backbone service announces/withdraws.
 type recordingServiceBGP struct {
@@ -360,15 +367,19 @@ type recordingServiceBGP struct {
 	announceErr error
 }
 
-func (b *recordingServiceBGP) AnnounceService(_ context.Context, _ string, r bgp.ServiceRoute) error {
+func (b *recordingServiceBGP) Announce(_ context.Context, _ string, adv bgp.Advertisement) (string, error) {
 	if b.announceErr != nil {
-		return b.announceErr
+		return "", b.announceErr
 	}
-	b.announced = append(b.announced, r)
-	return nil
+	if sa, ok := adv.(bgp.ServiceAdvert); ok {
+		b.announced = append(b.announced, sa.Route)
+	}
+	return "", nil
 }
-func (b *recordingServiceBGP) WithdrawService(_ context.Context, _ string, r bgp.ServiceRoute) error {
-	b.withdrawn = append(b.withdrawn, r)
+func (b *recordingServiceBGP) Withdraw(_ context.Context, _ string, adv bgp.Advertisement) error {
+	if sa, ok := adv.(bgp.ServiceAdvert); ok {
+		b.withdrawn = append(b.withdrawn, sa.Route)
+	}
 	return nil
 }
 func (b *recordingServiceBGP) Close() error { return nil }
@@ -397,8 +408,9 @@ func newBackboneReconciler(t *testing.T, svc *recordingServiceBGP) *EgressPolicy
 		Client: c, Scheme: s, Config: backboneConfig(),
 		VIPs:        fixedVIPAllocator{vip: "2001:db8:e::42"},
 		BGP:         &recordingBGP{},
+		Encoder:     bgp.NewColoredEncoder(),
 		Pools:       poolvalidator.NewCalico(c),
-		BackboneBGP: map[string]bgp.ServiceDistributor{"isp-a": svc},
+		BackboneBGP: map[string]bgp.Distributor{"isp-a": svc},
 	}
 }
 
@@ -526,7 +538,7 @@ func TestReconcile_WithdrawableAfterStatusWriteFailure(t *testing.T) {
 		}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec, Pools: poolvalidator.NewCalico(c)}
+		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
 
 	// First reconcile: intent persisted (write 1 OK), announced, Ready write
 	// (write 2) fails → requeue with error.
@@ -568,7 +580,7 @@ func TestReconcile_SpecEditWithdrawsOldAnnounce(t *testing.T) {
 		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec, Pools: poolvalidator.NewCalico(c)}
+		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
 
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile: %v", err)

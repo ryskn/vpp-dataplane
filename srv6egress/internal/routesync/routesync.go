@@ -1,8 +1,8 @@
 // Package routesync installs the upstream routes a per-VRF gobgp learned over
 // eBGP into VPP's per-upstream VRF FIBs on the egress gateway.
 //
-// In the v1alpha1 dataplane the egress gateway terminates an SRv6 SR Policy at
-// an End.DT6 SID bound to a per-upstream VRF (e.g. fcff:0:0:e0:a:: -> table
+// On the egress gateway the dataplane terminates an SRv6 SR Policy at an
+// End.DT6 SID bound to a per-upstream VRF (e.g. fcff:0:0:e0:a:: -> table
 // 100). After decap, the inner packet is looked up in that VRF — which is empty
 // unless the routes the upstream advertised over eBGP are installed there.
 // This package bridges the gobgp RIB to the VPP VRF FIB: for each learned
@@ -41,7 +41,7 @@ type Config struct {
 	// of SR policies created for received SRv6 service routes (RFC 9252). Each
 	// distinct service SID gets one deterministic BSID inside the block, so the
 	// mapping survives restarts without local state. Required only when the
-	// upstream advertises service routes (v1alpha2 BR mode).
+	// upstream advertises service routes (backbone stitching).
 	ServiceBSIDBlock string `json:"serviceBsidBlock,omitempty"`
 }
 
@@ -80,7 +80,7 @@ type Route struct {
 	Interface string
 	// ServiceSID, when non-empty, marks this as an SRv6 service route
 	// (RFC 9252): instead of a plain FIB entry via the peer, the prefix is
-	// steered into an SR encap toward this SID (v1alpha2 BR mode). Canonical
+	// steered into an SR encap toward this SID (backbone stitching). Canonical
 	// IPv6 string.
 	ServiceSID string
 }
@@ -169,7 +169,7 @@ func (p ribPath) nexthop() string {
 
 // serviceSID extracts the SRv6 service SID from a Prefix-SID attribute
 // (type 40 → SRv6 L3 Service TLV (5) → SRv6 Information Sub-TLV (1)), or ""
-// when the path is a plain route (RFC 9252 reception, v1alpha2 BR mode).
+// when the path is a plain route (RFC 9252 reception via backbone stitching).
 func (p ribPath) serviceSID() string {
 	for _, a := range p.Attrs {
 		if a.Type != 40 {
