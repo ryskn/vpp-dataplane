@@ -1,0 +1,25 @@
+# vpp-route-sync image — programs upstream-learned routes into the egress
+# gateway's per-VRF VPP FIBs. It reads the RIB by shelling out to the gobgp CLI
+# (`gobgp ... global rib`), so the CLI is bundled alongside the binary.
+#
+# Build context is the repository ROOT (go.mod lives there):
+#   docker build -f srv6egress/Dockerfile.vpp-route-sync -t <ref> .
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags "-s -w" -o /out/vpp-route-sync ./srv6egress/cmd/vpp-route-sync
+# gobgp CLI, pinned to the same version the module depends on. Installed with
+# the pkg@version form so it resolves its own deps independently of this module.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOBIN=/out \
+    go install github.com/osrg/gobgp/v3/cmd/gobgp@v3.35.0
+
+# distroless/static (root): vpp-route-sync needs the host VPP API socket and the
+# DaemonSet runs it privileged, so it stays uid 0 (no :nonroot).
+FROM gcr.io/distroless/static:latest
+LABEL org.opencontainers.image.title="srv6egress-vpp-route-sync"
+LABEL org.opencontainers.image.source="https://github.com/ryskn/vpp-dataplane"
+COPY --from=build /out/vpp-route-sync /bin/vpp-route-sync
+COPY --from=build /out/gobgp /bin/gobgp
+ENV PATH="/bin"
+ENTRYPOINT ["/bin/vpp-route-sync"]

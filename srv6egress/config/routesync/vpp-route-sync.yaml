@@ -1,0 +1,84 @@
+# vpp-route-sync — DaemonSet on the egress gateway node(s). It reads the per-VRF
+# gobgp RIB (over the gobgp CLI on the host) and programs upstream-learned routes
+# into VPP's per-upstream VRF FIBs via the native binary API.
+#
+# It needs the host network (to reach the local gobgp gRPC at 127.0.0.1:50052)
+# and the host VPP API socket. It talks to VPP and gobgp, not the k8s API, so it
+# needs no RBAC.
+#
+# EDIT before applying:
+#   - the container image tag (CI-published tag for your branch/sha)
+#   - the nodeSelector so it lands only on egress-gateway nodes
+#   - the routesync ConfigMap below (peer -> VRF table/interface) for your testbed
+#   - --vpp-api-socket / the hostPath if your VPP socket is not /run/vpp/vpp-api.sock
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srv6egress-routesync-config
+  namespace: srv6egress-system
+data:
+  # Template — replace with your testbed's peer->VRF mapping. See
+  # srv6egress/config/routesync/routesync.example.yaml for the full schema
+  # (incl. the optional serviceBsidBlock for backbone stitching).
+  routesync.yaml: |
+    upstreams:
+      - peer: "fda1::1"
+        table: 100
+        interface: "virtio-0/0/12/0"
+      - peer: "fda2::1"
+        table: 200
+        interface: "virtio-0/0/12/0"
+    # serviceBsidBlock: "cafe:f::/96"  # optional — enables RFC 9252 service routes (govpp backend)
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: srv6egress-vpp-route-sync
+  namespace: srv6egress-system
+  labels:
+    app: srv6egress-vpp-route-sync
+spec:
+  selector:
+    matchLabels:
+      app: srv6egress-vpp-route-sync
+  template:
+    metadata:
+      labels:
+        app: srv6egress-vpp-route-sync
+    spec:
+      # Reach the host's per-VRF gobgp (127.0.0.1:50052) and the VPP socket.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # EDIT: restrict to egress-gateway nodes.
+      nodeSelector:
+        srv6egress.ryskn.io/role: egress
+      tolerations:
+        - operator: Exists # run even on tainted gateway nodes
+      containers:
+        - name: vpp-route-sync
+          # EDIT: set to the CI-published tag (branch tag or sha-<commit>).
+          image: ghcr.io/ryskn/srv6egress-vpp-route-sync:srv6egress-solid-refactor
+          imagePullPolicy: IfNotPresent # IPv6-only cluster imports via `ctr images import`
+          args:
+            - --config=/etc/srv6egress/routesync.yaml
+            - --gobgp-cmd=gobgp -p 50052
+            - --vpp-backend=govpp
+            - --vpp-api-socket=/run/vpp/vpp-api.sock
+            - --interval=5s
+          volumeMounts:
+            - name: vpp-api
+              mountPath: /run/vpp
+            - name: config
+              mountPath: /etc/srv6egress
+              readOnly: true
+          securityContext:
+            privileged: true # VPP binary API socket access
+      volumes:
+        - name: vpp-api
+          hostPath:
+            path: /run/vpp
+            type: Directory
+        - name: config
+          configMap:
+            name: srv6egress-routesync-config
