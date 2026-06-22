@@ -66,6 +66,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Plain single-platform manifest (no OCI index): buildx provenance/SBOM
+          # attestations add an unknown/unknown manifest that cri-o's image pull
+          # hangs on. Disabling them makes the image pull cleanly on the cluster.
+          provenance: false
+          sbom: false
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             VERSION=${{ github.ref_name }}
