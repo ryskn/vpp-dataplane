@@ -19,10 +19,10 @@ rules:
     verbs: ["update"]
   # Calico IPPool access for per-tenant VIP allocation.
   - apiGroups: ["crd.projectcalico.org"]
-    resources: ["ippools"]
+    resources: ["ippools", "ipreservations", "clusterinformations", "ipamconfigs"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["crd.projectcalico.org"]
-    resources: ["ipamblocks", "ipamhandles"]
+    resources: ["ipamblocks", "ipamhandles", "blockaffinities"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
   # Node lookup for endpointSelector resolution.
   - apiGroups: [""]
