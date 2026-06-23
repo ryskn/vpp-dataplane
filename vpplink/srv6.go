@@ -169,31 +169,44 @@ func (v *VppLink) ListSRv6Localsid() (list []*types.SrLocalsid, err error) {
 }
 
 func (v *VppLink) AddSRv6Localsid(localSid *types.SrLocalsid) error {
-
-	client := sr.NewServiceClient(v.GetConnection())
-
-	_, err := client.SrLocalsidAddDel(v.GetContext(), &sr.SrLocalsidAddDel{
-		IsDel:     false,
-		Localsid:  localSid.Localsid,
-		EndPsp:    localSid.EndPsp,
-		Behavior:  types.ToVppSrBehavior(localSid.Behavior),
-		SwIfIndex: localSid.SwIfIndex,
-		VlanIndex: localSid.VlanIndex,
-		FibTable:  localSid.FibTable,
-		NhAddr:    localSid.NhAddr,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add SRv6Localsid: %w", err)
-	}
-
-	return err
+	return v.srLocalsidAddDel(localSid, false)
 }
 
 func (v *VppLink) DelSRv6Localsid(localSid *types.SrLocalsid) error {
+	return v.srLocalsidAddDel(localSid, true)
+}
+
+// srLocalsidAddDel installs or removes a localsid. uSID (NEXT-CSID) localsids carry a
+// SID structure and go through the v2 API; classic full-SID localsids keep the v1 API.
+func (v *VppLink) srLocalsidAddDel(localSid *types.SrLocalsid, isDel bool) error {
 	client := sr.NewServiceClient(v.GetConnection())
 
-	_, err := client.SrLocalsidAddDel(v.GetContext(), &sr.SrLocalsidAddDel{
-		IsDel:     true,
+	op := "add"
+	if isDel {
+		op = "delete"
+	}
+
+	if localSid.IsUSID() {
+		if _, err := client.SrLocalsidAddDelV2(v.GetContext(), &sr.SrLocalsidAddDelV2{
+			IsDel:           isDel,
+			Localsid:        localSid.Localsid,
+			EndPsp:          localSid.EndPsp,
+			Behavior:        types.ToVppSrBehavior(localSid.Behavior),
+			SwIfIndex:       localSid.SwIfIndex,
+			VlanIndex:       localSid.VlanIndex,
+			FibTable:        localSid.FibTable,
+			NhAddr:          localSid.NhAddr,
+			LocatorBlockLen: localSid.LocatorBlockLen,
+			LocatorNodeLen:  localSid.LocatorNodeLen,
+			FunctionLen:     localSid.FunctionLen,
+		}); err != nil {
+			return fmt.Errorf("failed to %s uSID SRv6Localsid: %w", op, err)
+		}
+		return nil
+	}
+
+	if _, err := client.SrLocalsidAddDel(v.GetContext(), &sr.SrLocalsidAddDel{
+		IsDel:     isDel,
 		Localsid:  localSid.Localsid,
 		EndPsp:    localSid.EndPsp,
 		Behavior:  types.ToVppSrBehavior(localSid.Behavior),
@@ -201,11 +214,10 @@ func (v *VppLink) DelSRv6Localsid(localSid *types.SrLocalsid) error {
 		VlanIndex: localSid.VlanIndex,
 		FibTable:  localSid.FibTable,
 		NhAddr:    localSid.NhAddr,
-	})
-	if err != nil {
-		return fmt.Errorf("delete SRv6Localsid failed: %w", err)
+	}); err != nil {
+		return fmt.Errorf("failed to %s SRv6Localsid: %w", op, err)
 	}
-	return err
+	return nil
 }
 
 func (v *VppLink) DelSRv6Steering(steer *types.SrSteer) error {

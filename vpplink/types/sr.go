@@ -24,6 +24,13 @@ const (
 	SrBehaviorDT6    SrBehavior = SrBehavior(sr_types.SR_BEHAVIOR_API_DT6)
 	SrBehaviorDT4    SrBehavior = SrBehavior(sr_types.SR_BEHAVIOR_API_DT4)
 	SrBehaviorLAST   SrBehavior = SrBehavior(sr_types.SR_BEHAVIOR_API_LAST)
+
+	// uSID (NEXT-CSID) behaviors. Programmed via the v2 localsid API together with
+	// the SID structure (LocatorBlockLen/LocatorNodeLen/FunctionLen); used for interop
+	// with uSID peers such as Cisco 8000 / IOS XR.
+	SrBehaviorUNPerf SrBehavior = SrBehavior(sr_types.SR_BEHAVIOR_API_END_UN_PERF)
+	SrBehaviorUN     SrBehavior = SrBehavior(sr_types.SR_BEHAVIOR_API_END_UN)
+	SrBehaviorUA     SrBehavior = SrBehavior(sr_types.SR_BEHAVIOR_API_UA)
 )
 
 var (
@@ -70,6 +77,12 @@ type SrLocalsid struct {
 	VlanIndex uint32
 	FibTable  uint32
 	NhAddr    ip_types.Address
+
+	// SID structure for uSID (NEXT-CSID). When any of these is non-zero the localsid
+	// is programmed through the v2 API as a uSID; all-zero keeps the classic full-SID path.
+	LocatorBlockLen uint8
+	LocatorNodeLen  uint8
+	FunctionLen     uint8
 }
 
 func (l *SrLocalsid) SetBehavior(code uint8) {
@@ -80,9 +93,16 @@ func (l *SrLocalsid) CompareBehaviorTo(behavior uint8) bool {
 	return uint8(l.Behavior) == behavior
 }
 
+// IsUSID reports whether the localsid carries a uSID (NEXT-CSID) SID structure and
+// must be programmed via the v2 localsid API.
+func (l *SrLocalsid) IsUSID() bool {
+	return l.LocatorBlockLen != 0 || l.LocatorNodeLen != 0 || l.FunctionLen != 0
+}
+
 func (l *SrLocalsid) String() (policy string) {
-	return fmt.Sprintf("Localsid: %s, EndPsp: %v,  Behavior: %d, SwIfIndex: %d, VlanIndex: %d, FibTable: %d, NhAddr: %s",
-		l.Localsid, l.EndPsp, uint8(l.Behavior), l.SwIfIndex, l.VlanIndex, l.FibTable, l.NhAddr.String())
+	return fmt.Sprintf("Localsid: %s, EndPsp: %v,  Behavior: %d, SwIfIndex: %d, VlanIndex: %d, FibTable: %d, NhAddr: %s, SidStructure: %d/%d/%d",
+		l.Localsid, l.EndPsp, uint8(l.Behavior), l.SwIfIndex, l.VlanIndex, l.FibTable, l.NhAddr.String(),
+		l.LocatorBlockLen, l.LocatorNodeLen, l.FunctionLen)
 }
 
 // SrPolicy definition
