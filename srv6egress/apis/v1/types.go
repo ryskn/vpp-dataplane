@@ -9,16 +9,15 @@ import (
 
 // EgressPolicy is the Schema for declaring per-tenant SRv6 egress path steering.
 // A namespace/pod selector picks source workloads; matched egress traffic is
-// SRv6-steered through the SR Policy resolved from <color, endpoint>, then
-// SNAT'd to a per-tenant VIP at the egress gateway. Color follows RFC 9256
-// (color = path intent / objective).
+// SRv6-steered through the SR Policy resolved from <color, endpoint> and decapped
+// into a per-tenant VRF at the egress gateway (NAT-less L3VPN — the pod source
+// address is preserved end to end). Color follows RFC 9256 (color = path intent).
 //
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=egp;egpol
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Color",type="integer",JSONPath=".spec.egress.color"
 // +kubebuilder:printcolumn:name="Upstream",type="string",JSONPath=".status.upstream"
-// +kubebuilder:printcolumn:name="EgressIP",type="string",JSONPath=".status.egressIP"
 // +kubebuilder:printcolumn:name="Endpoint",type="string",JSONPath=".status.activeEndpoint"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -68,7 +67,7 @@ type Selector struct {
 	PodSelector *metav1.LabelSelector `json:"podSelector,omitempty"`
 }
 
-// EgressSpec declares the egress endpoint, intent (color), and VIP allocation.
+// EgressSpec declares the egress endpoint and intent (color).
 type EgressSpec struct {
 	// EndpointSelector selects the egress gateway node. v1 requires
 	// exactly one node to match; the controller rejects policies whose
@@ -81,11 +80,6 @@ type EgressSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=4294967295
 	Color uint32 `json:"color"`
-
-	// EgressIPPool is the name of the Calico IPPool from which the per-tenant
-	// egress VIP is allocated by the controller. The pool SHOULD carry
-	// allowedUses: [Tunnel] so IPAM does not hand these addresses to pods.
-	EgressIPPool string `json:"egressIPPool"`
 }
 
 // EndpointSelector selects the egress gateway node.
@@ -97,10 +91,6 @@ type EndpointSelector struct {
 
 // EgressPolicyStatus reports the observed state.
 type EgressPolicyStatus struct {
-	// EgressIP is the per-tenant VIP allocated from EgressIPPool.
-	// +optional
-	EgressIP string `json:"egressIP,omitempty"`
-
 	// ActiveEndpoint is the node name currently serving this policy.
 	// +optional
 	ActiveEndpoint string `json:"activeEndpoint,omitempty"`
@@ -113,13 +103,6 @@ type EgressPolicyStatus struct {
 	// SRPolicy is the resolved SR Policy (BSID + segment list).
 	// +optional
 	SRPolicy *SRPolicyStatus `json:"srPolicy,omitempty"`
-
-	// Backbone records the RFC 9252 SRv6 service route announced toward the
-	// backbone PE for this policy's VIP. Set only when the policy's upstream is
-	// stitched to a backbone (the backbone-stitch capability). Persisted BEFORE
-	// the announce so deletion can always rebuild the exact withdraw.
-	// +optional
-	Backbone *BackboneStatus `json:"backbone,omitempty"`
 
 	// Conditions describe the current state. Standard k8s condition types:
 	//   - Ready: the policy is installed and traffic is being steered.
@@ -149,30 +132,6 @@ type SRPolicyStatus struct {
 	// (<distinguisher, color, endpoint>) after a controller restart.
 	// +optional
 	EndpointAddr string `json:"endpointAddr,omitempty"`
-}
-
-// BackboneStatus describes the SRv6 service route (RFC 9252) advertised to
-// the backbone for this policy's VIP.
-type BackboneStatus struct {
-	// Prefix is the advertised VIP prefix (e.g. "2001:db8:e::42/128").
-	Prefix string `json:"prefix"`
-
-	// EndSID is the gateway's own End.DT6 SID attached to the advertisement
-	// (the SID the backbone uses to SR-reach the VIP).
-	EndSID string `json:"endSID"`
-
-	// Color is the backbone Color Extended Community value (cluster color
-	// mapped through the controller's backbone colorMap).
-	Color uint32 `json:"color"`
-
-	// Upstream names the backbone peering (controller config key) the route
-	// was announced on.
-	// +optional
-	Upstream string `json:"upstream,omitempty"`
-
-	// Nexthop is the next-hop used on the GW-PE session.
-	// +optional
-	Nexthop string `json:"nexthop,omitempty"`
 }
 
 func init() {

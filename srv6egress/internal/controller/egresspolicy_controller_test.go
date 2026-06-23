@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,8 +21,6 @@ import (
 	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
-	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
-	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/vipalloc"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -35,12 +32,6 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	if err := srv6egressv1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
-	// Register the Calico IPPool CRD as unstructured so the fake client can
-	// serve it via GET.
-	s.AddKnownTypeWithName(poolvalidator.CalicoIPPoolGVK, &unstructured.Unstructured{})
-	listGVK := poolvalidator.CalicoIPPoolGVK
-	listGVK.Kind = "IPPoolList"
-	s.AddKnownTypeWithName(listGVK, &unstructured.UnstructuredList{})
 	return s
 }
 
@@ -71,17 +62,7 @@ func egressNode(name string) *corev1.Node {
 	}
 }
 
-func ippool(name string, allowedUses ...string) *unstructured.Unstructured {
-	p := &unstructured.Unstructured{}
-	p.SetGroupVersionKind(poolvalidator.CalicoIPPoolGVK)
-	p.SetName(name)
-	if allowedUses != nil {
-		_ = unstructured.SetNestedStringSlice(p.Object, allowedUses, "spec", "allowedUses")
-	}
-	return p
-}
-
-func newPolicy(name, uid string, color uint32, pool string) *srv6egressv1.EgressPolicy {
+func newPolicy(name, uid string, color uint32) *srv6egressv1.EgressPolicy {
 	return &srv6egressv1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       name,
@@ -96,8 +77,7 @@ func newPolicy(name, uid string, color uint32, pool string) *srv6egressv1.Egress
 						MatchLabels: map[string]string{"srv6egress.ryskn.io/role": "egress"},
 					},
 				},
-				Color:        color,
-				EgressIPPool: pool,
+				Color: color,
 			},
 		},
 	}
@@ -115,10 +95,8 @@ func newReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler 
 		Client:  c,
 		Scheme:  s,
 		Config:  testConfig(),
-		VIPs:    vipalloc.NewInMemory(),
 		BGP:     bgp.NewLoggingStub(logr.Discard()),
 		Encoder: bgp.NewColoredEncoder(),
-		Pools:   poolvalidator.NewCalico(c),
 	}
 }
 
@@ -170,8 +148,7 @@ func getReady(t *testing.T, r *EgressPolicyReconciler, name string) metav1.Condi
 }
 
 func TestReconcile_HappyPath(t *testing.T) {
-	r := newReconciler(t, egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
-		newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool"))
+	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile error: %v", err)
 	}
@@ -185,8 +162,7 @@ func TestReconcile_HappyPath(t *testing.T) {
 // the SR Policy SAFI encoding can build the NLRI and Withdraw can rebuild it
 // after a restart.
 func TestReconcile_PersistsEndpointAddr(t *testing.T) {
-	r := newReconciler(t, egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
-		newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool"))
+	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile error: %v", err)
 	}
@@ -204,9 +180,8 @@ func TestReconcile_PersistsEndpointAddr(t *testing.T) {
 func TestReconcile_DuplicateColorEndpointRejected(t *testing.T) {
 	r := newReconciler(t,
 		egressNode("egress-1"),
-		ippool("tenant-egress-pool", "Tunnel"),
-		newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool"),
-		newPolicy("tenant-b", "uid-b", 100, "tenant-egress-pool"),
+		newPolicy("tenant-a", "uid-a", 100),
+		newPolicy("tenant-b", "uid-b", 100),
 	)
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile A: %v", err)
@@ -225,80 +200,6 @@ func TestReconcile_DuplicateColorEndpointRejected(t *testing.T) {
 	}
 }
 
-// An egressIPPool without allowedUses:[Tunnel] must be rejected.
-func TestReconcile_IPPoolWithoutTunnelRejected(t *testing.T) {
-	r := newReconciler(t,
-		egressNode("egress-1"),
-		ippool("workload-pool", "Workload"),
-		newPolicy("tenant-a", "uid-a", 100, "workload-pool"),
-	)
-	err := reconcile(t, r, "tenant-a")
-	if err == nil {
-		t.Fatal("expected reconcile to error on non-Tunnel pool")
-	}
-	c := getReady(t, r, "tenant-a")
-	if c.Status != metav1.ConditionFalse || c.Reason != "InvalidEgressIPPool" {
-		t.Fatalf("expected Ready=False/InvalidEgressIPPool, got %s/%s", c.Status, c.Reason)
-	}
-}
-
-func TestReconcile_IPPoolMissingRejected(t *testing.T) {
-	r := newReconciler(t,
-		egressNode("egress-1"),
-		newPolicy("tenant-a", "uid-a", 100, "nonexistent-pool"),
-	)
-	if err := reconcile(t, r, "tenant-a"); err == nil {
-		t.Fatal("expected error when IPPool does not exist")
-	}
-	c := getReady(t, r, "tenant-a")
-	if c.Reason != "InvalidEgressIPPool" {
-		t.Fatalf("expected InvalidEgressIPPool, got %s", c.Reason)
-	}
-}
-
-// Order-independence: RehydrateVIPs must register every existing
-// VIP from status before any reconcile, so a newly created policy reconciled
-// BEFORE the old policy is re-seen still cannot be handed a colliding VIP.
-func TestRehydrateVIPs_RegistersExistingThenNoCollision(t *testing.T) {
-	ctx := context.Background()
-
-	// Existing policy with a VIP already recorded in status (survived restart).
-	existing := newPolicy("tenant-old", "uid-old", 100, "tenant-egress-pool")
-	existing.Status.EgressIP = "pool:tenant-egress-pool:1"
-
-	r := newReconciler(t,
-		egressNode("egress-1"),
-		ippool("tenant-egress-pool", "Tunnel"),
-		existing,
-		// brand-new policy created around restart time, no status yet.
-		newPolicy("tenant-new", "uid-new", 200, "tenant-egress-pool"),
-	)
-
-	// Startup rehydrate (uses the same client as reader).
-	n, err := RehydrateVIPs(ctx, r.Client, r.VIPs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 VIP rehydrated, got %d", n)
-	}
-
-	// Now reconcile the NEW policy FIRST (the order that previously collided).
-	if err := reconcile(t, r, "tenant-new"); err != nil {
-		t.Fatalf("reconcile tenant-new: %v", err)
-	}
-	var nw srv6egressv1.EgressPolicy
-	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-new"}, &nw); err != nil {
-		t.Fatal(err)
-	}
-	if nw.Status.EgressIP == "pool:tenant-egress-pool:1" {
-		t.Fatalf("collision: tenant-new got the VIP already held by tenant-old (%s)", nw.Status.EgressIP)
-	}
-	if nw.Status.EgressIP != "pool:tenant-egress-pool:2" {
-		t.Fatalf("expected counter advanced to :2 after rehydrate, got %q", nw.Status.EgressIP)
-	}
-}
-
 // Delete must withdraw the route using the PERSISTED announced color/segments
 // from status, not the (possibly edited) mutable spec — otherwise it would try
 // to delete a route that was never advertised and leave the real one stale.
@@ -308,12 +209,11 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 	s := testScheme(t)
 	c := fakeclient.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
-			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
+		WithObjects(egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100)).
 		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
+		BGP: rec, Encoder: bgp.NewColoredEncoder()}
 
 	// Announce with color 100 → status.srPolicy.color = 100.
 	if err := reconcile(t, r, "tenant-a"); err != nil {
@@ -348,167 +248,6 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 	}
 }
 
-// --- backbone stitching ---
-
-// fixedVIPAllocator hands out one real IPv6 VIP (backbone advertise requires
-// a parseable address, unlike the synthetic in-memory pool strings).
-type fixedVIPAllocator struct{ vip string }
-
-func (f fixedVIPAllocator) Allocate(_ context.Context, _, _ string) (string, error) {
-	return f.vip, nil
-}
-func (f fixedVIPAllocator) Register(_ context.Context, _, _ string) error { return nil }
-func (f fixedVIPAllocator) Release(_ context.Context, _ string) error     { return nil }
-
-// recordingServiceBGP records backbone service announces/withdraws.
-type recordingServiceBGP struct {
-	announced   []bgp.ServiceRoute
-	withdrawn   []bgp.ServiceRoute
-	announceErr error
-}
-
-func (b *recordingServiceBGP) Announce(_ context.Context, _ string, adv bgp.Advertisement) (string, error) {
-	if b.announceErr != nil {
-		return "", b.announceErr
-	}
-	if sa, ok := adv.(bgp.ServiceAdvert); ok {
-		b.announced = append(b.announced, sa.Route)
-	}
-	return "", nil
-}
-func (b *recordingServiceBGP) Withdraw(_ context.Context, _ string, adv bgp.Advertisement) error {
-	if sa, ok := adv.(bgp.ServiceAdvert); ok {
-		b.withdrawn = append(b.withdrawn, sa.Route)
-	}
-	return nil
-}
-func (b *recordingServiceBGP) Close() error { return nil }
-
-func backboneConfig() *config.ControllerConfig {
-	cfg := testConfig()
-	cfg.Backbone = &config.BackboneConfig{
-		ColorMap: map[uint32]uint32{100: 1100},
-		Peers: map[string]config.BackbonePeerConfig{
-			"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
-		},
-	}
-	return cfg
-}
-
-func newBackboneReconciler(t *testing.T, svc *recordingServiceBGP) *EgressPolicyReconciler {
-	t.Helper()
-	s := testScheme(t)
-	c := fakeclient.NewClientBuilder().
-		WithScheme(s).
-		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
-			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
-		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
-		Build()
-	return &EgressPolicyReconciler{
-		Client: c, Scheme: s, Config: backboneConfig(),
-		VIPs:        fixedVIPAllocator{vip: "2001:db8:e::42"},
-		BGP:         &recordingBGP{},
-		Encoder:     bgp.NewColoredEncoder(),
-		Pools:       poolvalidator.NewCalico(c),
-		BackboneBGP: map[string]bgp.Distributor{"isp-a": svc},
-	}
-}
-
-// The VIP must be announced to the backbone with the mapped color and the
-// upstream's own End SID, with the intent persisted in status.backbone first.
-func TestReconcile_BackboneAnnouncesVIP(t *testing.T) {
-	svc := &recordingServiceBGP{}
-	r := newBackboneReconciler(t, svc)
-
-	if err := reconcile(t, r, "tenant-a"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if len(svc.announced) != 1 {
-		t.Fatalf("announced = %v, want exactly one service route", svc.announced)
-	}
-	got := svc.announced[0]
-	if got.Prefix != "2001:db8:e::42/128" || got.EndSID != "fcff:0:0:e0:a::" ||
-		got.Color != 1100 || got.Nexthop != "fda1::2" || got.Behavior != bgp.EndDT6 {
-		t.Fatalf("service route = %+v", got)
-	}
-
-	var ep srv6egressv1.EgressPolicy
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
-		t.Fatal(err)
-	}
-	if ep.Status.Backbone == nil || ep.Status.Backbone.Color != 1100 ||
-		ep.Status.Backbone.Prefix != "2001:db8:e::42/128" || ep.Status.Backbone.Upstream != "isp-a" {
-		t.Fatalf("status.backbone = %+v", ep.Status.Backbone)
-	}
-	for _, c := range ep.Status.Conditions {
-		if c.Type == "BackboneAdvertised" && c.Status == metav1.ConditionTrue {
-			return
-		}
-	}
-	t.Fatalf("BackboneAdvertised condition not True: %+v", ep.Status.Conditions)
-}
-
-// Deleting the policy must withdraw the backbone service route (rebuilt from
-// the persisted status) before the VIP is released.
-func TestReconcile_DeleteWithdrawsBackboneRoute(t *testing.T) {
-	ctx := context.Background()
-	svc := &recordingServiceBGP{}
-	r := newBackboneReconciler(t, svc)
-
-	if err := reconcile(t, r, "tenant-a"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	var ep srv6egressv1.EgressPolicy
-	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Delete(ctx, &ep); err != nil {
-		t.Fatal(err)
-	}
-	if err := reconcile(t, r, "tenant-a"); err != nil {
-		t.Fatalf("reconcileDelete: %v", err)
-	}
-	if len(svc.withdrawn) != 1 || svc.withdrawn[0].Prefix != "2001:db8:e::42/128" ||
-		svc.withdrawn[0].Color != 1100 {
-		t.Fatalf("withdrawn = %+v, want the announced VIP route", svc.withdrawn)
-	}
-}
-
-// A backbone announce failure must NOT clobber Ready (cluster-side steering
-// already works); it surfaces on the BackboneAdvertised condition and requeues.
-func TestReconcile_BackboneFailureKeepsReady(t *testing.T) {
-	svc := &recordingServiceBGP{announceErr: fmt.Errorf("PE session down")}
-	r := newBackboneReconciler(t, svc)
-
-	if err := reconcile(t, r, "tenant-a"); err == nil {
-		t.Fatal("expected backbone announce error to surface for requeue")
-	}
-	var ep srv6egressv1.EgressPolicy
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
-		t.Fatal(err)
-	}
-	var ready, backbone *metav1.Condition
-	for i := range ep.Status.Conditions {
-		switch ep.Status.Conditions[i].Type {
-		case "Ready":
-			ready = &ep.Status.Conditions[i]
-		case "BackboneAdvertised":
-			backbone = &ep.Status.Conditions[i]
-		}
-	}
-	if ready == nil || ready.Status != metav1.ConditionTrue {
-		t.Fatalf("Ready = %+v, want True (cluster side is installed)", ready)
-	}
-	if backbone == nil || backbone.Status != metav1.ConditionFalse {
-		t.Fatalf("BackboneAdvertised = %+v, want False", backbone)
-	}
-	// Intent must already be persisted (persist-then-announce) so a delete
-	// at this point can still withdraw.
-	if ep.Status.Backbone == nil {
-		t.Fatal("status.backbone intent must be persisted before the announce")
-	}
-}
-
 // research#19 (F1) regression: the announce intent must be persisted BEFORE
 // Announce. If the post-announce Ready write fails and the policy is then
 // deleted, Withdraw must still see the real key/segments from status — with
@@ -520,8 +259,7 @@ func TestReconcile_WithdrawableAfterStatusWriteFailure(t *testing.T) {
 	statusWrites := 0
 	c := fakeclient.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
-			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
+		WithObjects(egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100)).
 		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -538,7 +276,7 @@ func TestReconcile_WithdrawableAfterStatusWriteFailure(t *testing.T) {
 		}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
+		BGP: rec, Encoder: bgp.NewColoredEncoder()}
 
 	// First reconcile: intent persisted (write 1 OK), announced, Ready write
 	// (write 2) fails → requeue with error.
@@ -575,12 +313,11 @@ func TestReconcile_SpecEditWithdrawsOldAnnounce(t *testing.T) {
 	s := testScheme(t)
 	c := fakeclient.NewClientBuilder().
 		WithScheme(s).
-		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
-			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
+		WithObjects(egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100)).
 		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
-		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
+		BGP: rec, Encoder: bgp.NewColoredEncoder()}
 
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -614,5 +351,85 @@ func TestReconcile_SpecEditWithdrawsOldAnnounce(t *testing.T) {
 	}
 	if c := getReady(t, r, "tenant-a"); c.Status != metav1.ConditionTrue {
 		t.Fatalf("expected Ready=True after edit reconcile, got %s (%s)", c.Status, c.Reason)
+	}
+}
+
+// --- backbone return advertisement (per-upstream, at startup) ---
+
+// recordingServiceBGP records backbone RFC 9252 service announces.
+type recordingServiceBGP struct {
+	announced []bgp.ServiceAdvert
+}
+
+func (b *recordingServiceBGP) Announce(_ context.Context, _ string, adv bgp.Advertisement) (string, error) {
+	if sa, ok := adv.(bgp.ServiceAdvert); ok {
+		b.announced = append(b.announced, sa)
+	}
+	return "", nil
+}
+func (b *recordingServiceBGP) Withdraw(_ context.Context, _ string, _ bgp.Advertisement) error {
+	return nil
+}
+func (b *recordingServiceBGP) Close() error { return nil }
+
+func backboneConfig() *config.ControllerConfig {
+	cfg := testConfig()
+	cfg.Backbone = &config.BackboneConfig{
+		ClusterPodCIDR: "fd00:dead::/48",
+		Peers: map[string]config.BackbonePeerConfig{
+			"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
+		},
+	}
+	return cfg
+}
+
+// AdvertiseClusterReturn announces the cluster pod CIDR per backbone upstream
+// with that upstream's End SID — the NAT-less return reachability.
+func TestAdvertiseClusterReturn(t *testing.T) {
+	svc := &recordingServiceBGP{}
+	if err := AdvertiseClusterReturn(context.Background(), backboneConfig(),
+		map[string]bgp.Distributor{"isp-a": svc}, logr.Discard()); err != nil {
+		t.Fatalf("advertise: %v", err)
+	}
+	if len(svc.announced) != 1 {
+		t.Fatalf("announced = %v, want one cluster-return route", svc.announced)
+	}
+	got := svc.announced[0].Route
+	if got.Prefix != "fd00:dead::/48" || got.EndSID != "fcff:0:0:e0:a::" ||
+		got.Nexthop != "fda1::2" || got.Behavior != bgp.EndDT6 {
+		t.Fatalf("cluster-return route = %+v", got)
+	}
+}
+
+// A uSID upstream must carry the uSID SID structure in its return advertisement.
+func TestAdvertiseClusterReturn_USIDStructure(t *testing.T) {
+	svc := &recordingServiceBGP{}
+	cfg := backboneConfig()
+	u := cfg.Upstreams["isp-a"]
+	u.SidMode = config.SidModeUSID
+	cfg.Upstreams["isp-a"] = u
+
+	if err := AdvertiseClusterReturn(context.Background(), cfg,
+		map[string]bgp.Distributor{"isp-a": svc}, logr.Discard()); err != nil {
+		t.Fatalf("advertise: %v", err)
+	}
+	if len(svc.announced) != 1 {
+		t.Fatalf("want one announce, got %d", len(svc.announced))
+	}
+	st := svc.announced[0].Structure
+	if st.LocatorBlockBits != 32 || st.LocatorNodeBits != 16 || st.FunctionBits != 16 {
+		t.Fatalf("usid structure = %+v, want 32/16/16", st)
+	}
+}
+
+// No backbone configured → AdvertiseClusterReturn is a no-op.
+func TestAdvertiseClusterReturn_NoBackbone(t *testing.T) {
+	svc := &recordingServiceBGP{}
+	if err := AdvertiseClusterReturn(context.Background(), testConfig(),
+		map[string]bgp.Distributor{"isp-a": svc}, logr.Discard()); err != nil {
+		t.Fatalf("advertise: %v", err)
+	}
+	if len(svc.announced) != 0 {
+		t.Fatalf("expected no announces without backbone config, got %v", svc.announced)
 	}
 }

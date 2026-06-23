@@ -29,9 +29,6 @@ spec:
         - name: Upstream
           type: string
           jsonPath: .status.upstream
-        - name: EgressIP
-          type: string
-          jsonPath: .status.egressIP
         - name: Endpoint
           type: string
           jsonPath: .status.activeEndpoint
@@ -47,8 +44,8 @@ spec:
             EgressPolicy declares per-tenant SRv6 egress path steering.
             A namespace/pod selector picks source workloads; matched egress
             traffic is SRv6-steered through the SR Policy resolved from
-            <color, endpoint>, then SNAT'd to a per-tenant VIP at the egress
-            gateway. Color follows RFC 9256 (color = path intent).
+            <color, endpoint> and decapped into a per-tenant VRF at the egress
+            gateway (NAT-less L3VPN). Color follows RFC 9256 (color = path intent).
           type: object
           required:
             - spec
@@ -124,12 +121,11 @@ spec:
                     type: string
                     format: cidr
                 egress:
-                  description: Egress endpoint, intent (color), and VIP allocation.
+                  description: Egress endpoint and intent (color).
                   type: object
                   required:
                     - endpointSelector
                     - color
-                    - egressIPPool
                   properties:
                     endpointSelector:
                       type: object
@@ -168,17 +164,9 @@ spec:
                       format: int64
                       minimum: 1
                       maximum: 4294967295
-                    egressIPPool:
-                      description: |
-                        Calico IPPool name to allocate the per-tenant egress VIP
-                        from. SHOULD carry allowedUses: [Tunnel].
-                      type: string
-                      minLength: 1
             status:
               type: object
               properties:
-                egressIP:
-                  type: string
                 activeEndpoint:
                   type: string
                 upstream:
@@ -197,28 +185,6 @@ spec:
                       type: array
                       items:
                         type: string
-                backbone:
-                  description: |
-                    RFC 9252 SRv6 service route announced toward the backbone
-                    PE for this policy's VIP (backbone stitching). Persisted
-                    before announcing so deletion can rebuild the withdraw.
-                  type: object
-                  required:
-                    - prefix
-                    - endSID
-                    - color
-                  properties:
-                    prefix:
-                      type: string
-                    endSID:
-                      type: string
-                    color:
-                      type: integer
-                      format: int64
-                    upstream:
-                      type: string
-                    nexthop:
-                      type: string
                 conditions:
                   type: array
                   items:

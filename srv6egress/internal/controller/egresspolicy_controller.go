@@ -3,13 +3,16 @@
 // On a watched EgressPolicy event the reconciler:
 //  1. resolves the endpoint (exactly one node, per v1)
 //  2. resolves <color, endpoint> to a segment list via the controller config
-//  3. allocates a per-tenant VIP from the named Calico IPPool
-//  4. withdraws a previously announced SR Policy whose key drifted (spec edit)
-//  5. persists the announce intent in status (persist-then-announce)
-//  6. distributes the SR Policy over BGP
-//  7. marks Ready and records the effective BSID
+//  3. withdraws a previously announced SR Policy whose key drifted (spec edit)
+//  4. persists the announce intent in status (persist-then-announce)
+//  5. distributes the SR Policy over BGP
+//  6. marks Ready and records the effective BSID
 //
-// Deletion: withdraws the BGP route, releases the VIP, removes the finalizer.
+// It is NAT-less L3VPN: no VIP is allocated; the pod source address is preserved
+// end to end. Backbone return reachability (the cluster pod CIDR) is advertised
+// once per upstream at startup (see AdvertiseClusterReturn), not per policy.
+//
+// Deletion: withdraws the BGP route, removes the finalizer.
 package controller
 
 import (
@@ -28,8 +31,6 @@ import (
 	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
-	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
-	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/vipalloc"
 )
 
 const finalizerName = "srv6egress.ryskn.io/finalizer"
@@ -39,18 +40,11 @@ type EgressPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Config *config.ControllerConfig
-	VIPs   vipalloc.Allocator
 	// BGP distributes SR Policies to headends; Encoder selects the on-the-wire
 	// encoding (colored route or SR Policy SAFI), chosen at startup. The
 	// transport is encoding-agnostic.
 	BGP     bgp.Distributor
 	Encoder bgp.Encoder
-	Pools   poolvalidator.Validator
-	// BackboneBGP holds the backbone-facing distributors, keyed by upstream
-	// name. Empty when no upstream is stitched to a backbone — the VIP service
-	// advertisement is then simply skipped, not a separate operating mode.
-	// Wired from Config.Backbone.Peers in main.
-	BackboneBGP map[string]bgp.Distributor
 }
 
 // +kubebuilder:rbac:groups=srv6egress.ryskn.io,resources=egresspolicies,verbs=get;list;watch;update;patch
@@ -58,12 +52,11 @@ type EgressPolicyReconciler struct {
 // +kubebuilder:rbac:groups=srv6egress.ryskn.io,resources=egresspolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=crd.projectcalico.org,resources=ippools,verbs=get;list;watch
 
 // Reconcile performs one reconciliation pass as a pipeline of single-purpose
-// stages: resolve the desired plan, acquire the VIP, distribute the SR Policy
-// to headends, then stitch the VIP to the backbone. Each stage fails closed via
-// markNotReady; the orchestration below stays short enough to read top-to-bottom.
+// stages: resolve the desired plan, then distribute the SR Policy to headends.
+// Each stage fails closed via markNotReady; the orchestration below stays short
+// enough to read top-to-bottom.
 func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -85,25 +78,13 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return res, err
 	}
 
-	// 2) Acquire the per-tenant egress VIP (recover from status or allocate).
-	vip, res, err := r.ensureVIP(ctx, &ep)
-	if err != nil {
-		return res, err
-	}
-
-	// 3) Distribute the SR Policy to headends (persist-then-announce, Ready).
-	if res, err := r.distributeCluster(ctx, &ep, plan, vip); err != nil {
-		return res, err
-	}
-
-	// 4) Stitch the VIP to the backbone (RFC 9252). A no-op when no upstream is
-	// stitched; a failure here does not clobber Ready (cluster side already works).
-	if res, err := r.stitchBackbone(ctx, &ep, plan, vip); err != nil {
+	// 2) Distribute the SR Policy to headends (persist-then-announce, Ready).
+	if res, err := r.distributeCluster(ctx, &ep, plan); err != nil {
 		return res, err
 	}
 
 	log.Info("reconciled", "name", ep.Name, "color", ep.Spec.Egress.Color,
-		"upstream", plan.cc.Upstream, "endpoint", plan.endpoint, "vip", vip)
+		"upstream", plan.cc.Upstream, "endpoint", plan.endpoint)
 	return ctrl.Result{}, nil
 }
 
@@ -159,35 +140,11 @@ func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egress
 	return &reconcilePlan{cc: cc, endpoint: endpoint, endpointAddr: endpointAddr}, ctrl.Result{}, nil
 }
 
-// ensureVIP returns the policy's egress VIP: it recovers a prior allocation
-// recorded in status (so the in-memory allocator never reissues it after a
-// restart), or validates the pool and allocates a new one. Allocation is
-// idempotent by EgressPolicy UID.
-func (r *EgressPolicyReconciler) ensureVIP(ctx context.Context, ep *srv6egressv1.EgressPolicy) (string, ctrl.Result, error) {
-	owner := string(ep.UID)
-	if vip := ep.Status.EgressIP; vip != "" {
-		if err := r.VIPs.Register(ctx, owner, vip); err != nil {
-			return "", ctrl.Result{}, err
-		}
-		return vip, ctrl.Result{}, nil
-	}
-	if err := r.Pools.ValidatePool(ctx, ep.Spec.Egress.EgressIPPool); err != nil {
-		res, err := r.markNotReady(ctx, ep, "InvalidEgressIPPool", err.Error())
-		return "", res, err
-	}
-	vip, err := r.VIPs.Allocate(ctx, owner, ep.Spec.Egress.EgressIPPool)
-	if err != nil {
-		res, err := r.markNotReady(ctx, ep, "VIPAllocation", err.Error())
-		return "", res, err
-	}
-	return vip, ctrl.Result{}, nil
-}
-
 // distributeCluster reconciles the headend-facing SR Policy distribution:
 // withdraw a drifted prior announce, persist the announce intent BEFORE
 // announcing (persist-then-announce, so deletion can always rebuild an exact
 // withdraw), announce, then record the effective BSID and mark Ready.
-func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6egressv1.EgressPolicy, plan *reconcilePlan, vip string) (ctrl.Result, error) {
+func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6egressv1.EgressPolicy, plan *reconcilePlan) (ctrl.Result, error) {
 	owner := string(ep.UID)
 	cc := plan.cc
 	intent := &srv6egressv1.SRPolicyStatus{
@@ -213,9 +170,8 @@ func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6
 	}
 
 	// Persist the announce intent BEFORE announcing.
-	if ep.Status.EgressIP != vip || ep.Status.ActiveEndpoint != plan.endpoint ||
+	if ep.Status.ActiveEndpoint != plan.endpoint ||
 		ep.Status.Upstream != cc.Upstream || !srPolicyIntentEqual(ep.Status.SRPolicy, intent) {
-		ep.Status.EgressIP = vip
 		ep.Status.ActiveEndpoint = plan.endpoint
 		ep.Status.Upstream = cc.Upstream
 		ep.Status.SRPolicy = intent
@@ -247,104 +203,6 @@ func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6
 	return ctrl.Result{}, nil
 }
 
-// stitchBackbone advertises the VIP toward the backbone as an RFC 9252 service
-// route (own End SID + backbone color) and surfaces the result on the
-// BackboneAdvertised condition. It is a no-op when no upstream is stitched to a
-// backbone; a failure does not clobber Ready (cluster-side steering already
-// works) but requeues.
-func (r *EgressPolicyReconciler) stitchBackbone(ctx context.Context, ep *srv6egressv1.EgressPolicy, plan *reconcilePlan, vip string) (ctrl.Result, error) {
-	advertised, err := r.reconcileBackbone(ctx, ep, plan.cc, vip)
-	if err != nil {
-		setCondition(ep, "BackboneAdvertised", metav1.ConditionFalse, "AnnounceFailed", err.Error())
-		if uerr := r.Status().Update(ctx, ep); uerr != nil {
-			return ctrl.Result{}, uerr
-		}
-		return ctrl.Result{}, err
-	}
-	if advertised {
-		setCondition(ep, "BackboneAdvertised", metav1.ConditionTrue, "Announced",
-			"VIP advertised to backbone with own End SID (RFC 9252)")
-		if uerr := r.Status().Update(ctx, ep); uerr != nil {
-			return ctrl.Result{}, uerr
-		}
-	}
-	return ctrl.Result{}, nil
-}
-
-// reconcileBackbone announces the policy's VIP as an SRv6 service route on the
-// upstream's backbone session, with the same guarantees as the SR Policy path:
-// stale-withdraw on drift, persist-then-announce, idempotent re-announce.
-// Returns (false, nil) when backbone mode is off or the upstream has no
-// backbone peer.
-func (r *EgressPolicyReconciler) reconcileBackbone(ctx context.Context, ep *srv6egressv1.EgressPolicy, cc config.ColorConfig, vip string) (bool, error) {
-	bb := r.Config.Backbone
-	if bb == nil {
-		return false, nil
-	}
-	peer, ok := bb.Peers[cc.Upstream]
-	if !ok {
-		return false, nil // upstream not stitched to a backbone
-	}
-	dist, ok := r.BackboneBGP[cc.Upstream]
-	if !ok {
-		return false, fmt.Errorf("backbone peer %q configured but no distributor wired", cc.Upstream)
-	}
-	vipIP := net.ParseIP(vip)
-	if vipIP == nil || vipIP.To4() != nil {
-		return false, fmt.Errorf("egress VIP %q is not an IPv6 address (backbone advertise requires the Calico IPAM VIP backend)", vip)
-	}
-
-	intent := &srv6egressv1.BackboneStatus{
-		Prefix:   vipIP.String() + "/128",
-		EndSID:   r.Config.Upstreams[cc.Upstream].SID,
-		Color:    bb.BackboneColor(ep.Spec.Egress.Color),
-		Upstream: cc.Upstream,
-		Nexthop:  peer.Nexthop,
-	}
-
-	// Withdraw a previously announced service route whose key drifted
-	// (color remap, SID change, VIP change) so it cannot leak.
-	if prior := ep.Status.Backbone; prior != nil && *prior != *intent {
-		if priorDist, ok := r.BackboneBGP[prior.Upstream]; ok {
-			if err := priorDist.Withdraw(ctx, string(ep.UID), serviceAdvert(prior)); err != nil {
-				return false, fmt.Errorf("withdraw stale backbone route: %w", err)
-			}
-		}
-	}
-
-	// Persist the intent BEFORE announcing (same rationale as the SR Policy).
-	if ep.Status.Backbone == nil || *ep.Status.Backbone != *intent {
-		ep.Status.Backbone = intent
-		if err := r.Status().Update(ctx, ep); err != nil {
-			return false, err
-		}
-	}
-
-	if _, err := dist.Announce(ctx, string(ep.UID), serviceAdvert(intent)); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// serviceRouteFromStatus rebuilds the announce/withdraw payload from the
-// persisted status record.
-func serviceRouteFromStatus(s *srv6egressv1.BackboneStatus) bgp.ServiceRoute {
-	return bgp.ServiceRoute{
-		Prefix:   s.Prefix,
-		EndSID:   s.EndSID,
-		Behavior: bgp.EndDT6,
-		Color:    s.Color,
-		Nexthop:  s.Nexthop,
-	}
-}
-
-// serviceAdvert builds the backbone Advertisement from the persisted status
-// record. The path is rebuilt deterministically, so withdraw works across a
-// controller restart.
-func serviceAdvert(s *srv6egressv1.BackboneStatus) bgp.ServiceAdvert {
-	return bgp.ServiceAdvert{Route: serviceRouteFromStatus(s), Structure: bgp.DefaultSIDStructure}
-}
-
 func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6egressv1.EgressPolicy) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 	if !containsString(ep.Finalizers, finalizerName) {
@@ -352,22 +210,6 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 	}
 
 	owner := string(ep.UID)
-
-	// Backbone stitch: withdraw the backbone service route first — the VIP must
-	// stop being advertised before it is released back to IPAM. Rebuilt from the
-	// persisted status record (works across controller restarts).
-	if bbs := ep.Status.Backbone; bbs != nil {
-		if dist, ok := r.BackboneBGP[bbs.Upstream]; ok {
-			if err := dist.Withdraw(ctx, owner, serviceAdvert(bbs)); err != nil {
-				return ctrl.Result{}, err
-			}
-		} else {
-			// Backbone config was removed while this route was announced; the
-			// session it lived on is gone with the config, so proceed.
-			log.Info("backbone route recorded but no distributor for its upstream; skipping withdraw",
-				"upstream", bbs.Upstream, "prefix", bbs.Prefix)
-		}
-	}
 
 	// Rebuild the SR Policy key + segment list from the PERSISTED ANNOUNCED
 	// values in status (not the mutable spec): the route in BGP was announced
@@ -387,9 +229,6 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 		if err := r.BGP.Withdraw(ctx, owner, r.Encoder.ClusterAdvert(key, sp.SegmentList)); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
-	if err := r.VIPs.Release(ctx, owner); err != nil {
-		return ctrl.Result{}, err
 	}
 
 	ep.Finalizers = removeString(ep.Finalizers, finalizerName)
@@ -525,34 +364,6 @@ func setCondition(ep *srv6egressv1.EgressPolicy, condType string, status metav1.
 		}
 	}
 	ep.Status.Conditions = append(ep.Status.Conditions, cond)
-}
-
-// RehydrateVIPs re-registers every already-allocated egress VIP into the
-// allocator BEFORE any reconcile runs. This must be called once at startup
-// (with a direct API reader, before the manager's caches/controllers start),
-// otherwise the restart-collision fix is order-dependent: a freshly created
-// policy could allocate a synthetic VIP that an existing policy still holds in
-// its status, because reconcile order is arbitrary.
-//
-// reader should be the manager's API reader (mgr.GetAPIReader()), which talks
-// directly to the API server and works before mgr.Start().
-func RehydrateVIPs(ctx context.Context, reader client.Reader, vips vipalloc.Allocator) (int, error) {
-	var list srv6egressv1.EgressPolicyList
-	if err := reader.List(ctx, &list); err != nil {
-		return 0, fmt.Errorf("rehydrate: list egresspolicies: %w", err)
-	}
-	n := 0
-	for i := range list.Items {
-		ep := &list.Items[i]
-		if ep.Status.EgressIP == "" {
-			continue
-		}
-		if err := vips.Register(ctx, string(ep.UID), ep.Status.EgressIP); err != nil {
-			return n, fmt.Errorf("rehydrate: register %s (%s): %w", ep.Name, ep.Status.EgressIP, err)
-		}
-		n++
-	}
-	return n, nil
 }
 
 // SetupWithManager wires the reconciler into the controller-runtime manager.

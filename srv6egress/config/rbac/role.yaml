@@ -17,13 +17,6 @@ rules:
   - apiGroups: ["srv6egress.ryskn.io"]
     resources: ["egresspolicies/finalizers"]
     verbs: ["update"]
-  # Calico IPPool access for per-tenant VIP allocation.
-  - apiGroups: ["crd.projectcalico.org"]
-    resources: ["ippools", "ipreservations", "clusterinformations", "ipamconfigs"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["crd.projectcalico.org"]
-    resources: ["ipamblocks", "ipamhandles", "blockaffinities"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
   # Node lookup for endpointSelector resolution.
   - apiGroups: [""]
     resources: ["nodes"]

@@ -140,7 +140,8 @@ func TestValidate_DuplicateBSIDRejected(t *testing.T) {
 
 func validBackbone() *BackboneConfig {
 	return &BackboneConfig{
-		ColorMap: map[uint32]uint32{100: 1100},
+		ColorMap:       map[uint32]uint32{100: 1100},
+		ClusterPodCIDR: "fd00:dead::/48",
 		Peers: map[string]BackbonePeerConfig{
 			"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
 		},
@@ -197,5 +198,41 @@ func TestBackboneColor_IdentityWhenUnmapped(t *testing.T) {
 	var nilB *BackboneConfig
 	if got := nilB.BackboneColor(300); got != 300 {
 		t.Fatalf("nil backbone color = %d, want identity 300", got)
+	}
+}
+
+func TestValidate_USIDUpstreamOK(t *testing.T) {
+	c := baseValid()
+	u := c.Upstreams["isp-a"]
+	u.SidMode = SidModeUSID
+	c.Upstreams["isp-a"] = u
+	if err := c.Validate(); err != nil {
+		t.Fatalf("usid upstream should validate, got: %v", err)
+	}
+}
+
+func TestValidate_UnknownSidModeRejected(t *testing.T) {
+	c := baseValid()
+	u := c.Upstreams["isp-a"]
+	u.SidMode = "compressed"
+	c.Upstreams["isp-a"] = u
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for unknown sidMode")
+	}
+}
+
+func TestResolvedSIDStructure_PerMode(t *testing.T) {
+	if got := (UpstreamConfig{SidMode: SidModeFull}).ResolvedSIDStructure(); got != classicSIDStructure {
+		t.Fatalf("full = %+v, want classic %+v", got, classicSIDStructure)
+	}
+	if got := (UpstreamConfig{}).ResolvedSIDStructure(); got != classicSIDStructure {
+		t.Fatalf("empty mode = %+v, want classic (default)", got)
+	}
+	if got := (UpstreamConfig{SidMode: SidModeUSID}).ResolvedSIDStructure(); got != usidSIDStructure {
+		t.Fatalf("usid = %+v, want usid default %+v", got, usidSIDStructure)
+	}
+	override := SIDStructure{LocatorBlockBits: 48, LocatorNodeBits: 16, FunctionBits: 16}
+	if got := (UpstreamConfig{SidMode: SidModeUSID, SIDStructure: &override}).ResolvedSIDStructure(); got != override {
+		t.Fatalf("override = %+v, want %+v", got, override)
 	}
 }

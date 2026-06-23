@@ -1,19 +1,8 @@
 # Example: send all egress from tenant-a namespace via ISP-A (color 100).
 # Assumes the bgp-controller config defines: color 100 -> upstream isp-a -> End.DT6 SID of egress GW.
 #
-# The egress VIP pool below MUST carry allowedUses: [Tunnel]; the controller
-# rejects an EgressPolicy whose egressIPPool lacks it (so egress VIPs can never
-# be drawn from a pod/workload pool).
----
-apiVersion: crd.projectcalico.org/v1
-kind: IPPool
-metadata:
-  name: tenant-egress-pool
-spec:
-  cidr: 2001:db8:e::/64
-  allowedUses: [Tunnel]   # isolates this pool from pod IPAM
-  nodeSelector: '!all()'
-  disabled: true          # not used for normal pod IPAM
+# NAT-less L3VPN: matched traffic is decapped into a per-tenant VRF at the egress
+# gateway and the pod source address is preserved end to end (no VIP / SNAT).
 ---
 apiVersion: srv6egress.ryskn.io/v1
 kind: EgressPolicy
@@ -33,7 +22,6 @@ spec:
         matchLabels:
           srv6egress.ryskn.io/role: egress
     color: 100
-    egressIPPool: tenant-egress-pool
 ---
 # A second policy: tenant-b uses ISP-B (color 200), demonstrating per-tenant path selection.
 apiVersion: srv6egress.ryskn.io/v1
@@ -51,4 +39,3 @@ spec:
         matchLabels:
           srv6egress.ryskn.io/role: egress
     color: 200
-    egressIPPool: tenant-egress-pool

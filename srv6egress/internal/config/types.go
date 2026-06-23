@@ -42,9 +42,16 @@ type BackboneConfig struct {
 	ColorMap map[uint32]uint32 `json:"colorMap,omitempty"`
 
 	// Peers configures the backbone-facing BGP speaker per upstream (keyed by
-	// the upstream name from Upstreams). Only upstreams present here get VIP
-	// service-route announcements.
+	// the upstream name from Upstreams). Only upstreams present here get the
+	// cluster pod-CIDR return route announced.
 	Peers map[string]BackbonePeerConfig `json:"peers"`
+
+	// ClusterPodCIDR is the cluster's pod IPv6 CIDR. It is advertised to each
+	// backbone upstream (with that upstream's End SID) as the NAT-less return
+	// reachability: the backbone SR-encapsulates return traffic toward the
+	// gateway, which decaps into the upstream VRF and bounces it into the cluster
+	// fabric to the pod's node.
+	ClusterPodCIDR string `json:"clusterPodCIDR"`
 }
 
 // BackbonePeerConfig is one backbone-facing gobgp (per-VRF, on the egress GW).
@@ -68,6 +75,34 @@ func (b *BackboneConfig) BackboneColor(clusterColor uint32) uint32 {
 	return clusterColor
 }
 
+// SID encoding modes for an upstream's egress path. The mode is a property of
+// the upstream (the backbone it peers with): full SID interops with a classic
+// SRv6 backbone (Linux/FRR), uSID with a NEXT-CSID backbone (e.g. Cisco 8000).
+// A single path is one mode end to end; different upstreams may differ.
+const (
+	SidModeFull = "full" // classic 128-bit SRv6 SIDs (+ SRH)
+	SidModeUSID = "usid" // NEXT-CSID compressed micro-segments
+)
+
+// SIDStructure is the SRv6 SID Structure (RFC 9252 §3.2.1): the bit layout of the
+// End SID, advertised to the backbone and installed on the gateway. Kept here (not
+// in the bgp package) so config carries no dependency on bgp; the controller
+// converts it to bgp.SIDStructure at the announce site.
+type SIDStructure struct {
+	LocatorBlockBits uint32 `json:"locatorBlockBits"`
+	LocatorNodeBits  uint32 `json:"locatorNodeBits"`
+	FunctionBits     uint32 `json:"functionBits"`
+	ArgumentBits     uint32 `json:"argumentBits,omitempty"`
+}
+
+// classicSIDStructure is the full-SID default (fcff::/40 block + 24-bit node +
+// 16-bit function = an 80-bit locator + 16-bit function).
+var classicSIDStructure = SIDStructure{LocatorBlockBits: 40, LocatorNodeBits: 24, FunctionBits: 16}
+
+// usidSIDStructure is a sensible uSID default (32-bit block + 16-bit node + 16-bit
+// function). Set UpstreamConfig.SIDStructure to match the actual uSID locator plan.
+var usidSIDStructure = SIDStructure{LocatorBlockBits: 32, LocatorNodeBits: 16, FunctionBits: 16}
+
 // UpstreamConfig describes a single egress upstream (per-VRF End.DT6 on the GW).
 type UpstreamConfig struct {
 	// SID is the egress gateway's End.DT6 SID for this upstream's VRF.
@@ -77,6 +112,30 @@ type UpstreamConfig struct {
 	// EgressGW is the egress gateway node name (informational; the actual
 	// endpoint resolution still happens via EgressPolicy.spec.egress.endpointSelector).
 	EgressGW string `json:"egressGW,omitempty"`
+	// SidMode selects the SID encoding for this upstream's egress path: "full"
+	// (classic 128-bit SRv6 SIDs) or "usid" (NEXT-CSID). Empty defaults to "full".
+	// +optional
+	SidMode string `json:"sidMode,omitempty"`
+	// SIDStructure overrides the SRv6 SID Structure advertised/installed for this
+	// upstream's End SID. Defaults to the classic 40/24/16 layout for full and a
+	// 32/16/16 layout for usid; set it to match the actual uSID locator plan.
+	// +optional
+	SIDStructure *SIDStructure `json:"sidStructure,omitempty"`
+}
+
+// IsUSID reports whether this upstream uses uSID (NEXT-CSID) encoding.
+func (u UpstreamConfig) IsUSID() bool { return u.SidMode == SidModeUSID }
+
+// ResolvedSIDStructure returns the configured SID structure, or the per-mode
+// default when unset.
+func (u UpstreamConfig) ResolvedSIDStructure() SIDStructure {
+	if u.SIDStructure != nil {
+		return *u.SIDStructure
+	}
+	if u.IsUSID() {
+		return usidSIDStructure
+	}
+	return classicSIDStructure
 }
 
 // ColorConfig binds a color to an upstream + segment list.
@@ -138,6 +197,11 @@ func (c *ControllerConfig) Validate() error {
 		if err != nil {
 			return fmt.Errorf("upstream %q: sid %v", name, err)
 		}
+		switch up.SidMode {
+		case "", SidModeFull, SidModeUSID:
+		default:
+			return fmt.Errorf("upstream %q: sidMode %q must be %q or %q", name, up.SidMode, SidModeFull, SidModeUSID)
+		}
 		upstreamSID[name] = sid
 	}
 
@@ -192,6 +256,12 @@ func (c *ControllerConfig) Validate() error {
 	if c.Backbone != nil {
 		if len(c.Backbone.Peers) == 0 {
 			return fmt.Errorf("backbone: peers must not be empty when backbone is set")
+		}
+		if c.Backbone.ClusterPodCIDR == "" {
+			return fmt.Errorf("backbone: clusterPodCIDR is required when backbone is set")
+		}
+		if ip, _, err := net.ParseCIDR(c.Backbone.ClusterPodCIDR); err != nil || ip.To4() != nil {
+			return fmt.Errorf("backbone: clusterPodCIDR %q must be an IPv6 CIDR", c.Backbone.ClusterPodCIDR)
 		}
 		for name, p := range c.Backbone.Peers {
 			if _, ok := c.Upstreams[name]; !ok {
