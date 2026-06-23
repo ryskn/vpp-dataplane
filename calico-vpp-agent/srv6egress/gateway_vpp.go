@@ -2,31 +2,43 @@ package srv6egress
 
 import (
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
+	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
 )
 
-// fibIndexRe extracts the fib index from `show ip6 fib table <id> summary`,
-// whose header reads e.g. "ipv6-VRF:1000, fib_index:16, ...".
-var fibIndexRe = regexp.MustCompile(`fib_index:(\d+)`)
+// tenantLocalsid builds the End.DT6 localsid for the tenant SID, decapping into
+// its VRF. A uSID upstream carries the SID structure so the wrapper programs it
+// as a uDT6 via the v2 API; otherwise it is a classic End.DT6.
+func tenantLocalsid(req GatewayRequest) *types.SrLocalsid {
+	ls := &types.SrLocalsid{
+		Localsid: types.ToVppIP6Address(req.TenantSID),
+		Behavior: types.SrBehaviorDT6,
+		FibTable: req.VrfTable,
+	}
+	if req.USID {
+		ls.LocatorBlockLen = req.LocatorBlockLen
+		ls.LocatorNodeLen = req.LocatorNodeLen
+		ls.FunctionLen = req.FunctionLen
+	}
+	return ls
+}
 
-// vppGateway implements VPPGateway over vpplink. The End.DT6.In behavior and
-// per-fib cnat SNAT are CLI-only in our VPP build (private patches 0006/0007),
-// so they are driven via RunCli (CliInband); the rest are plain table/route
-// operations also expressed as CLI for a single coherent provisioning unit.
+// vppGateway implements VPPGateway over vpplink.
 //
-// Per tenant the gateway installs, in a dedicated VRF:
-//   - a loopback (carries a link-local-only interface so ip6 features attach)
-//   - cnat-snat on that loopback (so the re-injected inner packet is SNAT'd)
-//   - End.DT6.In <loopback> for the tenant SID (decap -> ip6-input on loopback)
-//   - per-fib SNAT: pod src -> tenant VIP, fib == rfib == tenant VRF
-//   - tenant VRF default -> lookup-in-table <upstream VRF> (forward + return)
-//   - VIP/128 in the upstream VRF -> lookup-in-table <tenant VRF> (bounce return)
+// NAT-less L3VPN model. Per tenant the gateway installs, in a dedicated VRF:
+//   - End.DT6 <tenant VRF> for the tenant SID — decap straight into the VRF FIB.
+//     No loopback, no SNAT: the pod source address is preserved end to end.
+//   - tenant VRF default -> lookup-in-table <upstream VRF> (egress to the backbone).
+//   - optional shared return aggregate in the upstream VRF: the cluster pod CIDR ->
+//     lookup-in-table <cluster VRF>, so return traffic (dst = pod IP) re-enters the
+//     cluster SRv6 fabric and is carried back to the pod's node. Shared across the
+//     tenants on an upstream; installed idempotently and left in place on teardown.
+//
+// Everything is driven via RunCli (CliInband) as a single coherent provisioning unit.
 type vppGateway struct {
 	vpp *vpplink.VppLink
 	log *logrus.Entry
@@ -35,17 +47,6 @@ type vppGateway struct {
 // NewVPPGateway builds the production VPPGateway.
 func NewVPPGateway(vpp *vpplink.VppLink, log *logrus.Entry) VPPGateway {
 	return &vppGateway{vpp: vpp, log: log.WithField("subcomponent", "gateway-vpp")}
-}
-
-// loopName / loopLinkLocal derive a deterministic per-VRF loopback identity.
-// VPP loopbacks are named loopN by creation order, so we instead create one
-// and bind it; we track it by the tenant VRF in the CLI script. For simplicity
-// the loopback is addressed with a ULA derived from the VRF id.
-func loopV6(vrf uint32) string {
-	// fd6e::<vrf>/64 — only needs to ip6-enable the loopback. A /128 is
-	// rejected by VPP as an interface address; the per-VRF host part keeps it
-	// distinct (the loopbacks live in isolated VRFs anyway).
-	return fmt.Sprintf("fd6e::%x/64", vrf)
 }
 
 func (g *vppGateway) cli(cmd string) error {
@@ -60,26 +61,6 @@ func (g *vppGateway) cli(cmd string) error {
 		return fmt.Errorf("vppctl %q: %s", cmd, out)
 	}
 	return nil
-}
-
-// fibIndex resolves the VPP fib INDEX of an IPv6 VRF table id. The cnat
-// snat-policy CLI keys on the fib index (NOT the table id used by `ip route
-// table` / `ip6-lookup-in-table`); passing a table id that is not also a valid
-// fib index makes VPP dereference an out-of-range slot and crash.
-func (g *vppGateway) fibIndex(tableID uint32) (uint32, error) {
-	out, err := g.vpp.RunCli(fmt.Sprintf("show ip6 fib table %d summary", tableID))
-	if err != nil {
-		return 0, fmt.Errorf("resolve fib index for table %d: %w", tableID, err)
-	}
-	m := fibIndexRe.FindStringSubmatch(out)
-	if m == nil {
-		return 0, fmt.Errorf("no fib_index in `show ip6 fib table %d summary`: %s", tableID, out)
-	}
-	idx, err := strconv.ParseUint(m[1], 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse fib index %q: %w", m[1], err)
-	}
-	return uint32(idx), nil
 }
 
 // cliOK runs cmd but treats an error whose message contains any of okSubstrings
@@ -99,110 +80,58 @@ func (g *vppGateway) cliOK(cmd string, okSubstrings ...string) error {
 	return err
 }
 
-// InstallGateway provisions the per-tenant gateway data path as a sequence of
-// named steps: find/create the loopback, bind the VRFs, resolve the FIB index
-// the cnat SNAT keys on, bring the loopback up, then install the localsid +
-// inter-VRF routing + SNAT. Each step is idempotent so a retry converges.
+// InstallGateway provisions the per-tenant NAT-less gateway data path: ensure the
+// tenant + upstream VRFs exist, then install the End.DT6 decap into the tenant VRF,
+// the egress default route to the upstream VRF, and (if configured) the shared
+// return aggregate. Each step is idempotent so a retry converges.
 func (g *vppGateway) InstallGateway(req GatewayRequest) error {
-	if req.TenantSID == nil || req.VIP == nil {
+	if req.TenantSID == nil {
 		return fmt.Errorf("gateway install: incomplete request %+v", req)
 	}
-	vrf := req.VrfTable
-
-	loName, created, err := g.ensureLoopback(vrf)
-	if err != nil {
+	if err := g.bindVRFs(req.VrfTable, req.UpstreamTable); err != nil {
 		return err
 	}
-	if err := g.bindVRFs(loName, vrf, req.UpstreamTable); err != nil {
-		return err
-	}
-	// cnat snat-policy keys on the FIB INDEX of the tenant VRF, not its table id.
-	fibIdx, err := g.fibIndex(vrf)
-	if err != nil {
-		return err
-	}
-	if err := g.enableLoopback(loName, vrf, created); err != nil {
-		return err
-	}
-	return g.installTenantDataPath(req, loName, fibIdx)
-}
-
-// ensureLoopback finds or creates the deterministic per-VRF loopback (instance
-// == VRF table id) so a retry reuses the same loop<vrf> rather than leaking a
-// new loopback (and colliding on its address) on every attempt. It is the
-// End.DT6.In RX interface; ip6-input runs its features (cnat-snat) on the
-// decapped packet. created=true means it was freshly created (its address must
-// still be assigned by enableLoopback).
-func (g *vppGateway) ensureLoopback(vrf uint32) (loName string, created bool, err error) {
-	loName = fmt.Sprintf("loop%d", vrf)
-	if _, serr := g.vpp.SearchInterfaceWithName(loName); serr != nil {
-		if cerr := g.cli(fmt.Sprintf("create loopback interface instance %d", vrf)); cerr != nil {
-			return "", false, fmt.Errorf("create %s: %w", loName, cerr)
-		}
-		created = true
-	}
-	return loName, created, nil
+	return g.installTenantDataPath(req)
 }
 
 // bindVRFs ensures the shared upstream VRF and the tenant VRF exist (add is
-// tolerated if already present) and binds the loopback into the tenant VRF.
-func (g *vppGateway) bindVRFs(loName string, vrf, upstreamTable uint32) error {
+// tolerated if already present).
+func (g *vppGateway) bindVRFs(vrf, upstreamTable uint32) error {
 	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", upstreamTable), "already"); err != nil {
 		return err
 	}
-	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", vrf), "already"); err != nil {
-		return err
-	}
-	return g.cli(fmt.Sprintf("set interface ip6 table %s %d", loName, vrf))
+	return g.cliOK(fmt.Sprintf("ip6 table add %d", vrf), "already")
 }
 
-// enableLoopback brings the loopback up, assigns its address once (only when
-// freshly created — re-setting it on an existing loop<vrf> would fail as a
-// conflict), and attaches the cnat-snat feature so the re-injected inner packet
-// is SNAT'd.
-func (g *vppGateway) enableLoopback(loName string, vrf uint32, created bool) error {
-	if err := g.cli(fmt.Sprintf("set interface state %s up", loName)); err != nil {
-		return err
-	}
-	if created {
-		if err := g.cli(fmt.Sprintf("set interface ip address %s %s", loName, loopV6(vrf))); err != nil {
-			return err
-		}
-	}
-	// cnat-snat feature add is idempotent in VPP.
-	return g.cli(fmt.Sprintf("set interface feature %s cnat-snat-ip6 arc ip6-unicast", loName))
-}
-
-// installTenantDataPath installs the End.DT6.In localsid, the inter-VRF
-// forward/return routing, and the per-fib SNAT of the pod source to the VIP.
-func (g *vppGateway) installTenantDataPath(req GatewayRequest, loName string, fibIdx uint32) error {
-	sid := req.TenantSID.String()
-	vip := req.VIP.String()
+// installTenantDataPath installs the End.DT6 decap, the egress default route, and
+// (if configured) the shared return aggregate.
+func (g *vppGateway) installTenantDataPath(req GatewayRequest) error {
 	vrf := req.VrfTable
-	// sr localsid add reports "identical localsid already exists" on a retry,
-	// which cli() does not treat as an error.
-	if err := g.cli(fmt.Sprintf("sr localsid address %s behavior end.dt6.in %s", sid, loName)); err != nil {
-		return err
+	// End.DT6 (or uDT6 for a uSID upstream): decap straight into the tenant VRF
+	// FIB. No SNAT, no loopback; the pod source address is preserved (L3VPN).
+	// AddSRv6Localsid is idempotent (re-adding the same localsid is a no-op in VPP).
+	if err := g.vpp.AddSRv6Localsid(tenantLocalsid(req)); err != nil {
+		return fmt.Errorf("install tenant localsid %s: %w", req.TenantSID, err)
 	}
-	// forward + return leave the tenant VRF via the shared upstream VRF (route
-	// table args + lookup-in-table are all table ids).
+	// egress: the tenant VRF default leaves via the shared upstream VRF.
 	if err := g.cliOK(fmt.Sprintf("ip route add ::/0 table %d via ip6-lookup-in-table %d", vrf, req.UpstreamTable), "already", "exist"); err != nil {
 		return err
 	}
-	// per-fib SNAT (fib/rfib are the resolved FIB INDEX). Idempotent: updates
-	// the per-fib entry if present.
-	if err := g.cli(fmt.Sprintf("set cnat snat-policy addr %s fib %d rfib %d", vip, fibIdx, fibIdx)); err != nil {
-		return err
+	// return: bounce the cluster pod CIDR from the upstream VRF into the cluster
+	// VRF, where the cluster SRv6 fabric carries it back to the pod's node. Shared
+	// across tenants on the upstream; idempotent; left in place on teardown.
+	if req.ReturnCIDR != "" {
+		if err := g.cliOK(fmt.Sprintf("ip route add %s table %d via ip6-lookup-in-table %d", req.ReturnCIDR, req.UpstreamTable, req.ReturnTable), "already", "exist"); err != nil {
+			return err
+		}
 	}
-	// bounce the return (dst=VIP on the shared uplink VRF) into the tenant VRF.
-	return g.cliOK(fmt.Sprintf("ip route add %s/128 table %d via ip6-lookup-in-table %d", vip, req.UpstreamTable, vrf), "already", "exist")
+	return nil
 }
 
 func (g *vppGateway) RemoveGateway(req GatewayRequest) error {
 	if req.TenantSID == nil {
 		return nil
 	}
-	sid := req.TenantSID.String()
 	vrf := req.VrfTable
 	var firstErr error
 	rec := func(err error) {
@@ -210,21 +139,10 @@ func (g *vppGateway) RemoveGateway(req GatewayRequest) error {
 			firstErr = err
 		}
 	}
-	if req.VIP != nil {
-		rec(g.cli(fmt.Sprintf("ip route del %s/128 table %d via ip6-lookup-in-table %d",
-			req.VIP.String(), req.UpstreamTable, vrf)))
-		// Deleting a per-fib snat entry: addr omitted => is_delete for that fib.
-		// fib/rfib are the FIB INDEX; if the table is already gone the snat is
-		// too, so skip rather than pass a stale/invalid index (which can crash).
-		if fibIdx, ferr := g.fibIndex(vrf); ferr == nil {
-			rec(g.cli(fmt.Sprintf("set cnat snat-policy addr fib %d rfib %d", fibIdx, fibIdx)))
-		}
-	}
 	rec(g.cli(fmt.Sprintf("ip route del ::/0 table %d via ip6-lookup-in-table %d", vrf, req.UpstreamTable)))
-	rec(g.cli(fmt.Sprintf("sr localsid del address %s", sid)))
-	// Delete the deterministic loopback (after its localsid is gone). The VRF
-	// table is left for a later sweep; deleting it while the SR FIB still
-	// references it can crash some VPP builds.
-	rec(g.cliOK(fmt.Sprintf("delete loopback interface intfc loop%d", vrf), "unknown", "not", "no such"))
+	rec(g.vpp.DelSRv6Localsid(tenantLocalsid(req)))
+	// The shared return aggregate and the VRF tables are left for a later sweep:
+	// other tenants on the same upstream still need the aggregate, and deleting a
+	// VRF while the SR FIB still references it can crash some VPP builds.
 	return firstErr
 }

@@ -11,19 +11,19 @@ import (
 )
 
 // VPPGateway is the seam for the egress-gateway (endpoint) data path. The
-// GatewayManager calls it when this node is the endpoint of an EgressPolicy
-// and must terminate the tenant's SRv6 traffic, SNAT it to the tenant VIP, and
-// forward it to the upstream VRF (and the symmetric return).
+// GatewayManager calls it when this node is the endpoint of an EgressPolicy and
+// must terminate the tenant's SRv6 traffic and forward it to the upstream VRF
+// (and carry the return back to the pod).
 //
-// The production implementation drives VPP via vpplink (SR localsid with the
-// End.DT6.In behavior + per-fib cnat SNAT + inter-VRF routes). It is wired in
-// the agent main when this node may act as an egress gateway.
+// The production implementation drives VPP via vpplink (a stock End.DT6 localsid
+// that decaps into a per-tenant VRF + inter-VRF routes). It is NAT-less: the pod
+// source address is preserved end to end (L3VPN). It is wired in the agent main
+// when this node may act as an egress gateway.
 type VPPGateway interface {
 	// InstallGateway provisions the per-tenant gateway data path: a dedicated
-	// VRF, an End.DT6.In localsid for the tenant SID that re-injects the
-	// decapsulated packet into the VRF (so cnat runs), a per-fib SNAT of the
-	// pod source to the tenant VIP, and the inter-VRF routing to/from the
-	// shared upstream VRF. Idempotent.
+	// VRF, an End.DT6 localsid for the tenant SID that decaps into that VRF, the
+	// egress default route to the shared upstream VRF, and an optional shared
+	// return aggregate. Idempotent.
 	InstallGateway(req GatewayRequest) error
 	// RemoveGateway tears down everything InstallGateway created for req.
 	// Safe to call when nothing is installed.
@@ -46,32 +46,49 @@ type SIDAdvertiser interface {
 type GatewayRequest struct {
 	PolicyUID string
 	// TenantSID is the terminal SRv6 SID (the policy's segment-list tail): the
-	// End.DT6.In SID this gateway terminates for the tenant.
+	// End.DT6 SID this gateway terminates for the tenant.
 	TenantSID net.IP
-	// VIP is the per-tenant egress address pod traffic is SNAT'd to.
-	VIP net.IP
 	// VrfTable is the per-tenant VRF table id the gateway decaps into (manager
 	// allocated, stable for the policy's lifetime).
 	VrfTable uint32
 	// UpstreamTable is the shared upstream VRF holding the routes learned from
-	// the upstream peer; the tenant VRF forwards to it (forward) and the return
-	// VIP is bounced from it into the tenant VRF.
+	// the upstream peer; the tenant VRF forwards to it (egress).
 	UpstreamTable uint32
+	// ReturnCIDR / ReturnTable optionally install a shared return aggregate in the
+	// upstream VRF: the cluster pod CIDR -> lookup-in-table ReturnTable (the cluster
+	// VRF), so return traffic (dst = pod IP) re-enters the cluster SRv6 fabric. An
+	// empty ReturnCIDR skips it (return provided by other means).
+	ReturnCIDR  string
+	ReturnTable uint32
+	// USID installs the tenant SID as a uSID (uDT6) via the v2 localsid API with
+	// the SID structure below, matching the upstream's uSID locator plan; false
+	// installs a classic End.DT6.
+	USID            bool
+	LocatorBlockLen uint8
+	LocatorNodeLen  uint8
+	FunctionLen     uint8
 	// Upstream is the symbolic upstream name (for logging / mapping).
 	Upstream string
 }
 
-// key identifies a gateway install for diffing across reconciles. The tenant
-// SID + VIP + VRF fully determine the installed state.
+// UpstreamSIDSpec is the per-upstream SID encoding the gateway installs for a
+// tenant terminating on that upstream: a classic End.DT6 (USID false) or a uSID
+// uDT6 (USID true) with the given SID structure.
+type UpstreamSIDSpec struct {
+	USID            bool
+	LocatorBlockLen uint8
+	LocatorNodeLen  uint8
+	FunctionLen     uint8
+}
+
+// key identifies a gateway install for diffing across reconciles. The tenant SID
+// + VRF fully determine the per-tenant installed state.
 func (r GatewayRequest) key() string {
-	sid, vip := "", ""
+	sid := ""
 	if r.TenantSID != nil {
 		sid = r.TenantSID.String()
 	}
-	if r.VIP != nil {
-		vip = r.VIP.String()
-	}
-	return fmt.Sprintf("%s|%s|%d", sid, vip, r.VrfTable)
+	return fmt.Sprintf("%s|%d", sid, r.VrfTable)
 }
 
 // gwState tracks a policy this node is the endpoint for, and the gateway entry
@@ -97,6 +114,14 @@ type GatewayManager struct {
 	policies map[string]*gwState // key = EgressPolicy.UID
 	vrfs     *vrfAllocator
 	sids     SIDAdvertiser // optional; advertises the tenant SID over BGP
+
+	// returnCIDR / returnTable configure the shared return aggregate (see
+	// SetClusterReturn); an empty returnCIDR disables it.
+	returnCIDR  string
+	returnTable uint32
+	// sidModes is the per-upstream SID encoding (see SetUpstreamSIDModes); an
+	// upstream absent from the map defaults to classic End.DT6.
+	sidModes map[string]UpstreamSIDSpec
 }
 
 // SetSIDAdvertiser wires BGP advertisement of provisioned tenant SIDs. Call
@@ -105,6 +130,26 @@ func (m *GatewayManager) SetSIDAdvertiser(a SIDAdvertiser) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sids = a
+}
+
+// SetClusterReturn configures the shared return aggregate: the cluster pod CIDR is
+// bounced from the upstream VRF into the cluster VRF (table) so return traffic
+// (dst = pod IP) re-enters the cluster SRv6 fabric. Optional; unset means the
+// return path is provided by other means. Call before the watcher starts.
+func (m *GatewayManager) SetClusterReturn(podCIDR string, clusterVRF uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.returnCIDR = podCIDR
+	m.returnTable = clusterVRF
+}
+
+// SetUpstreamSIDModes configures the per-upstream SID encoding (classic vs uSID).
+// An upstream absent from the map defaults to classic End.DT6. Call before the
+// watcher starts.
+func (m *GatewayManager) SetUpstreamSIDModes(modes map[string]UpstreamSIDSpec) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sidModes = modes
 }
 
 // NewGatewayManager builds a GatewayManager for nodeName. upstreamTables gives
@@ -208,7 +253,7 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 		}
 	}
 	m.log.WithFields(logrus.Fields{
-		"uid": uid, "sid": req.TenantSID, "vip": req.VIP,
+		"uid": uid, "sid": req.TenantSID,
 		"vrf": req.VrfTable, "upstream": req.Upstream,
 	}).Info("installed egress gateway entry")
 }
@@ -248,23 +293,24 @@ func (m *GatewayManager) desired(ep *srv6egressv1.EgressPolicy) (bool, GatewayRe
 		m.log.WithField("name", ep.Name).Warn("terminal SID is not IPv6; skipping gateway install")
 		return false, GatewayRequest{}
 	}
-	vip := parseV6(ep.Status.EgressIP)
-	if vip == nil {
-		m.log.WithField("name", ep.Name).Warn("egressIP is not IPv6; skipping gateway install")
-		return false, GatewayRequest{}
-	}
 	upstreamTable, ok := m.upstreamTables[ep.Status.Upstream]
 	if !ok {
 		m.log.WithField("upstream", ep.Status.Upstream).
 			Warn("no upstream VRF table configured for upstream; skipping gateway install")
 		return false, GatewayRequest{}
 	}
+	spec := m.sidModes[ep.Status.Upstream]
 	return true, GatewayRequest{
-		PolicyUID:     string(ep.UID),
-		TenantSID:     sid,
-		VIP:           vip,
-		UpstreamTable: upstreamTable,
-		Upstream:      ep.Status.Upstream,
+		PolicyUID:       string(ep.UID),
+		TenantSID:       sid,
+		UpstreamTable:   upstreamTable,
+		ReturnCIDR:      m.returnCIDR,
+		ReturnTable:     m.returnTable,
+		USID:            spec.USID,
+		LocatorBlockLen: spec.LocatorBlockLen,
+		LocatorNodeLen:  spec.LocatorNodeLen,
+		FunctionLen:     spec.FunctionLen,
+		Upstream:        ep.Status.Upstream,
 	}
 }
 

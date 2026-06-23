@@ -419,18 +419,41 @@ func (cfg *CalicoVppFeatureGatesConfigType) String() string {
 	return string(b)
 }
 
+// EgressUpstreamSID configures the SID encoding for one egress upstream on the
+// gateway. usid=false (default) installs a classic End.DT6; usid=true installs a
+// uSID uDT6 with the given SID structure (bit lengths). Keyed by upstream name in
+// CalicoVppSrv6ConfigType.EgressUpstreamSidModes.
+type EgressUpstreamSID struct {
+	USID             bool  `json:"usid,omitempty"`
+	LocatorBlockBits uint8 `json:"locatorBlockBits,omitempty"`
+	LocatorNodeBits  uint8 `json:"locatorNodeBits,omitempty"`
+	FunctionBits     uint8 `json:"functionBits,omitempty"`
+}
+
 type CalicoVppSrv6ConfigType struct {
 	LocalsidPool string `json:"localsidPool"`
 	PolicyPool   string `json:"policyPool"`
 	// EgressUpstreamTables maps an egress upstream name (EgressPolicy
 	// status.upstream) to the VPP VRF table id holding that upstream's routes
-	// on the egress gateway. Set on egress gateway nodes for v1alpha2 SNAT: the
-	// per-tenant VRF forwards to / returns from this table. Empty on
-	// non-gateway nodes (the gateway provisioner then stays idle there).
+	// on the egress gateway. Set on egress gateway nodes: the per-tenant VRF
+	// forwards to / returns from this table. Empty on non-gateway nodes (the
+	// gateway provisioner then stays idle there).
 	EgressUpstreamTables map[string]uint32 `json:"egressUpstreamTables,omitempty"`
 	// EgressVrfBase is the first VPP VRF table id used for per-tenant egress
 	// VRFs on the gateway (allocated upward). Defaults to 1000 when 0.
 	EgressVrfBase uint32 `json:"egressVrfBase,omitempty"`
+	// EgressUpstreamSidModes maps an egress upstream name to its SID encoding
+	// (classic End.DT6 vs uSID uDT6). Upstreams absent here default to classic.
+	// +optional
+	EgressUpstreamSidModes map[string]EgressUpstreamSID `json:"egressUpstreamSidModes,omitempty"`
+	// EgressClusterPodCIDR / EgressClusterVrf install the NAT-less return
+	// aggregate on the gateway: return traffic (dst = pod IP) is bounced from the
+	// upstream VRF into EgressClusterVrf (the cluster VRF carrying SRv6 pod
+	// reachability, usually 0) so it re-enters the cluster fabric toward the pod's
+	// node. An empty EgressClusterPodCIDR skips it.
+	// +optional
+	EgressClusterPodCIDR string `json:"egressClusterPodCIDR,omitempty"`
+	EgressClusterVrf     uint32 `json:"egressClusterVrf,omitempty"`
 }
 
 func (cfg *CalicoVppSrv6ConfigType) Validate() (err error) { return nil }

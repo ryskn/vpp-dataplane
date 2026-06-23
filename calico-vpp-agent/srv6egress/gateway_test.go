@@ -36,7 +36,6 @@ func gwPolicy(name, uid, endpoint, sid, vip, upstream string) *srv6egressv1.Egre
 	return &srv6egressv1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uid)},
 		Status: srv6egressv1.EgressPolicyStatus{
-			EgressIP:       vip,
 			ActiveEndpoint: endpoint,
 			Upstream:       upstream,
 			SRPolicy:       &srv6egressv1.SRPolicyStatus{SegmentList: []string{sid}},
@@ -108,7 +107,7 @@ func TestGateway_InstallsForLocalEndpoint(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a gateway install for the local endpoint")
 	}
-	if !req.TenantSID.Equal(net.ParseIP("fcff:0:0:e0:a:1::")) || !req.VIP.Equal(net.ParseIP("2001:db8:e::a")) {
+	if !req.TenantSID.Equal(net.ParseIP("fcff:0:0:e0:a:1::")) {
 		t.Fatalf("bad request %+v", req)
 	}
 	if req.UpstreamTable != 100 {
@@ -116,6 +115,20 @@ func TestGateway_InstallsForLocalEndpoint(t *testing.T) {
 	}
 	if req.VrfTable < 1000 {
 		t.Fatalf("vrf table = %d, want >= base 1000", req.VrfTable)
+	}
+}
+
+// SetClusterReturn must flow the cluster pod CIDR + cluster VRF into the install
+// request so the gateway installs the shared return aggregate.
+func TestGateway_ClusterReturnConfigured(t *testing.T) {
+	vpp := newFakeGW()
+	m := newGWManager(vpp)
+	m.SetClusterReturn("fd00:cafe::/48", 0)
+	m.OnPolicyUpdate(gwPolicy("a", "uid-a", "gw-node", "fcff:0:0:e0:a:1::", "2001:db8:e::a", "isp-a"))
+
+	req := vpp.installs["uid-a"]
+	if req.ReturnCIDR != "fd00:cafe::/48" || req.ReturnTable != 0 {
+		t.Fatalf("cluster return not propagated: cidr=%q table=%d", req.ReturnCIDR, req.ReturnTable)
 	}
 }
 
@@ -128,7 +141,7 @@ func TestGateway_IgnoresRemoteEndpoint(t *testing.T) {
 	}
 }
 
-func TestGateway_DistinctVRFsAndVIPsPerTenant(t *testing.T) {
+func TestGateway_DistinctVRFsPerTenant(t *testing.T) {
 	vpp := newFakeGW()
 	m := newGWManager(vpp)
 	m.OnPolicyUpdate(gwPolicy("a", "uid-a", "gw-node", "fcff:0:0:e0:a:1::", "2001:db8:e::a", "isp-a"))
@@ -138,9 +151,6 @@ func TestGateway_DistinctVRFsAndVIPsPerTenant(t *testing.T) {
 	if a.VrfTable == b.VrfTable {
 		t.Fatalf("tenants must get distinct VRFs, both %d", a.VrfTable)
 	}
-	if a.VIP.Equal(b.VIP) {
-		t.Fatal("tenants must keep distinct VIPs")
-	}
 	if a.UpstreamTable != 100 || b.UpstreamTable != 200 {
 		t.Fatalf("upstream tables a=%d b=%d, want 100/200", a.UpstreamTable, b.UpstreamTable)
 	}
@@ -148,7 +158,7 @@ func TestGateway_DistinctVRFsAndVIPsPerTenant(t *testing.T) {
 
 // A periodic reconcile of an already-installed, unchanged policy must be a
 // no-op: no teardown, no re-install (otherwise the gateway churns the VRF /
-// localsid / SNAT every tick).
+// localsid / route every tick).
 func TestGateway_ReconcileIsIdempotent(t *testing.T) {
 	vpp := newFakeGW()
 	m := newGWManager(vpp)

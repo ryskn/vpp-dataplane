@@ -303,6 +303,24 @@ func main() {
 					if spec, ok := ourBGPSpec.(*common.LocalNodeSpec); ok && spec != nil {
 						egressGateway.SetSIDAdvertiser(srv6egress.NewBGPSIDAdvertiser(spec))
 					}
+					// Per-upstream SID encoding (classic End.DT6 vs uSID uDT6).
+					if len(srv6cfg.EgressUpstreamSidModes) > 0 {
+						modes := make(map[string]srv6egress.UpstreamSIDSpec, len(srv6cfg.EgressUpstreamSidModes))
+						for name, m := range srv6cfg.EgressUpstreamSidModes {
+							modes[name] = srv6egress.UpstreamSIDSpec{
+								USID:            m.USID,
+								LocatorBlockLen: m.LocatorBlockBits,
+								LocatorNodeLen:  m.LocatorNodeBits,
+								FunctionLen:     m.FunctionBits,
+							}
+						}
+						egressGateway.SetUpstreamSIDModes(modes)
+					}
+					// NAT-less return aggregate: bounce the cluster pod CIDR back
+					// into the cluster SRv6 fabric so return traffic reaches the pod.
+					if srv6cfg.EgressClusterPodCIDR != "" {
+						egressGateway.SetClusterReturn(srv6cfg.EgressClusterPodCIDR, srv6cfg.EgressClusterVrf)
+					}
 					egressWatcher.SetGatewayManager(egressGateway)
 					egressLog.WithField("upstreamTables", srv6cfg.EgressUpstreamTables).
 						Info("egress gateway provisioning enabled on this node")
