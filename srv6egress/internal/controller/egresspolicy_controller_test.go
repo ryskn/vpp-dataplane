@@ -19,7 +19,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
@@ -32,7 +32,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	if err := clientgoscheme.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv6egressv1alpha1.AddToScheme(s); err != nil {
+	if err := srv6egressv1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
 	// Register the Calico IPPool CRD as unstructured so the fake client can
@@ -81,17 +81,17 @@ func ippool(name string, allowedUses ...string) *unstructured.Unstructured {
 	return p
 }
 
-func newPolicy(name, uid string, color uint32, pool string) *srv6egressv1alpha1.EgressPolicy {
-	return &srv6egressv1alpha1.EgressPolicy{
+func newPolicy(name, uid string, color uint32, pool string) *srv6egressv1.EgressPolicy {
+	return &srv6egressv1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       name,
 			UID:        types.UID(uid),
 			Finalizers: []string{finalizerName}, // pre-add to skip the requeue step
 		},
-		Spec: srv6egressv1alpha1.EgressPolicySpec{
-			Selector: srv6egressv1alpha1.Selector{},
-			Egress: srv6egressv1alpha1.EgressSpec{
-				EndpointSelector: srv6egressv1alpha1.EndpointSelector{
+		Spec: srv6egressv1.EgressPolicySpec{
+			Selector: srv6egressv1.Selector{},
+			Egress: srv6egressv1.EgressSpec{
+				EndpointSelector: srv6egressv1.EndpointSelector{
 					NodeSelector: &metav1.LabelSelector{
 						MatchLabels: map[string]string{"srv6egress.ryskn.io/role": "egress"},
 					},
@@ -109,7 +109,7 @@ func newReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler 
 	c := fakeclient.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(objs...).
-		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		Build()
 	return &EgressPolicyReconciler{
 		Client:  c,
@@ -156,7 +156,7 @@ func reconcile(t *testing.T, r *EgressPolicyReconciler, name string) error {
 
 func getReady(t *testing.T, r *EgressPolicyReconciler, name string) metav1.Condition {
 	t.Helper()
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(context.Background(), types.NamespacedName{Name: name}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestReconcile_PersistsEndpointAddr(t *testing.T) {
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile error: %v", err)
 	}
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestRehydrateVIPs_RegistersExistingThenNoCollision(t *testing.T) {
 	if err := reconcile(t, r, "tenant-new"); err != nil {
 		t.Fatalf("reconcile tenant-new: %v", err)
 	}
-	var nw srv6egressv1alpha1.EgressPolicy
+	var nw srv6egressv1.EgressPolicy
 	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-new"}, &nw); err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 		WithScheme(s).
 		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
 			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
-		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
 		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
@@ -321,7 +321,7 @@ func TestReconcile_DeleteUsesAnnouncedColorNotSpec(t *testing.T) {
 	}
 
 	// Edit spec.egress.color to 200 (simulate a spec change), then delete.
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +402,7 @@ func newBackboneReconciler(t *testing.T, svc *recordingServiceBGP) *EgressPolicy
 		WithScheme(s).
 		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
 			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
-		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		Build()
 	return &EgressPolicyReconciler{
 		Client: c, Scheme: s, Config: backboneConfig(),
@@ -432,7 +432,7 @@ func TestReconcile_BackboneAnnouncesVIP(t *testing.T) {
 		t.Fatalf("service route = %+v", got)
 	}
 
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +458,7 @@ func TestReconcile_DeleteWithdrawsBackboneRoute(t *testing.T) {
 	if err := reconcile(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,7 @@ func TestReconcile_BackboneFailureKeepsReady(t *testing.T) {
 	if err := reconcile(t, r, "tenant-a"); err == nil {
 		t.Fatal("expected backbone announce error to surface for requeue")
 	}
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -522,10 +522,10 @@ func TestReconcile_WithdrawableAfterStatusWriteFailure(t *testing.T) {
 		WithScheme(s).
 		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
 			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
-		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-				if _, ok := obj.(*srv6egressv1alpha1.EgressPolicy); ok && sub == "status" {
+				if _, ok := obj.(*srv6egressv1.EgressPolicy); ok && sub == "status" {
 					statusWrites++
 					if statusWrites == 2 { // the Ready write, right after Announce
 						return apierrors.NewConflict(
@@ -547,7 +547,7 @@ func TestReconcile_WithdrawableAfterStatusWriteFailure(t *testing.T) {
 	}
 
 	// Policy is deleted before any retry succeeds.
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +577,7 @@ func TestReconcile_SpecEditWithdrawsOldAnnounce(t *testing.T) {
 		WithScheme(s).
 		WithObjects(egressNode("egress-1"), ippool("tenant-egress-pool", "Tunnel"),
 			newPolicy("tenant-a", "uid-a", 100, "tenant-egress-pool")).
-		WithStatusSubresource(&srv6egressv1alpha1.EgressPolicy{}).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
 		Build()
 	r := &EgressPolicyReconciler{Client: c, Scheme: s, Config: testConfig(),
 		VIPs: vipalloc.NewInMemory(), BGP: rec, Encoder: bgp.NewColoredEncoder(), Pools: poolvalidator.NewCalico(c)}
@@ -586,7 +586,7 @@ func TestReconcile_SpecEditWithdrawsOldAnnounce(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
 		t.Fatal(err)
 	}

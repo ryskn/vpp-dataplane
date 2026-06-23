@@ -1,4 +1,4 @@
-// bgp-controller is the central reconciler for EgressPolicy v1alpha1.
+// bgp-controller is the central reconciler for EgressPolicy v1.
 //
 // Responsibilities:
 //   - Watch EgressPolicy CRDs across the cluster
@@ -27,7 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/controller"
@@ -41,7 +41,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(srv6egressv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(srv6egressv1.AddToScheme(scheme))
 }
 
 func main() {
@@ -215,9 +215,9 @@ func main() {
 	}
 }
 
-// versionString is intentionally unfilled in v1alpha1; ldflags inject later.
+// versionString is intentionally unfilled in v1; ldflags inject later.
 var (
-	buildVersion = "v1alpha1-dev"
+	buildVersion = "v1-dev"
 	buildCommit  = "unknown"
 )
 

@@ -7,7 +7,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 // VPPGateway is the seam for the egress-gateway (endpoint) data path. The
@@ -77,7 +77,7 @@ func (r GatewayRequest) key() string {
 // gwState tracks a policy this node is the endpoint for, and the gateway entry
 // it provisioned.
 type gwState struct {
-	policy  *srv6egressv1alpha1.EgressPolicy
+	policy  *srv6egressv1.EgressPolicy
 	install *GatewayRequest // nil until provisioned
 }
 
@@ -124,7 +124,7 @@ func NewGatewayManager(log *logrus.Entry, vpp VPPGateway, nodeName string,
 }
 
 // OnPolicyUpdate is called for create+update events on EgressPolicy.
-func (m *GatewayManager) OnPolicyUpdate(ep *srv6egressv1alpha1.EgressPolicy) {
+func (m *GatewayManager) OnPolicyUpdate(ep *srv6egressv1.EgressPolicy) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -232,7 +232,7 @@ func (m *GatewayManager) teardownLocked(uid string, st *gwState) {
 
 // desired returns whether this node should provision a gateway entry for ep,
 // and the (VRF-unallocated) request describing it.
-func (m *GatewayManager) desired(ep *srv6egressv1alpha1.EgressPolicy) (bool, GatewayRequest) {
+func (m *GatewayManager) desired(ep *srv6egressv1.EgressPolicy) (bool, GatewayRequest) {
 	if ep == nil || !isReady(ep) {
 		return false, GatewayRequest{}
 	}

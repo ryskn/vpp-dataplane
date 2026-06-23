@@ -15,7 +15,7 @@ spec:
   nodeSelector: '!all()'
   disabled: true          # not used for normal pod IPAM
 ---
-apiVersion: srv6egress.ryskn.io/v1alpha1
+apiVersion: srv6egress.ryskn.io/v1
 kind: EgressPolicy
 metadata:
   name: tenant-a-via-isp-a
@@ -36,7 +36,7 @@ spec:
     egressIPPool: tenant-egress-pool
 ---
 # A second policy: tenant-b uses ISP-B (color 200), demonstrating per-tenant path selection.
-apiVersion: srv6egress.ryskn.io/v1alpha1
+apiVersion: srv6egress.ryskn.io/v1
 kind: EgressPolicy
 metadata:
   name: tenant-b-via-isp-b

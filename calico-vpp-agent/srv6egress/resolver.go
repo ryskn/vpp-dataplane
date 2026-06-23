@@ -14,7 +14,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 const resolverResync = 5 * time.Minute
@@ -106,7 +106,7 @@ func (r *PodResolverImpl) Start(stopCh <-chan struct{}) error {
 // selector: namespaces matched by NamespaceSelector ∩ pods matched by
 // PodSelector (the pod cache is already node-scoped). A nil selector field
 // matches everything in its scope.
-func (r *PodResolverImpl) MatchingLocalPodIPs(sel srv6egressv1alpha1.Selector) ([]net.IP, error) {
+func (r *PodResolverImpl) MatchingLocalPodIPs(sel srv6egressv1.Selector) ([]net.IP, error) {
 	nsSelector, err := asSelector(sel.NamespaceSelector)
 	if err != nil {
 		return nil, fmt.Errorf("invalid namespaceSelector: %w", err)
@@ -137,7 +137,7 @@ func (r *PodResolverImpl) MatchingLocalPodIPs(sel srv6egressv1alpha1.Selector) (
 		for _, podIP := range p.Status.PodIPs {
 			ip := net.ParseIP(podIP.IP)
 			if ip == nil || ip.To4() != nil {
-				continue // IPv6 only for v1alpha1
+				continue // IPv6 only for v1
 			}
 			ips = append(ips, ip)
 		}

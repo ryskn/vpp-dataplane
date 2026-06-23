@@ -34,7 +34,7 @@ Two orthogonal layers:
 | `hw-fabric-underlay.drawio` | switch as a hardware L3-ECMP underlay; SRv6 endpoints stay in software (VPP / FRR+kernel) |
 | `full-feature-testbed.drawio` | full-feature testbed: 2 tenants × 2 colors × backbone, with the feature→test matrix |
 | `two-spine-clos.drawio` | 2-spine CLOS variant (multi-spine ECMP + fabric failover; needs a 2nd switch) |
-| `v1alpha2-lo-stitch.drawio` | tenant-VRF × path-VRF stitch model (loopback as the stitch anchor) |
+| `backbone-lo-stitch.drawio` | tenant-VRF × path-VRF stitch model (loopback as the stitch anchor) |
 
 `testbed-runbook.md` is the concrete build runbook for `full-feature-testbed`:
 per-tier config (spine SONiC / leaf FRR / egress-GW VPP+gobgp / PE·P

@@ -7,7 +7,7 @@ import (
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 // Manager is the per-node coordinator. It holds the current set of active
@@ -46,7 +46,7 @@ func NewManagerWithResolver(log *logrus.Entry, vpp VPPInterface, pods PodResolve
 
 // OnPolicyUpdate is called for create + update events on EgressPolicy.
 // The Manager replaces the cached policy and reconciles installs.
-func (m *Manager) OnPolicyUpdate(ep *srv6egressv1alpha1.EgressPolicy) {
+func (m *Manager) OnPolicyUpdate(ep *srv6egressv1.EgressPolicy) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -145,12 +145,12 @@ func (m *Manager) reconcileLocked(st *policyState) {
 // lifecycle can be exercised without informers.
 type nopResolver struct{}
 
-func (nopResolver) MatchingLocalPodIPs(srv6egressv1alpha1.Selector) ([]net.IP, error) {
+func (nopResolver) MatchingLocalPodIPs(srv6egressv1.Selector) ([]net.IP, error) {
 	return nil, nil
 }
 
 // isReady returns true once the controller has marked the policy Ready=True.
-func isReady(ep *srv6egressv1alpha1.EgressPolicy) bool {
+func isReady(ep *srv6egressv1.EgressPolicy) bool {
 	for _, c := range ep.Status.Conditions {
 		if c.Type == "Ready" && c.Status == metav1.ConditionTrue {
 			return true

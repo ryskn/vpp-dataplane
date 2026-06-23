@@ -14,7 +14,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 // Watcher subscribes to EgressPolicy events and dispatches them to the
@@ -38,7 +38,7 @@ func (w *Watcher) SetGatewayManager(g *GatewayManager) { w.gateway = g }
 func NewWatcher(log *logrus.Entry, cfg *rest.Config, mgr *Manager) (*Watcher, error) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(srv6egressv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(srv6egressv1.AddToScheme(scheme))
 
 	c, err := ctrlclient.NewWithWatch(cfg, ctrlclient.Options{Scheme: scheme})
 	if err != nil {
@@ -63,7 +63,7 @@ func (w *Watcher) Watch(t *tomb.Tomb) error {
 	// List-then-watch: feed the current state, prune policies deleted while no
 	// watch was running (their Deleted events are gone for good), then watch
 	// from the list's resourceVersion so nothing in between is missed.
-	var list srv6egressv1alpha1.EgressPolicyList
+	var list srv6egressv1.EgressPolicyList
 	if err := w.client.List(ctx, &list); err != nil {
 		return err
 	}
@@ -108,7 +108,7 @@ func (w *Watcher) Watch(t *tomb.Tomb) error {
 func (w *Watcher) handleEvent(ev watch.Event) {
 	switch ev.Type {
 	case watch.Added, watch.Modified:
-		ep, ok := ev.Object.(*srv6egressv1alpha1.EgressPolicy)
+		ep, ok := ev.Object.(*srv6egressv1.EgressPolicy)
 		if !ok {
 			w.log.WithField("type", ev.Type).Warn("unexpected object type in watch event")
 			return
@@ -118,7 +118,7 @@ func (w *Watcher) handleEvent(ev watch.Event) {
 			w.gateway.OnPolicyUpdate(ep)
 		}
 	case watch.Deleted:
-		ep, ok := ev.Object.(*srv6egressv1alpha1.EgressPolicy)
+		ep, ok := ev.Object.(*srv6egressv1.EgressPolicy)
 		if !ok {
 			w.log.WithField("type", ev.Type).Warn("delete event with unexpected object type")
 			return

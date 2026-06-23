@@ -1,7 +1,7 @@
 // Package controller implements the EgressPolicy reconcile loop.
 //
 // On a watched EgressPolicy event the reconciler:
-//  1. resolves the endpoint (exactly one node, per v1alpha1)
+//  1. resolves the endpoint (exactly one node, per v1)
 //  2. resolves <color, endpoint> to a segment list via the controller config
 //  3. allocates a per-tenant VIP from the named Calico IPPool
 //  4. withdraws a previously announced SR Policy whose key drifted (spec edit)
@@ -25,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerruntimecfg "sigs.k8s.io/controller-runtime/pkg/controller"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/bgp"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/poolvalidator"
@@ -67,7 +67,7 @@ type EgressPolicyReconciler struct {
 func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	var ep srv6egressv1alpha1.EgressPolicy
+	var ep srv6egressv1.EgressPolicy
 	if err := r.Get(ctx, req.NamespacedName, &ep); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -110,7 +110,7 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // ensureFinalizer adds the finalizer if missing. It returns done=true when the
 // caller must stop this pass — either because the add failed, or because it
 // succeeded and the object should be requeued to pick up the update.
-func (r *EgressPolicyReconciler) ensureFinalizer(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy) (ctrl.Result, bool, error) {
+func (r *EgressPolicyReconciler) ensureFinalizer(ctx context.Context, ep *srv6egressv1.EgressPolicy) (ctrl.Result, bool, error) {
 	if containsString(ep.Finalizers, finalizerName) {
 		return ctrl.Result{}, false, nil
 	}
@@ -133,7 +133,7 @@ type reconcilePlan struct {
 // resolvePlan resolves the color config, the egress endpoint (exactly one
 // node), and enforces RFC 9256 §2 <color, endpoint> uniqueness. On any failure
 // it marks the policy not-ready and returns the error to requeue.
-func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy) (*reconcilePlan, ctrl.Result, error) {
+func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egressv1.EgressPolicy) (*reconcilePlan, ctrl.Result, error) {
 	cc, ok := r.Config.Colors[ep.Spec.Egress.Color]
 	if !ok {
 		res, err := r.markNotReady(ctx, ep, "UnknownColor",
@@ -163,7 +163,7 @@ func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egress
 // recorded in status (so the in-memory allocator never reissues it after a
 // restart), or validates the pool and allocates a new one. Allocation is
 // idempotent by EgressPolicy UID.
-func (r *EgressPolicyReconciler) ensureVIP(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy) (string, ctrl.Result, error) {
+func (r *EgressPolicyReconciler) ensureVIP(ctx context.Context, ep *srv6egressv1.EgressPolicy) (string, ctrl.Result, error) {
 	owner := string(ep.UID)
 	if vip := ep.Status.EgressIP; vip != "" {
 		if err := r.VIPs.Register(ctx, owner, vip); err != nil {
@@ -187,10 +187,10 @@ func (r *EgressPolicyReconciler) ensureVIP(ctx context.Context, ep *srv6egressv1
 // withdraw a drifted prior announce, persist the announce intent BEFORE
 // announcing (persist-then-announce, so deletion can always rebuild an exact
 // withdraw), announce, then record the effective BSID and mark Ready.
-func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy, plan *reconcilePlan, vip string) (ctrl.Result, error) {
+func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6egressv1.EgressPolicy, plan *reconcilePlan, vip string) (ctrl.Result, error) {
 	owner := string(ep.UID)
 	cc := plan.cc
-	intent := &srv6egressv1alpha1.SRPolicyStatus{
+	intent := &srv6egressv1.SRPolicyStatus{
 		BSID:         cc.BSID,
 		Color:        ep.Spec.Egress.Color,
 		SegmentList:  cc.SegmentList,
@@ -252,7 +252,7 @@ func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6
 // BackboneAdvertised condition. It is a no-op when no upstream is stitched to a
 // backbone; a failure does not clobber Ready (cluster-side steering already
 // works) but requeues.
-func (r *EgressPolicyReconciler) stitchBackbone(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy, plan *reconcilePlan, vip string) (ctrl.Result, error) {
+func (r *EgressPolicyReconciler) stitchBackbone(ctx context.Context, ep *srv6egressv1.EgressPolicy, plan *reconcilePlan, vip string) (ctrl.Result, error) {
 	advertised, err := r.reconcileBackbone(ctx, ep, plan.cc, vip)
 	if err != nil {
 		setCondition(ep, "BackboneAdvertised", metav1.ConditionFalse, "AnnounceFailed", err.Error())
@@ -276,7 +276,7 @@ func (r *EgressPolicyReconciler) stitchBackbone(ctx context.Context, ep *srv6egr
 // stale-withdraw on drift, persist-then-announce, idempotent re-announce.
 // Returns (false, nil) when backbone mode is off or the upstream has no
 // backbone peer.
-func (r *EgressPolicyReconciler) reconcileBackbone(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy, cc config.ColorConfig, vip string) (bool, error) {
+func (r *EgressPolicyReconciler) reconcileBackbone(ctx context.Context, ep *srv6egressv1.EgressPolicy, cc config.ColorConfig, vip string) (bool, error) {
 	bb := r.Config.Backbone
 	if bb == nil {
 		return false, nil
@@ -294,7 +294,7 @@ func (r *EgressPolicyReconciler) reconcileBackbone(ctx context.Context, ep *srv6
 		return false, fmt.Errorf("egress VIP %q is not an IPv6 address (backbone advertise requires the Calico IPAM VIP backend)", vip)
 	}
 
-	intent := &srv6egressv1alpha1.BackboneStatus{
+	intent := &srv6egressv1.BackboneStatus{
 		Prefix:   vipIP.String() + "/128",
 		EndSID:   r.Config.Upstreams[cc.Upstream].SID,
 		Color:    bb.BackboneColor(ep.Spec.Egress.Color),
@@ -328,7 +328,7 @@ func (r *EgressPolicyReconciler) reconcileBackbone(ctx context.Context, ep *srv6
 
 // serviceRouteFromStatus rebuilds the announce/withdraw payload from the
 // persisted status record.
-func serviceRouteFromStatus(s *srv6egressv1alpha1.BackboneStatus) bgp.ServiceRoute {
+func serviceRouteFromStatus(s *srv6egressv1.BackboneStatus) bgp.ServiceRoute {
 	return bgp.ServiceRoute{
 		Prefix:   s.Prefix,
 		EndSID:   s.EndSID,
@@ -341,11 +341,11 @@ func serviceRouteFromStatus(s *srv6egressv1alpha1.BackboneStatus) bgp.ServiceRou
 // serviceAdvert builds the backbone Advertisement from the persisted status
 // record. The path is rebuilt deterministically, so withdraw works across a
 // controller restart.
-func serviceAdvert(s *srv6egressv1alpha1.BackboneStatus) bgp.ServiceAdvert {
+func serviceAdvert(s *srv6egressv1.BackboneStatus) bgp.ServiceAdvert {
 	return bgp.ServiceAdvert{Route: serviceRouteFromStatus(s), Structure: bgp.DefaultSIDStructure}
 }
 
-func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy) (ctrl.Result, error) {
+func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6egressv1.EgressPolicy) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 	if !containsString(ep.Finalizers, finalizerName) {
 		return ctrl.Result{}, nil
@@ -400,12 +400,12 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 	return ctrl.Result{}, nil
 }
 
-// resolveEndpoint enforces the v1alpha1 invariant: exactly one node must match.
+// resolveEndpoint enforces the v1 invariant: exactly one node must match.
 // It returns the node name (identity) and its IPv6 address (the SR Policy SAFI
 // endpoint). The address is best-effort: an empty string is returned when the
 // node exposes no IPv6 InternalIP, which only the SR Policy SAFI encoding cares
 // about (it then rejects the policy with a clear error).
-func (r *EgressPolicyReconciler) resolveEndpoint(ctx context.Context, es srv6egressv1alpha1.EndpointSelector) (name, addr string, err error) {
+func (r *EgressPolicyReconciler) resolveEndpoint(ctx context.Context, es srv6egressv1.EndpointSelector) (name, addr string, err error) {
 	if es.NodeSelector == nil {
 		return "", "", fmt.Errorf("endpointSelector.nodeSelector is required")
 	}
@@ -428,7 +428,7 @@ func (r *EgressPolicyReconciler) resolveEndpoint(ctx context.Context, es srv6egr
 		for i := range nodes.Items {
 			names = append(names, nodes.Items[i].Name)
 		}
-		return "", "", fmt.Errorf("v1alpha1 requires exactly one matching node, got %d: %v", len(nodes.Items), names)
+		return "", "", fmt.Errorf("v1 requires exactly one matching node, got %d: %v", len(nodes.Items), names)
 	}
 }
 
@@ -451,8 +451,8 @@ func nodeIPv6(node *corev1.Node) string {
 // resolved endpoint in status.activeEndpoint. Reconciles are serialized
 // (MaxConcurrentReconciles=1), so the first writer wins and later duplicates
 // are rejected deterministically.
-func (r *EgressPolicyReconciler) findColorEndpointConflict(ctx context.Context, me *srv6egressv1alpha1.EgressPolicy, endpoint string) (string, error) {
-	var list srv6egressv1alpha1.EgressPolicyList
+func (r *EgressPolicyReconciler) findColorEndpointConflict(ctx context.Context, me *srv6egressv1.EgressPolicy, endpoint string) (string, error) {
+	var list srv6egressv1.EgressPolicyList
 	if err := r.List(ctx, &list); err != nil {
 		return "", fmt.Errorf("list egresspolicies: %w", err)
 	}
@@ -472,7 +472,7 @@ func (r *EgressPolicyReconciler) findColorEndpointConflict(ctx context.Context, 
 	return "", nil
 }
 
-func (r *EgressPolicyReconciler) markNotReady(ctx context.Context, ep *srv6egressv1alpha1.EgressPolicy, reason, message string) (ctrl.Result, error) {
+func (r *EgressPolicyReconciler) markNotReady(ctx context.Context, ep *srv6egressv1.EgressPolicy, reason, message string) (ctrl.Result, error) {
 	setReady(ep, metav1.ConditionFalse, reason, message)
 	if err := r.Status().Update(ctx, ep); err != nil {
 		return ctrl.Result{}, err
@@ -484,7 +484,7 @@ func (r *EgressPolicyReconciler) markNotReady(ctx context.Context, ep *srv6egres
 // status records. BSID is deliberately excluded: the colored-route encoding
 // reports the terminal SID as the effective BSID after announce, which must
 // not register as drift on the next reconcile (it would flap Ready).
-func srPolicyIntentEqual(a, b *srv6egressv1alpha1.SRPolicyStatus) bool {
+func srPolicyIntentEqual(a, b *srv6egressv1.SRPolicyStatus) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
@@ -502,11 +502,11 @@ func srPolicyIntentEqual(a, b *srv6egressv1alpha1.SRPolicyStatus) bool {
 	return true
 }
 
-func setReady(ep *srv6egressv1alpha1.EgressPolicy, status metav1.ConditionStatus, reason, message string) {
+func setReady(ep *srv6egressv1.EgressPolicy, status metav1.ConditionStatus, reason, message string) {
 	setCondition(ep, "Ready", status, reason, message)
 }
 
-func setCondition(ep *srv6egressv1alpha1.EgressPolicy, condType string, status metav1.ConditionStatus, reason, message string) {
+func setCondition(ep *srv6egressv1.EgressPolicy, condType string, status metav1.ConditionStatus, reason, message string) {
 	cond := metav1.Condition{
 		Type:               condType,
 		Status:             status,
@@ -537,7 +537,7 @@ func setCondition(ep *srv6egressv1alpha1.EgressPolicy, condType string, status m
 // reader should be the manager's API reader (mgr.GetAPIReader()), which talks
 // directly to the API server and works before mgr.Start().
 func RehydrateVIPs(ctx context.Context, reader client.Reader, vips vipalloc.Allocator) (int, error) {
-	var list srv6egressv1alpha1.EgressPolicyList
+	var list srv6egressv1.EgressPolicyList
 	if err := reader.List(ctx, &list); err != nil {
 		return 0, fmt.Errorf("rehydrate: list egresspolicies: %w", err)
 	}
@@ -560,7 +560,7 @@ func RehydrateVIPs(ctx context.Context, reader client.Reader, vips vipalloc.Allo
 // check (findColorEndpointConflict) is first-writer-wins and deterministic.
 func (r *EgressPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&srv6egressv1alpha1.EgressPolicy{}).
+		For(&srv6egressv1.EgressPolicy{}).
 		WithOptions(controllerruntimecfg.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

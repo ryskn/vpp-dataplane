@@ -1,9 +1,9 @@
-// Package v1alpha1 contains API Schema definitions for the
-// srv6egress.ryskn.io v1alpha1 API group.
+// Package v1 contains API Schema definitions for the
+// srv6egress.ryskn.io v1 API group.
 //
 // +kubebuilder:object:generate=true
 // +groupName=srv6egress.ryskn.io
-package v1alpha1
+package v1
 
 import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -12,7 +12,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "srv6egress.ryskn.io", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "srv6egress.ryskn.io", Version: "v1"}
 
 	// SchemeBuilder is used to add Go types to the GroupVersionKind scheme.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

@@ -33,7 +33,7 @@ type Allocator interface {
 }
 
 // NewInMemory returns an in-memory allocator. Used for unit tests and the
-// v1alpha1 bring-up phase before Calico IPAM integration is wired up.
+// v1 bring-up phase before Calico IPAM integration is wired up.
 //
 // Each pool advances a per-pool counter; the returned address is a synthetic
 // placeholder of the form "pool:<poolName>:<counter>" so that misconfigurations
@@ -123,7 +123,7 @@ func parseSyntheticVIP(vip string) (pool string, n uint64, ok bool) {
 	return pool, n, true
 }
 
-// TODO(v1alpha1 → v1alpha1.1): replace inMemory with a CalicoIPAM allocator
+// TODO(v1 → v1.1): replace inMemory with a CalicoIPAM allocator
 // that calls projectcalico/calico's libcalico IPAM client to allocate /128
 // from the named IPPool (which carries allowedUses: [Tunnel] for isolation
 // from pod IPAM).

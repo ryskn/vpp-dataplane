@@ -23,20 +23,20 @@ allocates a per-tenant VIP, and distributes the SR Policy over BGP; the agent
 on the pod node (headend) installs the SR steering in VPP, and the agent on the
 egress gateway provisions the decap + per-tenant SNAT data path.
 
-### v1alpha1 and the "v1alpha2" BR mode
+### Backbone stitching (Border Router capability)
 
-The API version is `v1alpha1` — there is no separate v1alpha2 API. What the
-design notes call **v1alpha2** is the *Border Router* capability delivered
-through the same v1alpha1 CRD: the egress gateway additionally stitches the
-cluster SR domain to an operator SRv6 backbone (RFC 9252 service routes + RFC
-9012 Color), announced by the controller and recorded in
-`status.backbone`. It is opt-in via the controller config's `backbone:` section.
+The single `v1` API delivers two composable capabilities through one EgressPolicy
+CRD: cluster egress (SR Policy steering + per-tenant VIP SNAT), and optional
+**backbone stitching** — the egress gateway additionally stitches the cluster SR
+domain to an operator SRv6 backbone (RFC 9252 service routes + RFC 9012 Color),
+announced by the controller and recorded in `status.backbone`. It is opt-in via
+the controller config's `backbone:` section, not a separate API version or mode.
 
 ## Layout
 
 ```
 srv6egress/
-├── apis/v1alpha1/                     # Go types + DeepCopy (EgressPolicy, incl. BackboneStatus)
+├── apis/v1/                     # Go types + DeepCopy (EgressPolicy, incl. BackboneStatus)
 │   ├── groupversion_info.go
 │   ├── types.go
 │   └── zz_generated.deepcopy.go
@@ -79,7 +79,7 @@ until the bgp-controller reconciles it and the calico-vpp-agent (with the
 
 | Component | Status |
 |---|---|
-| EgressPolicy CRD + schema (v1alpha1, incl. `status.backbone`) | implemented |
+| EgressPolicy CRD + schema (v1, incl. `status.backbone`) | implemented |
 | bgp-controller (Calico IPAM VIPs + gobgp SR Policy SAFI 73, default production) | implemented |
 | bgp-controller BR mode (RFC 9252 service announce, persist-then-announce) | implemented (config-gated by `backbone:`) |
 | calico-vpp-agent headend steering | implemented (gate: `SRv6EgressEnabled`) |
@@ -98,11 +98,11 @@ re-inject) and **0007** (per-fib cnat SNAT).
 with controller-gen once it is installed:
 
 ```sh
-controller-gen object paths=./srv6egress/apis/v1alpha1/...
-controller-gen crd paths=./srv6egress/apis/v1alpha1/... output:crd:dir=./srv6egress/config/crd/bases
+controller-gen object paths=./srv6egress/apis/v1/...
+controller-gen crd paths=./srv6egress/apis/v1/... output:crd:dir=./srv6egress/config/crd/bases
 ```
 
-## Scope (v1alpha1)
+## Scope (v1)
 
 - IPv6 single-stack
 - Color steering (RFC 9256), color semantics defined by bgp-controller config

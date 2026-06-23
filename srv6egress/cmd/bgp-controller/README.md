@@ -1,6 +1,6 @@
 # bgp-controller
 
-Central reconciler for the `EgressPolicy` CRD (`srv6egress.ryskn.io/v1alpha1`).
+Central reconciler for the `EgressPolicy` CRD (`srv6egress.ryskn.io/v1`).
 
 ## What it does
 

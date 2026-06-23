@@ -5,7 +5,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 // steeringComputer turns a Ready EgressPolicy into the set of per-(pod, dest)
@@ -21,7 +21,7 @@ type steeringComputer struct {
 // desired builds the (pod × dest) SteeringRequest set for ep on this node. It
 // returns nil when the policy is not yet installable: no BSID resolved, no
 // usable IPv6 destinationCIDR, or local pod resolution failed.
-func (c *steeringComputer) desired(ep *srv6egressv1alpha1.EgressPolicy) []SteeringRequest {
+func (c *steeringComputer) desired(ep *srv6egressv1.EgressPolicy) []SteeringRequest {
 	if ep.Status.SRPolicy == nil || ep.Status.SRPolicy.BSID == "" {
 		return nil
 	}
@@ -49,7 +49,7 @@ func (c *steeringComputer) desired(ep *srv6egressv1alpha1.EgressPolicy) []Steeri
 	reqs := make([]SteeringRequest, 0, len(podIPs)*len(dests))
 	for _, ip := range podIPs {
 		if !isV6(ip) {
-			continue // IPv6 only for v1alpha1
+			continue // IPv6 only for v1
 		}
 		for _, dst := range dests {
 			reqs = append(reqs, SteeringRequest{
@@ -80,11 +80,11 @@ func parseV6DestCIDRs(cidrs []string) []*net.IPNet {
 }
 
 // isV6 reports whether ip is a non-nil IPv6 (non-IPv4) address. It centralizes
-// the "v1alpha1 is IPv6-only" predicate the steering and gateway paths share.
+// the "v1 is IPv6-only" predicate the steering and gateway paths share.
 func isV6(ip net.IP) bool { return ip != nil && ip.To4() == nil }
 
 // parseV6 parses s as an IPv6 address, returning nil when s is empty, malformed,
-// or IPv4 (v1alpha1 is IPv6-only).
+// or IPv4 (v1 is IPv6-only).
 func parseV6(s string) net.IP {
 	if ip := net.ParseIP(s); isV6(ip) {
 		return ip

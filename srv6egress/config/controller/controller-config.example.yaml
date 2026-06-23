@@ -35,7 +35,7 @@ colors:
     segmentList:
       - "fcff:0:0:e0:b::"
 
-# v1alpha2 BR mode (optional): stitch the cluster SR domain to an SRv6
+# backbone stitching (optional): stitch the cluster SR domain to an SRv6
 # backbone. Tenant VIPs are additionally announced on the per-upstream GW↔PE
 # eBGP sessions as RFC 9252 service routes (own End SID + Color Ext-Comm),
 # making the VIP SR-reachable from the backbone with the intent color intact.

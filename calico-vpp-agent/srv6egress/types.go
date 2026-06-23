@@ -3,7 +3,7 @@ package srv6egress
 import (
 	"net"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 // VPPInterface is the seam between this package and the actual VPP control
@@ -19,7 +19,7 @@ type VPPInterface interface {
 	// InstallSteering programs a steering entry for the (source pod, dest CIDR)
 	// pair into the pod's per-pod VRF, targeting the SR Policy identified by BSID.
 	//
-	// podIP and destPrefix may use either IPv4 or IPv6; v1alpha1 supports IPv6
+	// podIP and destPrefix may use either IPv4 or IPv6; v1 supports IPv6
 	// only (dual-stack End.DT4 / SrSteerIPv4 is future work).
 	InstallSteering(req SteeringRequest) error
 
@@ -36,7 +36,7 @@ type PodResolver interface {
 	// MatchingLocalPodIPs returns the IPv6 addresses of local (this-node) pods
 	// matching sel.NamespaceSelector + sel.PodSelector. A nil selector field
 	// matches everything in its scope (standard k8s LabelSelector semantics).
-	MatchingLocalPodIPs(sel srv6egressv1alpha1.Selector) ([]net.IP, error)
+	MatchingLocalPodIPs(sel srv6egressv1.Selector) ([]net.IP, error)
 }
 
 // SteeringRequest carries the information needed to install / remove a single
@@ -53,7 +53,7 @@ type SteeringRequest struct {
 // policyState tracks an active EgressPolicy and the steering entries it has
 // installed on this node.
 type policyState struct {
-	policy   *srv6egressv1alpha1.EgressPolicy
+	policy   *srv6egressv1.EgressPolicy
 	installs map[string]SteeringRequest // key = SteeringRequest.key()
 }
 

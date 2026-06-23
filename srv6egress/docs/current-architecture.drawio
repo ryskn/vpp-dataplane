@@ -60,7 +60,7 @@
         <mxCell id="ret_sr" value="戻り路（return）: un-SNAT 後 dst=pod → fd20::/64 → fib0 → SrSteer cafe::aaaa → SR encap &lt; fcff::11aa:…:31a4 &gt;（worker-1 の実 End.DT6 SID）→ worker-1 で decap → pod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8d7da;strokeColor=#b85450;align=center;fontSize=10;dashed=1;" vertex="1" parent="1">
           <mxGeometry x="400" y="480" width="580" height="56" as="geometry" />
         </mxCell>
-        <mxCell id="gw_note" value="⚠ 戻り路は agent が auto-provision しない（手動 cafe::aaaa 依存・GW restart で消える）= v1alpha2 コード gap" style="text;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#b85450;" vertex="1" parent="1">
+        <mxCell id="gw_note" value="⚠ 戻り路は agent が auto-provision しない（手動 cafe::aaaa 依存・GW restart で消える）= backbone stitching のコード gap" style="text;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#b85450;" vertex="1" parent="1">
           <mxGeometry x="400" y="544" width="580" height="40" as="geometry" />
         </mxCell>
         <mxCell id="gw_snat_note" value="patch 0006 = End.DT6.In（decap→ip6-input 再注入で cnat arc に乗せる）&#10;patch 0007 = cnat per-fib SNAT（テナント毎に VIP 隔離。fib=fib INDEX）" style="text;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#7a6000;" vertex="1" parent="1">

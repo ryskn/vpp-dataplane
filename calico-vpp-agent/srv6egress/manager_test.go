@@ -8,7 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 type fakeVPP struct {
@@ -37,14 +37,14 @@ func (f *fakeVPP) RemoveSteering(req SteeringRequest) error {
 // readyPolicy returns an EgressPolicy with Ready=True and a populated BSID.
 // The manager uses a no-op pod resolver here, so this test only verifies the
 // policy state lifecycle (add → delete).
-func readyPolicy(name, uid, bsid string) *srv6egressv1alpha1.EgressPolicy {
-	return &srv6egressv1alpha1.EgressPolicy{
+func readyPolicy(name, uid, bsid string) *srv6egressv1.EgressPolicy {
+	return &srv6egressv1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			UID:  types.UID(uid),
 		},
-		Status: srv6egressv1alpha1.EgressPolicyStatus{
-			SRPolicy: &srv6egressv1alpha1.SRPolicyStatus{
+		Status: srv6egressv1.EgressPolicyStatus{
+			SRPolicy: &srv6egressv1.SRPolicyStatus{
 				BSID:  bsid,
 				Color: 100,
 			},
@@ -77,7 +77,7 @@ func TestManager_NotReadyDeferred(t *testing.T) {
 	vpp := newFakeVPP()
 	m := NewManager(log, vpp)
 
-	ep := &srv6egressv1alpha1.EgressPolicy{
+	ep := &srv6egressv1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "tenant-pending",
 			UID:  types.UID("uid-p"),

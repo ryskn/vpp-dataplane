@@ -8,7 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	srv6egressv1alpha1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1alpha1"
+	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
 )
 
 type fakeGW struct {
@@ -32,14 +32,14 @@ func (f *fakeGW) RemoveGateway(req GatewayRequest) error {
 
 // gwPolicy builds a Ready EgressPolicy whose endpoint resolved to `endpoint`,
 // with a terminal SID, VIP and upstream in status.
-func gwPolicy(name, uid, endpoint, sid, vip, upstream string) *srv6egressv1alpha1.EgressPolicy {
-	return &srv6egressv1alpha1.EgressPolicy{
+func gwPolicy(name, uid, endpoint, sid, vip, upstream string) *srv6egressv1.EgressPolicy {
+	return &srv6egressv1.EgressPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uid)},
-		Status: srv6egressv1alpha1.EgressPolicyStatus{
+		Status: srv6egressv1.EgressPolicyStatus{
 			EgressIP:       vip,
 			ActiveEndpoint: endpoint,
 			Upstream:       upstream,
-			SRPolicy:       &srv6egressv1alpha1.SRPolicyStatus{SegmentList: []string{sid}},
+			SRPolicy:       &srv6egressv1.SRPolicyStatus{SegmentList: []string{sid}},
 			Conditions:     []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
 		},
 	}

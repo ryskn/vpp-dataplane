@@ -17,7 +17,7 @@ spec:
       - egpol
   scope: Cluster
   versions:
-    - name: v1alpha1
+    - name: v1
       served: true
       storage: true
       subresources:
@@ -200,7 +200,7 @@ spec:
                 backbone:
                   description: |
                     RFC 9252 SRv6 service route announced toward the backbone
-                    PE for this policy's VIP (v1alpha2 BR mode). Persisted
+                    PE for this policy's VIP (backbone stitching). Persisted
                     before announcing so deletion can rebuild the withdraw.
                   type: object
                   required:

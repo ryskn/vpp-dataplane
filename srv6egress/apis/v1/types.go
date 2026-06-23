@@ -1,7 +1,7 @@
-// Package v1alpha1 defines the EgressPolicy CRD types.
+// Package v1 defines the EgressPolicy CRD types.
 //
 // Design notes: see srv6egress/docs/.
-package v1alpha1
+package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,7 +47,7 @@ type EgressPolicySpec struct {
 
 	// DestinationCIDRs restricts the policy to traffic destined to these CIDRs.
 	// When empty, the policy applies to all off-cluster destinations.
-	// Each entry MUST be a valid IPv6 CIDR for v1alpha1.
+	// Each entry MUST be a valid IPv6 CIDR for v1.
 	// +optional
 	DestinationCIDRs []string `json:"destinationCIDRs,omitempty"`
 
@@ -70,7 +70,7 @@ type Selector struct {
 
 // EgressSpec declares the egress endpoint, intent (color), and VIP allocation.
 type EgressSpec struct {
-	// EndpointSelector selects the egress gateway node. v1alpha1 requires
+	// EndpointSelector selects the egress gateway node. v1 requires
 	// exactly one node to match; the controller rejects policies whose
 	// selector matches zero or more than one node.
 	EndpointSelector EndpointSelector `json:"endpointSelector"`
@@ -90,7 +90,7 @@ type EgressSpec struct {
 
 // EndpointSelector selects the egress gateway node.
 type EndpointSelector struct {
-	// NodeSelector matches the egress gateway node. v1alpha1 enforces a
+	// NodeSelector matches the egress gateway node. v1 enforces a
 	// single-node match in the controller.
 	NodeSelector *metav1.LabelSelector `json:"nodeSelector"`
 }
