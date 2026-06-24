@@ -56,7 +56,11 @@ func (s *Server) egressSteer(req srv6egress.SteeringRequest) (*types.SrSteer, er
 		TrafficType: types.SrSteerIPv6,
 		FibTable:    vrf,
 		Prefix:      prefix,
-		Bsid:        types.ToVppIP6Address(req.BSID),
+		// L3 steering selects the FIB by FibTable; SwIfIndex must be ~0 (InvalidID,
+		// the API default), not 0 — a 0 makes VPP try to derive the table from
+		// interface 0 and reject it ("Invalid sw_if_index"), ignoring FibTable.
+		SwIfIndex: vpplink.InvalidID,
+		Bsid:      types.ToVppIP6Address(req.BSID),
 	}, nil
 }
 
