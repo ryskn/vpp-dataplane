@@ -7,17 +7,21 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
+	"github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings/interface_types"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
 )
 
 // tenantLocalsid builds the End.DT6 localsid for the tenant SID, decapping into
-// its VRF. A uSID upstream carries the SID structure so the wrapper programs it
-// as a uDT6 via the v2 API; otherwise it is a classic End.DT6.
+// its VRF. The decap VRF table is carried in SwIfIndex (the VPP API's
+// xconnect_iface_or_vrf_table field for End.DT behaviors), NOT FibTable —
+// FibTable is the table the SID itself is installed in (the main table 0, so the
+// arriving SR packets match it). A uSID upstream additionally carries the SID
+// structure (programmed via the v2 API).
 func tenantLocalsid(req GatewayRequest) *types.SrLocalsid {
 	ls := &types.SrLocalsid{
-		Localsid: types.ToVppIP6Address(req.TenantSID),
-		Behavior: types.SrBehaviorDT6,
-		FibTable: req.VrfTable,
+		Localsid:  types.ToVppIP6Address(req.TenantSID),
+		Behavior:  types.SrBehaviorDT6,
+		SwIfIndex: interface_types.InterfaceIndex(req.VrfTable),
 	}
 	if req.USID {
 		ls.LocatorBlockLen = req.LocatorBlockLen
