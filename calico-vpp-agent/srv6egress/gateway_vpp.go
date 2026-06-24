@@ -107,15 +107,37 @@ func (g *vppGateway) bindVRFs(vrf, upstreamTable uint32) error {
 	return g.cliOK(fmt.Sprintf("ip6 table add %d", vrf), "already")
 }
 
+// localsidExists reports whether a localsid with ls's address is already
+// installed in VPP (AddSRv6Localsid is not idempotent, so callers check first).
+func (g *vppGateway) localsidExists(ls *types.SrLocalsid) bool {
+	list, err := g.vpp.ListSRv6Localsid()
+	if err != nil {
+		return false
+	}
+	for _, l := range list {
+		if l.Localsid == ls.Localsid {
+			return true
+		}
+	}
+	return false
+}
+
 // installTenantDataPath installs the End.DT6 decap, the egress default route, and
 // (if configured) the shared return aggregate.
 func (g *vppGateway) installTenantDataPath(req GatewayRequest) error {
 	vrf := req.VrfTable
 	// End.DT6 (or uDT6 for a uSID upstream): decap straight into the tenant VRF
 	// FIB. No SNAT, no loopback; the pod source address is preserved (L3VPN).
-	// AddSRv6Localsid is idempotent (re-adding the same localsid is a no-op in VPP).
-	if err := g.vpp.AddSRv6Localsid(tenantLocalsid(req)); err != nil {
-		return fmt.Errorf("install tenant localsid %s: %w", req.TenantSID, err)
+	// AddSRv6Localsid is NOT idempotent (VPP errors on re-adding an existing
+	// localsid), and the manager re-runs InstallGateway after an agent restart
+	// (VPP keeps the localsid across an agent-only restart, so st.install is lost
+	// but the SID persists). Skip the add when the SID is already present —
+	// otherwise the failing re-add would block the post-install SID advertisement.
+	ls := tenantLocalsid(req)
+	if !g.localsidExists(ls) {
+		if err := g.vpp.AddSRv6Localsid(ls); err != nil {
+			return fmt.Errorf("install tenant localsid %s: %w", req.TenantSID, err)
+		}
 	}
 	// egress: the tenant VRF default leaves via the shared upstream VRF.
 	if err := g.cliOK(fmt.Sprintf("ip route add ::/0 table %d via ip6-lookup-in-table %d", vrf, req.UpstreamTable), "already", "exist"); err != nil {
