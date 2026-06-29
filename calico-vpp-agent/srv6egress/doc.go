@@ -13,14 +13,17 @@
 // the same mechanism as `steerNodeIPViaSID` (PR #1028) but driven by an
 // EgressPolicy selector instead of node-to-node reachability.
 //
-// Egress gateway / Border Router (endpoint node): when this node is the
-// policy's resolved endpoint, GatewayManager provisions the per-tenant data
-// path — a dedicated VRF with End.DT6.In decap, per-fib cnat SNAT (pod → VIP),
-// and inter-VRF stitch to the upstream VRF — and advertises the tenant SID over
-// BGP for cluster reachability. End.DT6.In and per-fib SNAT are private local
-// VPP patches (0006/0007), so this path is driven via CLI. The backbone (BR)
-// leg — RFC 9252 VIP service routes + Color — is announced by the
-// bgp-controller, not by the agent.
+// Egress gateway (endpoint node): when this node is the policy's resolved
+// endpoint, GatewayManager provisions the per-tenant data path — a dedicated
+// per-tenant VRF, a stock End.DT6 localsid that decaps the tenant SID into that
+// VRF, an inter-VRF default route from the tenant VRF to the shared upstream
+// VRF, and (optionally) a shared return aggregate (cluster pod CIDR ->
+// lookup-in-table the cluster VRF) — and advertises the tenant SID over BGP for
+// cluster reachability. It is NAT-less L3VPN: no VIP and no SNAT; the pod source
+// address is preserved end to end. The tenant SID is a classic End.DT6 or, per
+// upstream, a uSID (uDT6 via the v2 localsid API). The whole path uses stock
+// vpplink calls (no private VPP patches). The shared per-upstream cluster-return
+// route is announced once by the bgp-controller, not by the agent.
 //
 // Design notes: see srv6egress/docs/.
 package srv6egress
