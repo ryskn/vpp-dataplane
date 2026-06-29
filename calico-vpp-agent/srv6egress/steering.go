@@ -22,12 +22,11 @@ type steeringComputer struct {
 // returns nil when the policy is not yet installable: no BSID resolved, no
 // usable IPv6 destinationCIDR, or local pod resolution failed.
 func (c *steeringComputer) desired(ep *srv6egressv1.EgressPolicy) []SteeringRequest {
-	if ep.Status.SRPolicy == nil || ep.Status.SRPolicy.BSID == "" {
-		return nil
-	}
-	bsid := net.ParseIP(ep.Status.SRPolicy.BSID)
+	bsid := policyBSID(ep)
 	if bsid == nil {
-		c.log.WithField("bsid", ep.Status.SRPolicy.BSID).Warn("status.srPolicy.bsid is not a valid IP")
+		if ep.Status.SRPolicy != nil && ep.Status.SRPolicy.BSID != "" {
+			c.log.WithField("bsid", ep.Status.SRPolicy.BSID).Warn("status.srPolicy.bsid is not a valid IP")
+		}
 		return nil
 	}
 

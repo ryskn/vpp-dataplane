@@ -35,6 +35,51 @@ func (s *Server) RemoveSteering(req srv6egress.SteeringRequest) error {
 	return s.vpp.DelSRv6Steering(steer)
 }
 
+// InstallBlackhole implements srv6egress.VPPInterface. It installs a drop route
+// for req.DestPrefix in the owning pod's per-pod IPv6 VRF so that, while the SR
+// Policy is unavailable, the pod's traffic is dropped (fail-closed) instead of
+// leaking out via the node default egress.
+func (s *Server) InstallBlackhole(req srv6egress.SteeringRequest) error {
+	route, err := s.egressBlackholeRoute(req)
+	if err != nil {
+		return err
+	}
+	return s.vpp.RouteAdd(route)
+}
+
+// RemoveBlackhole implements srv6egress.VPPInterface. Idempotent: a delete for
+// an absent route is logged and treated as success by callers.
+func (s *Server) RemoveBlackhole(req srv6egress.SteeringRequest) error {
+	route, err := s.egressBlackholeRoute(req)
+	if err != nil {
+		return err
+	}
+	if err := s.vpp.RouteDel(route); err != nil {
+		s.log.WithError(err).Warnf("cni(egress) del blackhole %s in vrf %d (continuing)", req.DestPrefix, route.Table)
+	}
+	return nil
+}
+
+// egressBlackholeRoute builds the per-pod-VRF drop route for an egress
+// SteeringRequest, resolving the owning pod's IPv6 VRF from the local pod cache.
+func (s *Server) egressBlackholeRoute(req srv6egress.SteeringRequest) (*types.Route, error) {
+	if req.PodIP == nil || req.DestPrefix == nil {
+		return nil, fmt.Errorf("egress blackhole: incomplete request %+v", req)
+	}
+	vrf, ok := s.podV6VrfForIP(req.PodIP)
+	if !ok {
+		return nil, fmt.Errorf("egress blackhole: no local pod with IP %s", req.PodIP)
+	}
+	if vrf == vpplink.InvalidID {
+		return nil, fmt.Errorf("egress blackhole: pod %s has no v6 VRF yet", req.PodIP)
+	}
+	return &types.Route{
+		Dst:   req.DestPrefix,
+		Table: vrf,
+		Paths: []types.RoutePath{{IsDrop: true}},
+	}, nil
+}
+
 // egressSteer builds the SrSteer for an egress SteeringRequest, resolving the
 // owning pod's per-pod IPv6 VRF from the local pod cache.
 func (s *Server) egressSteer(req srv6egress.SteeringRequest) (*types.SrSteer, error) {

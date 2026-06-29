@@ -164,6 +164,16 @@ spec:
                       format: int64
                       minimum: 1
                       maximum: 4294967295
+                    onUnavailable:
+                      description: |
+                        Behavior when the resolved SR Policy (BSID) is absent in
+                        the dataplane (withdrawn or not yet installed). "Drop"
+                        blackholes destinationCIDRs so traffic does not leak via
+                        the node default egress (fail-closed); "Fallback" removes
+                        the steering so traffic uses the node default egress
+                        (fail-open). Defaults to "Drop".
+                      type: string
+                      enum: [Drop, Fallback]
             status:
               type: object
               properties:

@@ -80,6 +80,16 @@ type EgressSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=4294967295
 	Color uint32 `json:"color"`
+
+	// OnUnavailable selects behavior when the resolved SR Policy (BSID) is not
+	// present in the dataplane (withdrawn or not yet installed): "Drop" keeps a
+	// blackhole for destinationCIDRs so traffic does not leak via the node's
+	// default egress (fail-closed; preserves path intent); "Fallback" removes the
+	// steering so traffic uses the node default egress (fail-open). Defaults to
+	// "Drop".
+	// +kubebuilder:validation:Enum=Drop;Fallback
+	// +optional
+	OnUnavailable string `json:"onUnavailable,omitempty"`
 }
 
 // EndpointSelector selects the egress gateway node.

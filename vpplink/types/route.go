@@ -30,6 +30,9 @@ type RoutePath struct {
 	IsAttached bool
 	Preference uint8
 	RpfID      uint32
+	// IsDrop installs a blackhole path (FIB_API_PATH_TYPE_DROP): traffic
+	// matching the route is silently dropped instead of forwarded.
+	IsDrop bool
 }
 
 type Route struct {
@@ -90,6 +93,9 @@ func (p *RoutePath) ToFibPath(isIP6 bool) fib_types.FibPath {
 	}
 	if p.IsAttached {
 		fibPath.Flags |= fib_types.FIB_API_PATH_FLAG_RESOLVE_VIA_ATTACHED
+	}
+	if p.IsDrop {
+		fibPath.Type = fib_types.FIB_API_PATH_TYPE_DROP
 	}
 	if p.Gw != nil {
 		fibPath.Nh.Address = ToVppAddress(p.Gw).Un

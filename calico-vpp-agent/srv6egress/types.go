@@ -26,6 +26,12 @@ type VPPInterface interface {
 	// RemoveSteering undoes a previous InstallSteering for the same request key.
 	// Safe to call when no install exists (returns nil).
 	RemoveSteering(req SteeringRequest) error
+
+	// InstallBlackhole installs a drop route for the (pod, dest) pair in the
+	// pod's per-pod VRF so traffic to DestPrefix is dropped instead of leaving
+	// via the node default egress while the SR Policy is unavailable.
+	InstallBlackhole(req SteeringRequest) error
+	RemoveBlackhole(req SteeringRequest) error
 }
 
 // PodResolver resolves an EgressPolicy selector to the IPv6 addresses of the
@@ -55,6 +61,10 @@ type SteeringRequest struct {
 type policyState struct {
 	policy   *srv6egressv1.EgressPolicy
 	installs map[string]SteeringRequest // key = SteeringRequest.key()
+	// blackholes are drop routes installed while the SR Policy is unavailable
+	// under OnUnavailable=Drop. They are mutually exclusive with installs:
+	// reconcileLocked clears one before populating the other.
+	blackholes map[string]SteeringRequest // key = SteeringRequest.key()
 }
 
 // key produces a deterministic string for diffing installs across reconciles.

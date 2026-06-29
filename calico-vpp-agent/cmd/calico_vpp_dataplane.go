@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/signal"
 	"runtime/coverage"
@@ -67,6 +68,20 @@ func Go(f func(t *tomb.Tomb) error) {
 			return err
 		})
 	}
+}
+
+// egressBSIDFromConnectivity extracts the SR Policy BSID from an SRv6Policy
+// pubsub event payload (a *common.NodeConnectivity whose .Custom is a
+// *common.SRv6Tunnel). Returns nil when the payload is malformed.
+func egressBSIDFromConnectivity(cn *common.NodeConnectivity) net.IP {
+	if cn == nil {
+		return nil
+	}
+	tunnel, ok := cn.Custom.(*common.SRv6Tunnel)
+	if !ok || tunnel == nil {
+		return nil
+	}
+	return tunnel.Bsid
 }
 
 func main() {
@@ -281,6 +296,14 @@ func main() {
 		} else {
 			egressManager := srv6egress.NewManagerWithResolver(egressLog, cniServer, egressResolver)
 			egressResolver.OnChange = egressManager.ReconcileAll
+
+			// Couple steering liveness to SR Policy install/withdraw. The BGP
+			// watcher fires SRv6Policy{Added,Deleted} as BSIDs come and go; we
+			// track the live set so steering is removed (and OnUnavailable
+			// applied) the moment its BSID disappears, instead of blackholing.
+			egressSRPolicyChan := make(chan common.CalicoVppEvent, common.ChanSize)
+			egressSRPolicyReg := common.RegisterHandler(egressSRPolicyChan, "srv6egress SR policy liveness")
+			egressSRPolicyReg.ExpectEvents(common.SRv6PolicyAdded, common.SRv6PolicyDeleted)
 			egressWatcher, err := srv6egress.NewWatcher(egressLog, clusterConfig, egressManager)
 			if err != nil {
 				log.WithError(err).Error("srv6egress: watcher init failed; egress steering disabled")
@@ -333,6 +356,37 @@ func main() {
 						log.WithError(err).Error("srv6egress: resolver start failed; egress steering disabled")
 						return nil
 					}
+					// Feed SR Policy liveness events to the manager: extract the
+					// BSID from the NodeConnectivity carried by the event and mark
+					// it live/absent. Added carries event.New, Deleted carries
+					// event.Old; both wrap a *common.SRv6Tunnel with .Bsid.
+					go func() {
+						for {
+							select {
+							case <-t.Dying():
+								return
+							case evt := <-egressSRPolicyChan:
+								var cn *common.NodeConnectivity
+								switch evt.Type {
+								case common.SRv6PolicyAdded:
+									cn, _ = evt.New.(*common.NodeConnectivity)
+								case common.SRv6PolicyDeleted:
+									cn, _ = evt.Old.(*common.NodeConnectivity)
+								default:
+									continue
+								}
+								bsid := egressBSIDFromConnectivity(cn)
+								if bsid == nil {
+									continue
+								}
+								if evt.Type == common.SRv6PolicyAdded {
+									egressManager.OnSRPolicyAdded(bsid)
+								} else {
+									egressManager.OnSRPolicyDeleted(bsid)
+								}
+							}
+						}
+					}()
 					// Periodically re-reconcile: a steering install can fail
 					// because the SR Policy (distributed asynchronously over BGP)
 					// is not installed yet when the pod/policy event fires. The

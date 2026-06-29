@@ -23,6 +23,11 @@ type Manager struct {
 
 	mu       sync.Mutex
 	policies map[string]*policyState // key = EgressPolicy.UID
+	// liveBSIDs is the set of SR Policy BSIDs currently installed in the
+	// dataplane (key = bsid.String()), tracked from the BGP watcher's
+	// SRv6PolicyAdded/Deleted events. Steering is only installed for a policy
+	// whose resolved BSID is live; otherwise OnUnavailable applies.
+	liveBSIDs map[string]struct{}
 }
 
 // NewManager constructs a Manager with a no-op pod resolver (zero matches).
@@ -37,10 +42,11 @@ func NewManager(log *logrus.Entry, vpp VPPInterface) *Manager {
 func NewManagerWithResolver(log *logrus.Entry, vpp VPPInterface, pods PodResolver) *Manager {
 	l := log.WithField("component", "srv6egress-manager")
 	return &Manager{
-		log:      l,
-		vpp:      vpp,
-		steering: &steeringComputer{pods: pods, log: l},
-		policies: make(map[string]*policyState),
+		log:       l,
+		vpp:       vpp,
+		steering:  &steeringComputer{pods: pods, log: l},
+		policies:  make(map[string]*policyState),
+		liveBSIDs: make(map[string]struct{}),
 	}
 }
 
@@ -58,7 +64,10 @@ func (m *Manager) OnPolicyUpdate(ep *srv6egressv1.EgressPolicy) {
 
 	prev, existed := m.policies[uid]
 	if !existed {
-		prev = &policyState{installs: make(map[string]SteeringRequest)}
+		prev = &policyState{
+			installs:   make(map[string]SteeringRequest),
+			blackholes: make(map[string]SteeringRequest),
+		}
 		m.policies[uid] = prev
 	}
 	prev.policy = ep
@@ -81,6 +90,12 @@ func (m *Manager) OnPolicyDelete(uid string) {
 				Warn("failed to remove steering on policy delete; continuing")
 		}
 	}
+	for _, req := range st.blackholes {
+		if err := m.vpp.RemoveBlackhole(req); err != nil {
+			m.log.WithError(err).WithField("uid", uid).
+				Warn("failed to remove blackhole on policy delete; continuing")
+		}
+	}
 	delete(m.policies, uid)
 }
 
@@ -90,24 +105,82 @@ func (m *Manager) OnPolicyDelete(uid string) {
 func (m *Manager) ReconcileAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.reconcileAllLocked()
+}
+
+// reconcileAllLocked re-reconciles every tracked policy. m.mu must be held.
+func (m *Manager) reconcileAllLocked() {
 	for _, st := range m.policies {
 		m.reconcileLocked(st)
 	}
 }
 
+// OnSRPolicyAdded marks bsid live (the BGP watcher installed the SR Policy in
+// VPP) and re-reconciles, so any policy whose status BSID matches gets steered.
+func (m *Manager) OnSRPolicyAdded(bsid net.IP) {
+	if bsid == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.liveBSIDs[bsid.String()] = struct{}{}
+	m.reconcileAllLocked()
+}
+
+// OnSRPolicyDeleted marks bsid absent (the BGP watcher withdrew the SR Policy
+// from VPP) and re-reconciles, so any policy relying on it falls back per its
+// OnUnavailable mode instead of blackholing into a now-missing BSID.
+func (m *Manager) OnSRPolicyDeleted(bsid net.IP) {
+	if bsid == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.liveBSIDs, bsid.String())
+	m.reconcileAllLocked()
+}
+
+// bsidLive reports whether bsid is currently installed in the dataplane.
+// m.mu must be held.
+func (m *Manager) bsidLive(bsid net.IP) bool {
+	if bsid == nil {
+		return false
+	}
+	_, ok := m.liveBSIDs[bsid.String()]
+	return ok
+}
+
 // reconcileLocked recomputes the desired install set for one policy (via the
 // steeringComputer) and diffs it against the previously installed set, applying
 // the difference through the VPP seam. m.mu must be held.
+//
+// Steering is installed only when the policy is Ready AND its resolved BSID is
+// live in the dataplane. When the BSID is absent (withdrawn, or not yet
+// installed) the policy is unavailable: existing steering is torn down and the
+// OnUnavailable mode decides whether to blackhole (Drop, fail-closed) or leak
+// to the node default egress (Fallback, fail-open).
 func (m *Manager) reconcileLocked(st *policyState) {
 	if st.policy == nil {
 		return
 	}
-	if !isReady(st.policy) {
-		// Controller hasn't allocated a VIP / resolved the SR Policy yet;
-		// the BGP layer will not have a BSID for us either.
-		m.log.WithField("name", st.policy.Name).Debug("policy not yet Ready; deferring")
+
+	bsid := policyBSID(st.policy)
+	available := st.policy != nil && isReady(st.policy) && bsid != nil && m.bsidLive(bsid)
+
+	if !available {
+		// Tear down any steering: it would point at an absent BSID and blackhole.
+		for k, req := range st.installs {
+			if err := m.vpp.RemoveSteering(req); err != nil {
+				m.log.WithError(err).WithField("key", k).Warn("RemoveSteering failed")
+			}
+			delete(st.installs, k)
+		}
+		m.applyUnavailableLocked(st)
 		return
 	}
+
+	// Available again: drop any blackholes before (re)installing steering.
+	m.clearBlackholesLocked(st)
 
 	desired := m.steering.desired(st.policy)
 	desiredKeys := make(map[string]struct{}, len(desired))
@@ -139,6 +212,73 @@ func (m *Manager) reconcileLocked(st *policyState) {
 		}
 		st.installs[k] = req
 	}
+}
+
+// applyUnavailableLocked enacts the policy's OnUnavailable mode while its SR
+// Policy is absent. Drop (the default) installs a blackhole per desired (pod,
+// dest) pair so traffic fails closed; Fallback removes any blackholes so
+// traffic uses the node default egress. m.mu must be held.
+func (m *Manager) applyUnavailableLocked(st *policyState) {
+	if onUnavailableDrop(st.policy) {
+		desired := m.steering.desired(st.policy)
+		desiredKeys := make(map[string]struct{}, len(desired))
+		for _, req := range desired {
+			desiredKeys[req.key()] = struct{}{}
+		}
+		// Remove blackholes no longer desired (pod departed / dest changed).
+		for k, req := range st.blackholes {
+			if _, keep := desiredKeys[k]; keep {
+				continue
+			}
+			if err := m.vpp.RemoveBlackhole(req); err != nil {
+				m.log.WithError(err).WithField("key", k).Warn("RemoveBlackhole failed")
+				continue
+			}
+			delete(st.blackholes, k)
+		}
+		// Install blackholes for newly-desired pairs.
+		for _, req := range desired {
+			k := req.key()
+			if _, exists := st.blackholes[k]; exists {
+				continue
+			}
+			if err := m.vpp.InstallBlackhole(req); err != nil {
+				m.log.WithError(err).WithField("key", k).Warn("InstallBlackhole failed")
+				continue
+			}
+			st.blackholes[k] = req
+		}
+		return
+	}
+	// Fallback: ensure no blackhole lingers (traffic leaks to node default egress).
+	m.clearBlackholesLocked(st)
+}
+
+// clearBlackholesLocked removes and forgets every blackhole tracked for st.
+// m.mu must be held.
+func (m *Manager) clearBlackholesLocked(st *policyState) {
+	for k, req := range st.blackholes {
+		if err := m.vpp.RemoveBlackhole(req); err != nil {
+			m.log.WithError(err).WithField("key", k).Warn("RemoveBlackhole failed")
+		}
+		delete(st.blackholes, k)
+	}
+}
+
+// policyBSID returns the SR Policy BSID resolved in the policy status, or nil
+// when no (valid) BSID is present yet. The steering computer sources it the
+// same way.
+func policyBSID(ep *srv6egressv1.EgressPolicy) net.IP {
+	if ep == nil || ep.Status.SRPolicy == nil || ep.Status.SRPolicy.BSID == "" {
+		return nil
+	}
+	return net.ParseIP(ep.Status.SRPolicy.BSID)
+}
+
+// onUnavailableDrop reports whether the policy should blackhole (fail-closed)
+// when its SR Policy is unavailable. Empty defaults to Drop.
+func onUnavailableDrop(ep *srv6egressv1.EgressPolicy) bool {
+	return ep == nil || ep.Spec.Egress.OnUnavailable != "Fallback"
 }
 
 // nopResolver matches no pods. Used by NewManager (unit tests) so the policy
@@ -177,6 +317,12 @@ func (m *Manager) PruneExcept(live map[string]struct{}) {
 					Warn("prune: RemoveSteering failed; continuing")
 			}
 		}
+		for _, req := range st.blackholes {
+			if err := m.vpp.RemoveBlackhole(req); err != nil {
+				m.log.WithError(err).WithField("uid", uid).
+					Warn("prune: RemoveBlackhole failed; continuing")
+			}
+		}
 		delete(m.policies, uid)
 	}
 }
@@ -190,6 +336,11 @@ func (m *Manager) Reset() {
 		for _, req := range st.installs {
 			if err := m.vpp.RemoveSteering(req); err != nil {
 				m.log.WithError(err).WithField("uid", uid).Warn("reset: RemoveSteering failed")
+			}
+		}
+		for _, req := range st.blackholes {
+			if err := m.vpp.RemoveBlackhole(req); err != nil {
+				m.log.WithError(err).WithField("uid", uid).Warn("reset: RemoveBlackhole failed")
 			}
 		}
 	}
