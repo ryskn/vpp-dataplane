@@ -148,10 +148,10 @@ func (p *SRv6Provider) RescanState() {
 func (p *SRv6Provider) CreateSRv6Tunnel(dst net.IP, prefixDst ip_types.Prefix, policyTunnel *types.SrPolicy) (err error) {
 	p.log.Infof("SRv6Provider CreateSRv6Tunnel")
 
-	err = p.vpp.AddModSRv6Policy(policyTunnel)
-	if err != nil {
-		p.log.Errorf("SRv6Provider CreateSRv6Tunnel AddSRv6Policy %s", err)
-
+	// Install the policy first: steering into a BSID with no policy behind it
+	// is a blackhole, so a failed policy add must abort before steering.
+	if err := p.vpp.AddModSRv6Policy(policyTunnel); err != nil {
+		return errors.Wrapf(err, "SRv6Provider CreateSRv6Tunnel AddModSRv6Policy")
 	}
 	srSteer := &types.SrSteer{
 		TrafficType: types.SrSteerIPv4,
@@ -163,14 +163,10 @@ func (p *SRv6Provider) CreateSRv6Tunnel(dst net.IP, prefixDst ip_types.Prefix, p
 	if vpplink.IsIP6(srSteer.Prefix.Address.ToIP()) {
 		srSteer.TrafficType = types.SrSteerIPv6
 	}
-	err = p.vpp.AddSRv6Steering(srSteer)
-
-	if err != nil {
-		p.log.Errorf("SRv6Provider CreateSRv6Tunnel AddSRv6Steering %s", err)
-
+	if err := p.vpp.AddSRv6Steering(srSteer); err != nil {
+		return errors.Wrapf(err, "SRv6Provider CreateSRv6Tunnel AddSRv6Steering")
 	}
-
-	return err
+	return nil
 }
 
 // steerNodeIPViaSID steers pod traffic to a remote node's own IP onto that node's
