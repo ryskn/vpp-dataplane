@@ -111,10 +111,36 @@ type reconcilePlan struct {
 	endpointAddr string
 }
 
+// validateDestinationCIDRs enforces the v1 IPv6-only invariant on the policy's
+// destinationCIDRs. An empty list is rejected: steering ::/0 is not yet
+// supported, so an unvalidated empty/IPv4 list would otherwise go Ready=True
+// while the dataplane installs neither steering nor (under Drop) a blackhole —
+// a fail-closed policy that silently fails open.
+func validateDestinationCIDRs(cidrs []string) error {
+	if len(cidrs) == 0 {
+		return fmt.Errorf("destinationCIDRs must not be empty")
+	}
+	for _, c := range cidrs {
+		ip, ipnet, err := net.ParseCIDR(c)
+		if err != nil || ipnet == nil {
+			return fmt.Errorf("destinationCIDR %q is not a valid CIDR", c)
+		}
+		if ip.To4() != nil {
+			return fmt.Errorf("destinationCIDR %q must be IPv6 (v1 is IPv6-only)", c)
+		}
+	}
+	return nil
+}
+
 // resolvePlan resolves the color config, the egress endpoint (exactly one
 // node), and enforces RFC 9256 §2 <color, endpoint> uniqueness. On any failure
 // it marks the policy not-ready and returns the error to requeue.
 func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egressv1.EgressPolicy) (*reconcilePlan, ctrl.Result, error) {
+	if err := validateDestinationCIDRs(ep.Spec.DestinationCIDRs); err != nil {
+		res, err := r.markNotReady(ctx, ep, "InvalidDestinationCIDRs", err.Error())
+		return nil, res, err
+	}
+
 	cc, ok := r.Config.Colors[ep.Spec.Egress.Color]
 	if !ok {
 		res, err := r.markNotReady(ctx, ep, "UnknownColor",

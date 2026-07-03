@@ -70,7 +70,8 @@ func newPolicy(name, uid string, color uint32) *srv6egressv1.EgressPolicy {
 			Finalizers: []string{finalizerName}, // pre-add to skip the requeue step
 		},
 		Spec: srv6egressv1.EgressPolicySpec{
-			Selector: srv6egressv1.Selector{},
+			Selector:         srv6egressv1.Selector{},
+			DestinationCIDRs: []string{"2001:db8:100::/64"},
 			Egress: srv6egressv1.EgressSpec{
 				EndpointSelector: srv6egressv1.EndpointSelector{
 					NodeSelector: &metav1.LabelSelector{
@@ -145,6 +146,28 @@ func getReady(t *testing.T, r *EgressPolicyReconciler, name string) metav1.Condi
 	}
 	t.Fatalf("%s has no Ready condition", name)
 	return metav1.Condition{}
+}
+
+func TestReconcile_InvalidDestinationCIDRs(t *testing.T) {
+	cases := map[string][]string{
+		"empty":   nil,
+		"ipv4":    {"10.0.0.0/8"},
+		"garbage": {"not-a-cidr"},
+	}
+	for name, cidrs := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := newPolicy("tenant-a", "uid-a", 100)
+			p.Spec.DestinationCIDRs = cidrs
+			r := newReconciler(t, egressNode("egress-1"), p)
+			// markNotReady requeues by returning an error; we only care that the
+			// policy was marked not-ready with the right reason.
+			_ = reconcile(t, r, "tenant-a")
+			cond := getReady(t, r, "tenant-a")
+			if cond.Status != metav1.ConditionFalse || cond.Reason != "InvalidDestinationCIDRs" {
+				t.Fatalf("expected Ready=False/InvalidDestinationCIDRs, got %s/%s", cond.Status, cond.Reason)
+			}
+		})
+	}
 }
 
 func TestReconcile_HappyPath(t *testing.T) {
