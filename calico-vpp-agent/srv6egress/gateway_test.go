@@ -1,6 +1,7 @@
 package srv6egress
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -12,8 +13,9 @@ import (
 )
 
 type fakeGW struct {
-	installs map[string]GatewayRequest
-	removes  map[string]GatewayRequest
+	installs    map[string]GatewayRequest
+	removes     map[string]GatewayRequest
+	failInstall bool
 }
 
 func newFakeGW() *fakeGW {
@@ -21,6 +23,9 @@ func newFakeGW() *fakeGW {
 }
 
 func (f *fakeGW) InstallGateway(req GatewayRequest) error {
+	if f.failInstall {
+		return fmt.Errorf("install failed (test)")
+	}
 	f.installs[req.PolicyUID] = req
 	return nil
 }
@@ -81,6 +86,24 @@ func TestGateway_AdvertisesAndWithdrawsSID(t *testing.T) {
 	m.OnPolicyDelete("uid-a")
 	if !contains(adv.withdrawn, "fcff:0:0:e0:a:1::") {
 		t.Fatalf("SID not withdrawn on teardown: %v", adv.withdrawn)
+	}
+}
+
+// A failed InstallGateway must not leak the VRF table id: reconcile allocs it
+// before InstallGateway, so a later delete has to free it even though
+// st.install is still nil.
+func TestGateway_FailedInstallFreesVRF(t *testing.T) {
+	vpp := newFakeGW()
+	vpp.failInstall = true
+	m := newGWManager(vpp)
+
+	m.OnPolicyUpdate(gwPolicy("a", "uid-a", "gw-node", "fcff:0:0:e0:a:1::", "2001:db8:e::a", "isp-a"))
+	if len(m.vrfs.byUID) != 1 {
+		t.Fatalf("expected 1 VRF allocated after failed install, got %d", len(m.vrfs.byUID))
+	}
+	m.OnPolicyDelete("uid-a")
+	if len(m.vrfs.byUID) != 0 || len(m.vrfs.inUse) != 0 {
+		t.Fatalf("VRF leaked after delete: byUID=%d inUse=%d", len(m.vrfs.byUID), len(m.vrfs.inUse))
 	}
 }
 
