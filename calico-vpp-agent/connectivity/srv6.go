@@ -620,14 +620,14 @@ func (p *SRv6Provider) isSRv6TunnelInfoFromBGP(cn *common.NodeConnectivity) bool
 
 // find the highest priority policy for a specific node
 func (p *SRv6Provider) getPolicyNode(nodeip string, behavior types.SrBehavior) (policy *types.SrPolicy, err error) {
-	p.log.Infof("SRv6Provider getPolicyNode node: %s, with beahvior: %d", nodeip, behavior)
+	p.log.Debugf("SRv6Provider getPolicyNode node: %s, with behavior: %d", nodeip, behavior)
 	if p.nodePolices[nodeip] != nil {
 		var priority uint32
 		found := false
-		p.log.Infof("SRv6Provider getPolicyNode: found %d tunnels for node %s", len(p.nodePolices[nodeip].SRv6Tunnel), nodeip)
+		p.log.Debugf("SRv6Provider getPolicyNode: found %d tunnels for node %s", len(p.nodePolices[nodeip].SRv6Tunnel), nodeip)
 		for i, tunnel := range p.nodePolices[nodeip].SRv6Tunnel {
 			converted := types.FromGoBGPSrBehavior(tunnel.Behavior)
-			p.log.Infof("SRv6Provider getPolicyNode: tunnel[%d] behavior=%d converted=%d want=%d match=%v policy=%v",
+			p.log.Debugf("SRv6Provider getPolicyNode: tunnel[%d] behavior=%d converted=%d want=%d match=%v policy=%v",
 				i, tunnel.Behavior, converted, behavior, converted == behavior, tunnel.Policy != nil)
 			// Skip a candidate with no SrPolicy object (nil-deref guard; a nil
 			// Policy here does not imply not-installed-in-VPP). Strict > keeps
@@ -642,12 +642,12 @@ func (p *SRv6Provider) getPolicyNode(nodeip string, behavior types.SrBehavior) (
 			}
 		}
 	} else {
-		p.log.Infof("SRv6Provider getPolicyNode: nodePolices[%s] is nil", nodeip)
+		p.log.Debugf("SRv6Provider getPolicyNode: nodePolices[%s] is nil", nodeip)
 	}
 	if policy == nil {
-		p.log.Infof("SRv6Provider getPolicyNode: no matching policy found")
+		p.log.Debugf("SRv6Provider getPolicyNode: no matching policy found")
 	} else {
-		p.log.Infof("SRv6Provider getPolicyNode: found policy bsid=%s", policy.Bsid.String())
+		p.log.Debugf("SRv6Provider getPolicyNode: found policy bsid=%s", policy.Bsid.String())
 	}
 	return policy, err
 }

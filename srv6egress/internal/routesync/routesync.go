@@ -156,11 +156,19 @@ type ribPath struct {
 	} `json:"attrs"`
 }
 
+// BGP path-attribute / SRv6 TLV type codes used when parsing the gobgp RIB.
+const (
+	bgpAttrMPReachNLRI = 14 // MP_REACH_NLRI path attribute (RFC 4760)
+	bgpAttrPrefixSID   = 40 // BGP Prefix-SID path attribute (RFC 8669)
+	tlvSRv6L3Service   = 5  // SRv6 L3 Service TLV (RFC 9252)
+	subTLVSRv6SIDInfo  = 1  // SRv6 SID Information Sub-TLV (RFC 9252)
+)
+
 // nexthop returns the route next-hop, preferring the MP_REACH_NLRI attribute
-// (type 14) and falling back to the advertising neighbor.
+// and falling back to the advertising neighbor.
 func (p ribPath) nexthop() string {
 	for _, a := range p.Attrs {
-		if a.Type == 14 && a.Nexthop != "" {
+		if a.Type == bgpAttrMPReachNLRI && a.Nexthop != "" {
 			return a.Nexthop
 		}
 	}
@@ -168,19 +176,19 @@ func (p ribPath) nexthop() string {
 }
 
 // serviceSID extracts the SRv6 service SID from a Prefix-SID attribute
-// (type 40 → SRv6 L3 Service TLV (5) → SRv6 Information Sub-TLV (1)), or ""
+// (Prefix-SID → SRv6 L3 Service TLV → SRv6 Information Sub-TLV), or ""
 // when the path is a plain route (RFC 9252 reception via backbone stitching).
 func (p ribPath) serviceSID() string {
 	for _, a := range p.Attrs {
-		if a.Type != 40 {
+		if a.Type != bgpAttrPrefixSID {
 			continue
 		}
 		for _, tlv := range a.TLVs {
-			if tlv.Type != 5 {
+			if tlv.Type != tlvSRv6L3Service {
 				continue
 			}
 			for _, sub := range tlv.SubTLVs {
-				if sub.Type != 1 || len(sub.SID) != net.IPv6len {
+				if sub.Type != subTLVSRv6SIDInfo || len(sub.SID) != net.IPv6len {
 					continue
 				}
 				return net.IP(sub.SID).String()
