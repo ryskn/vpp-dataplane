@@ -32,32 +32,40 @@ const (
 
 func (w *LocalSIDWatcher) WatchLocalSID(t *tomb.Tomb) error {
 	w.log.Infof("WatchLocalSID")
-	time.Sleep(localSIDWatchInterval)
+
+	ticker := time.NewTicker(localSIDWatchInterval)
+	defer ticker.Stop()
 
 	assignedLocalSIDs := make(map[string]bool)
-	for t.Alive() {
+	for {
+		select {
+		case <-t.Dying():
+			return nil
+		case <-ticker.C:
+		}
+
 		list, err := w.vpp.ListSRv6Localsid()
 		if err != nil {
-			return errors.Wrap(err, "error getting assigned SRv6 LocalSIDs")
+			// A transient VPP dump error must not tear down the whole agent:
+			// log and retry on the next tick.
+			w.log.WithError(err).Warn("error listing SRv6 LocalSIDs, retrying")
+			continue
 		}
 		for _, localsid := range list {
-			w.log.Debugf("LocalSID: %s", localsid.String())
-			if _, found := assignedLocalSIDs[localsid.Localsid.String()]; found {
-				w.log.Debugf("Old assigned LocalSID: %s", localsid.Localsid.String())
-			} else {
-				w.log.Debugf("New assigned LocalSID: %s", localsid.Localsid.String())
-				err := w.AdvertiseSRv6Policy(localsid)
-				if err != nil {
-					return errors.Wrap(err, "error advertising assigned SRv6 LocalSID")
-				}
-				time.Sleep(localSIDWatchInterval / 2)
-				assignedLocalSIDs[localsid.Localsid.String()] = true
+			key := localsid.Localsid.String()
+			if assignedLocalSIDs[key] {
+				w.log.Debugf("Old assigned LocalSID: %s", key)
+				continue
 			}
+			w.log.Debugf("New assigned LocalSID: %s", key)
+			if err := w.AdvertiseSRv6Policy(localsid); err != nil {
+				// Do not record the SID as advertised so it is retried next tick.
+				w.log.WithError(err).Warnf("error advertising SRv6 LocalSID %s, will retry", key)
+				continue
+			}
+			assignedLocalSIDs[key] = true
 		}
-		time.Sleep(localSIDWatchInterval)
 	}
-
-	return nil
 }
 
 func (w *LocalSIDWatcher) AdvertiseSRv6Policy(localsid *types.SrLocalsid) (err error) {
