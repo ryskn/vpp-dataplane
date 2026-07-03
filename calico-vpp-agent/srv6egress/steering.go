@@ -29,7 +29,26 @@ func (c *steeringComputer) desired(ep *srv6egressv1.EgressPolicy) []SteeringRequ
 		}
 		return nil
 	}
+	reqs := c.podDestPairs(ep)
+	for i := range reqs {
+		reqs[i].Color = ep.Spec.Egress.Color
+		reqs[i].BSID = bsid
+	}
+	return reqs
+}
 
+// blackholeTargets builds the (pod × dest) set to blackhole while the SR Policy
+// is unavailable under OnUnavailable=Drop. Unlike desired(), it does NOT require
+// a resolved BSID: fail-closed must hold during the provisioning window, before
+// the SR Policy exists, so the returned requests carry no BSID/Color.
+func (c *steeringComputer) blackholeTargets(ep *srv6egressv1.EgressPolicy) []SteeringRequest {
+	return c.podDestPairs(ep)
+}
+
+// podDestPairs crosses the policy's matching local pod IPs with its usable IPv6
+// destinationCIDRs. It returns nil when there is no usable destination or local
+// pod resolution fails. Callers fill Color/BSID as needed.
+func (c *steeringComputer) podDestPairs(ep *srv6egressv1.EgressPolicy) []SteeringRequest {
 	// An explicit IPv6 destinationCIDR list is required. Empty means "all
 	// off-cluster destinations" in the CRD, but steering ::/0 would also catch
 	// in-cluster traffic; that needs cluster-CIDR exclusion (future work).
@@ -55,8 +74,6 @@ func (c *steeringComputer) desired(ep *srv6egressv1.EgressPolicy) []SteeringRequ
 				PolicyUID:  string(ep.UID),
 				PodIP:      ip,
 				DestPrefix: dst,
-				Color:      ep.Spec.Egress.Color,
-				BSID:       bsid,
 			})
 		}
 	}

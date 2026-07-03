@@ -136,6 +136,57 @@ func TestManager_SRPolicyLiveness(t *testing.T) {
 	}
 }
 
+// TestManager_DropBlackholesBeforeBSID is the fail-closed regression: under
+// OnUnavailable=Drop, blackholes must be installed for the matching (pod, dest)
+// pairs even during the bring-up window when no BSID is resolved yet, then be
+// replaced by steering once the SR Policy goes live, and reappear on withdraw.
+func TestManager_DropBlackholesBeforeBSID(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	vpp := newFakeVPP()
+	podIP := net.ParseIP("fd20::1")
+	m := NewManagerWithResolver(log, vpp, staticResolver{ips: []net.IP{podIP}})
+
+	ep := &srv6egressv1.EgressPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: types.UID("uid-a")},
+		Spec: srv6egressv1.EgressPolicySpec{
+			DestinationCIDRs: []string{"2001:db8:a::/64"},
+			Egress:           srv6egressv1.EgressSpec{OnUnavailable: "Drop"},
+		},
+		Status: srv6egressv1.EgressPolicyStatus{
+			Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
+		},
+	}
+	m.OnPolicyUpdate(ep)
+
+	// Bring-up: no BSID resolved yet, but Drop must fail closed.
+	if len(vpp.installs) != 0 {
+		t.Fatalf("expected no steering without a live BSID, got %d", len(vpp.installs))
+	}
+	if len(vpp.blackholes) != 1 {
+		t.Fatalf("expected 1 fail-closed blackhole during bring-up, got %d", len(vpp.blackholes))
+	}
+
+	// BSID resolves in status and goes live: blackhole replaced by steering.
+	ep.Status.SRPolicy = &srv6egressv1.SRPolicyStatus{BSID: "cafe::1", Color: 100}
+	m.OnPolicyUpdate(ep)
+	m.OnSRPolicyAdded(net.ParseIP("cafe::1"))
+	if len(vpp.installs) != 1 {
+		t.Fatalf("expected 1 install once the BSID is live, got %d", len(vpp.installs))
+	}
+	if len(vpp.blackholes) != 0 {
+		t.Fatalf("expected blackhole cleared once steering is live, got %d", len(vpp.blackholes))
+	}
+
+	// SR Policy withdrawn: fail closed again.
+	m.OnSRPolicyDeleted(net.ParseIP("cafe::1"))
+	if len(vpp.installs) != 0 {
+		t.Fatalf("expected steering removed after withdraw, got %d", len(vpp.installs))
+	}
+	if len(vpp.blackholes) != 1 {
+		t.Fatalf("expected fail-closed blackhole after withdraw, got %d", len(vpp.blackholes))
+	}
+}
+
 func TestManager_NotReadyDeferred(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())
 	vpp := newFakeVPP()
