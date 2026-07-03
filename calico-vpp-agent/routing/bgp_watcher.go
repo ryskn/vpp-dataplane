@@ -46,13 +46,29 @@ func (s *Server) getNexthop(path *bgpapi.Path) string {
 			return nhAttr.NextHop
 		}
 		if err := attr.UnmarshalTo(mpReachAttr); err == nil {
-			if len(mpReachAttr.NextHops) != 1 {
-				s.log.Fatalf("Cannot process more than one Nlri in path attributes: %+v", mpReachAttr)
+			if len(mpReachAttr.NextHops) == 0 {
+				return ""
 			}
-			return mpReachAttr.NextHops[0]
+			if len(mpReachAttr.NextHops) > 1 {
+				// RFC 2545 IPv6 routinely advertises a global and a link-local
+				// nexthop. Never crash on peer input: warn and prefer global.
+				s.log.Warnf("MP_REACH_NLRI carries %d nexthops, using first global-scope one: %+v", len(mpReachAttr.NextHops), mpReachAttr.NextHops)
+			}
+			return preferGlobalNexthop(mpReachAttr.NextHops)
 		}
 	}
 	return ""
+}
+
+// preferGlobalNexthop returns the first non-link-local nexthop, falling back to
+// the first entry when all are link-local.
+func preferGlobalNexthop(nexthops []string) string {
+	for _, nh := range nexthops {
+		if ip := net.ParseIP(nh); ip != nil && !ip.IsLinkLocalUnicast() {
+			return nh
+		}
+	}
+	return nexthops[0]
 }
 
 // injectRoute is a helper function to inject BGP routes to VPP
