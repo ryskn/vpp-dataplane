@@ -202,6 +202,16 @@ func (p *SRv6Provider) steerNodeIPViaSID(nodeip string) {
 	}
 }
 
+// containsPrefix reports whether prefixes already holds p (compared by string).
+func containsPrefix(prefixes []ip_types.Prefix, p ip_types.Prefix) bool {
+	for i := range prefixes {
+		if prefixes[i].String() == p.String() {
+			return true
+		}
+	}
+	return false
+}
+
 // AddConnectivity creates dynamic parts of SRv6 tunnel leading to node that we are adding connectivity to.
 // The static parts are created in RescanState.
 // This method doesn't create the needed parts in one pass, you need to call this function 3 times. Once
@@ -255,7 +265,13 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 				Prefixes: []ip_types.Prefix{},
 			}
 		}
-		p.nodePrefixes[nodeip].Prefixes = append(p.nodePrefixes[nodeip].Prefixes, prefix)
+		// Dedup: AddConnectivity is re-invoked for unchanged routes on the
+		// "connectivity(same)" path and on every updateAllIPConnectivity();
+		// without this each pass would append again and CreateSRv6Tunnel would
+		// re-run AddModSRv6Policy (del+add), rebuilding the shared SR policy.
+		if !containsPrefix(p.nodePrefixes[nodeip].Prefixes, prefix) {
+			p.nodePrefixes[nodeip].Prefixes = append(p.nodePrefixes[nodeip].Prefixes, prefix)
+		}
 
 		// stopping processing until we have also needed SRv6 tunnel data (SRv6 policy)
 		// from the destination node (BGP transportation)
