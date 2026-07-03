@@ -226,7 +226,15 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 			EndpointAddr: sp.EndpointAddr,
 			BSID:         sp.BSID,
 		}
-		if err := r.BGP.Withdraw(ctx, owner, r.Encoder.ClusterAdvert(key, sp.SegmentList)); err != nil {
+		adv := r.Encoder.ClusterAdvert(key, sp.SegmentList)
+		if _, err := adv.BuildPath(); err != nil {
+			// Deterministic encode failure (e.g. sr-policy with an empty
+			// BSID/endpoint): nothing valid could have been announced, so there
+			// is nothing to withdraw. Log and drop the finalizer rather than
+			// wedging the object in Terminating forever on every reconcile.
+			log.Error(err, "cannot rebuild withdraw advert; dropping finalizer without withdraw", "name", ep.Name)
+		} else if err := r.BGP.Withdraw(ctx, owner, adv); err != nil {
+			// Transient transport error: keep the finalizer and retry.
 			return ctrl.Result{}, err
 		}
 	}

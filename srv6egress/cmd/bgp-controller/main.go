@@ -98,6 +98,16 @@ func main() {
 	var encoder bgp.Encoder
 	switch bgpEncoding {
 	case "sr-policy":
+		// The headend keys its SR Policy install on the BSID, so under this
+		// encoding every color needs one. Fail fast at load instead of letting
+		// a bsid-less color go non-Ready yet un-deletable (BuildPath would fail
+		// on both Announce and Withdraw).
+		for color, cc := range cfg.Colors {
+			if cc.BSID == "" {
+				log.Error(fmt.Errorf("color %d: bsid is required with --bgp-encoding=sr-policy", color), "invalid config")
+				os.Exit(1)
+			}
+		}
 		encoder = bgp.NewSRPolicyEncoder(bgp.SRPolicyOptions{})
 	case "color-route":
 		encoder = bgp.NewColoredEncoder()
