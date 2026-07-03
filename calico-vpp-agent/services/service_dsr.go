@@ -33,6 +33,15 @@ func (s *Server) dsrEligible(service *v1.Service, epSlices []*discoveryv1.Endpoi
 	if service.Spec.Type != v1.ServiceTypeClusterIP {
 		return false
 	}
+	// Dual-stack: DSR only programs the IPv6 ClusterIP, but GetLocalService
+	// suppresses cnat for ALL ClusterIPs of a DSR-eligible service, so an IPv4
+	// ClusterIP would be left with neither path. Keep dual-stack services on cnat.
+	for _, cip := range service.Spec.ClusterIPs {
+		if ip := net.ParseIP(cip); ip != nil && ip.To4() != nil {
+			s.log.Warnf("svc(dsr) %s/%s: dual-stack (IPv4 ClusterIP %s); falling back to cnat", service.Namespace, service.Name, cip)
+			return false
+		}
+	}
 	// ExternalIPs (and LoadBalancer ingress) are still served by cnat, which
 	// hits the SRv6 un-DNAT issue this feature avoids. Don't DSR a service that
 	// exposes them — keep the whole service on the cnat path for consistency.
@@ -57,21 +66,27 @@ func (s *Server) dsrEligible(service *v1.Service, epSlices []*discoveryv1.Endpoi
 	// not in any IPAM pool, and DSR cannot deliver to them (no pod interface to
 	// bind the VIP on). Keep such services on the cnat path rather than silently
 	// skipping cnat and leaving them with no working path.
-	if s.felixServerIpam != nil {
-		for _, epslice := range epSlices {
-			for _, ep := range epslice.Endpoints {
-				if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+	// Without the IPAM view we cannot verify backends are pod-backed. Fail closed
+	// (keep the service on cnat) rather than risk DSR-ing a host-network backed
+	// service such as the apiserver: this security guard must not depend on a
+	// nilable field being set.
+	if s.felixServerIpam == nil {
+		s.log.Warnf("svc(dsr) %s/%s: no IPAM view to verify pod-backed backends; falling back to cnat", service.Namespace, service.Name)
+		return false
+	}
+	for _, epslice := range epSlices {
+		for _, ep := range epslice.Endpoints {
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				ip := net.ParseIP(addr)
+				if ip == nil || ip.To4() != nil {
 					continue
 				}
-				for _, addr := range ep.Addresses {
-					ip := net.ParseIP(addr)
-					if ip == nil || ip.To4() != nil {
-						continue
-					}
-					if s.felixServerIpam.GetPrefixIPPool(common.ToMaxLenCIDR(ip)) == nil {
-						s.log.Warnf("svc(dsr) %s/%s: backend %s is not pod-backed (not in an IPAM pool); falling back to cnat", service.Namespace, service.Name, addr)
-						return false
-					}
+				if s.felixServerIpam.GetPrefixIPPool(common.ToMaxLenCIDR(ip)) == nil {
+					s.log.Warnf("svc(dsr) %s/%s: backend %s is not pod-backed (not in an IPAM pool); falling back to cnat", service.Namespace, service.Name, addr)
+					return false
 				}
 			}
 		}
