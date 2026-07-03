@@ -169,26 +169,33 @@ func (s *Server) cleanupDSRPod(ipStr string, vip net.IP) bool {
 //     add the new (on failure return nil so the add is retried);
 //   - no paths: delete the old (retain on failure).
 func (s *Server) updateDeliveryRoute(vip net.IP, prev *dsrVIPState, paths []types.RoutePath) *types.Route {
-	if prev != nil && prev.delivery != nil {
-		if len(paths) > 0 && samePaths(prev.delivery.Paths, paths) {
-			return prev.delivery
-		}
-		if err := s.vpp.RouteDel(prev.delivery); err != nil {
-			s.log.Errorf("cni(dsr) del delivery route vip=%s: %v", vip, err)
-			return prev.delivery // keep old; retry replacement next reconcile
-		}
-	}
 	if len(paths) == 0 {
+		// No backends: remove the delivery route (retain on failure to retry).
+		if prev != nil && prev.delivery != nil {
+			if err := s.vpp.RouteDel(prev.delivery); err != nil {
+				s.log.Errorf("cni(dsr) del delivery route vip=%s: %v", vip, err)
+				return prev.delivery
+			}
+		}
 		return nil
+	}
+	if prev != nil && prev.delivery != nil && samePaths(prev.delivery.Paths, paths) {
+		return prev.delivery // unchanged
 	}
 	route := &types.Route{
 		Dst:   common.ToMaxLenCIDR(vip),
 		Paths: paths,
 		Table: common.PodVRFIndex,
 	}
+	// RouteAdd is a non-multipath add, which VPP applies as an atomic replace of
+	// the prefix's paths. Skipping the prior RouteDel removes the delete-then-add
+	// window that would briefly blackhole the VIP while the backend set changes.
 	if err := s.vpp.RouteAdd(route); err != nil {
 		s.log.Errorf("cni(dsr) add delivery route vip=%s: %v", vip, err)
-		return nil // retry add next reconcile
+		if prev != nil {
+			return prev.delivery // old route still installed; retry next reconcile
+		}
+		return nil
 	}
 	return route
 }
