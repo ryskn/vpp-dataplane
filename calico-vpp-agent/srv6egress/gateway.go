@@ -114,6 +114,11 @@ type GatewayManager struct {
 	policies map[string]*gwState // key = EgressPolicy.UID
 	vrfs     *vrfAllocator
 	sids     SIDAdvertiser // optional; advertises the tenant SID over BGP
+	// pendingSID collects SID advertise/withdraw closures produced under mu.
+	// They are run by flushPendingSID after the lock is released, because the
+	// advertiser broadcasts a blocking pub/sub event and must not stall every
+	// other gateway operation while a consumer is backed up.
+	pendingSID []func()
 
 	// returnCIDR / returnTable configure the shared return aggregate (see
 	// SetClusterReturn); an empty returnCIDR disables it.
@@ -170,6 +175,7 @@ func NewGatewayManager(log *logrus.Entry, vpp VPPGateway, nodeName string,
 
 // OnPolicyUpdate is called for create+update events on EgressPolicy.
 func (m *GatewayManager) OnPolicyUpdate(ep *srv6egressv1.EgressPolicy) {
+	defer m.flushPendingSID() // runs after Unlock (LIFO): sends off the lock
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -188,6 +194,7 @@ func (m *GatewayManager) OnPolicyUpdate(ep *srv6egressv1.EgressPolicy) {
 
 // OnPolicyDelete tears down the gateway entry (if any) and forgets the policy.
 func (m *GatewayManager) OnPolicyDelete(uid string) {
+	defer m.flushPendingSID()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st, ok := m.policies[uid]
@@ -201,10 +208,24 @@ func (m *GatewayManager) OnPolicyDelete(uid string) {
 // ReconcileAll re-reconciles every tracked policy (periodic retry; the SR
 // localsid or cnat set may have failed transiently).
 func (m *GatewayManager) ReconcileAll() {
+	defer m.flushPendingSID()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for uid, st := range m.policies {
 		m.reconcileLocked(uid, st)
+	}
+}
+
+// flushPendingSID runs the SID advertise/withdraw closures collected under mu,
+// with the lock released, so a blocking pub/sub broadcast cannot stall gateway
+// reconciliation. Safe to call when nothing is pending.
+func (m *GatewayManager) flushPendingSID() {
+	m.mu.Lock()
+	ops := m.pendingSID
+	m.pendingSID = nil
+	m.mu.Unlock()
+	for _, op := range ops {
+		op()
 	}
 }
 
@@ -246,11 +267,15 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 	st.install = &cp
 	// Advertise the tenant SID so headend nodes can route the SR-encapsulated
 	// packet to this gateway (best-effort; the data path is already installed).
+	// Deferred off the lock: AdvertiseSID broadcasts a blocking pub/sub event.
 	if m.sids != nil {
-		if err := m.sids.AdvertiseSID(req.TenantSID); err != nil {
-			m.log.WithError(err).WithField("sid", req.TenantSID).
-				Warn("failed to advertise gateway SID; reachability may be incomplete")
-		}
+		sid := req.TenantSID
+		m.pendingSID = append(m.pendingSID, func() {
+			if err := m.sids.AdvertiseSID(sid); err != nil {
+				m.log.WithError(err).WithField("sid", sid).
+					Warn("failed to advertise gateway SID; reachability may be incomplete")
+			}
+		})
 	}
 	m.log.WithFields(logrus.Fields{
 		"uid": uid, "sid": req.TenantSID,
@@ -260,11 +285,15 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 
 func (m *GatewayManager) teardownLocked(uid string, st *gwState) {
 	if st.install != nil {
+		// Deferred off the lock: WithdrawSID broadcasts a blocking pub/sub event.
 		if m.sids != nil && st.install.TenantSID != nil {
-			if err := m.sids.WithdrawSID(st.install.TenantSID); err != nil {
-				m.log.WithError(err).WithField("sid", st.install.TenantSID).
-					Warn("failed to withdraw gateway SID; continuing")
-			}
+			sid := st.install.TenantSID
+			m.pendingSID = append(m.pendingSID, func() {
+				if err := m.sids.WithdrawSID(sid); err != nil {
+					m.log.WithError(err).WithField("sid", sid).
+						Warn("failed to withdraw gateway SID; continuing")
+				}
+			})
 		}
 		if err := m.vpp.RemoveGateway(*st.install); err != nil {
 			m.log.WithError(err).WithField("uid", uid).Warn("RemoveGateway failed; continuing")
