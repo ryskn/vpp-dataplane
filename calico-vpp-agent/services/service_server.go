@@ -321,7 +321,9 @@ func NewServiceServer(vpp *vpplink.VppLink, k8sclient *kubernetes.Clientset, fel
 									svc,
 									server.endpointSlicesByService[svcKey],
 								)
-								server.handleServiceEndpointEvent(oldLocal, newLocal)
+								// new (current) state first, old second — matches every
+								// other handleServiceEndpointEvent caller.
+								server.handleServiceEndpointEvent(newLocal, oldLocal)
 							} else {
 								server.log.Debugf("Service %s already gone", svcKey)
 								delete(server.endpointSlicesByService[svcKey], objectID(&oldEps.ObjectMeta))
