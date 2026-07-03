@@ -17,6 +17,7 @@ package common
 
 import (
 	"fmt"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -107,7 +108,11 @@ func (reg *PubSubHandlerRegistration) ExpectEvents(eventTypes ...CalicoVppEventT
 }
 
 type PubSub struct {
-	log                        *log.Entry
+	log *log.Entry
+	// mu guards pubSubHandlerRegistrations: RegisterHandler may run (e.g. the
+	// srv6egress liveness handler) after producer goroutines have started
+	// calling SendEvent, so append and range must be synchronized.
+	mu                         sync.RWMutex
 	pubSubHandlerRegistrations []*PubSubHandlerRegistration
 }
 
@@ -118,7 +123,9 @@ func RegisterHandler(channel chan CalicoVppEvent, name string) *PubSubHandlerReg
 		expectedEvents:  make(map[CalicoVppEventType]bool),
 		expectAllEvents: true, /* By default receive everything, unless we ask for a filter */
 	}
+	ThePubSub.mu.Lock()
 	ThePubSub.pubSubHandlerRegistrations = append(ThePubSub.pubSubHandlerRegistrations, reg)
+	ThePubSub.mu.Unlock()
 	return reg
 }
 
@@ -134,7 +141,14 @@ func redactPassword(event CalicoVppEvent) string {
 
 func SendEvent(event CalicoVppEvent) {
 	ThePubSub.log.Debugf("Broadcasting event %s", redactPassword(event))
-	for _, reg := range ThePubSub.pubSubHandlerRegistrations {
+	// Snapshot under the read lock, then send off-lock: the channel sends can
+	// block on a slow consumer, and holding the lock across them would stall a
+	// concurrent RegisterHandler.
+	ThePubSub.mu.RLock()
+	regs := make([]*PubSubHandlerRegistration, len(ThePubSub.pubSubHandlerRegistrations))
+	copy(regs, ThePubSub.pubSubHandlerRegistrations)
+	ThePubSub.mu.RUnlock()
+	for _, reg := range regs {
 		if reg.expectAllEvents || reg.expectedEvents[event.Type] {
 			reg.channel <- event
 		}
