@@ -259,19 +259,21 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 }
 
 func (m *GatewayManager) teardownLocked(uid string, st *gwState) {
-	if st.install == nil {
-		return
-	}
-	if m.sids != nil && st.install.TenantSID != nil {
-		if err := m.sids.WithdrawSID(st.install.TenantSID); err != nil {
-			m.log.WithError(err).WithField("sid", st.install.TenantSID).
-				Warn("failed to withdraw gateway SID; continuing")
+	if st.install != nil {
+		if m.sids != nil && st.install.TenantSID != nil {
+			if err := m.sids.WithdrawSID(st.install.TenantSID); err != nil {
+				m.log.WithError(err).WithField("sid", st.install.TenantSID).
+					Warn("failed to withdraw gateway SID; continuing")
+			}
 		}
+		if err := m.vpp.RemoveGateway(*st.install); err != nil {
+			m.log.WithError(err).WithField("uid", uid).Warn("RemoveGateway failed; continuing")
+		}
+		st.install = nil
 	}
-	if err := m.vpp.RemoveGateway(*st.install); err != nil {
-		m.log.WithError(err).WithField("uid", uid).Warn("RemoveGateway failed; continuing")
-	}
-	st.install = nil
+	// Free the VRF unconditionally: reconcileLocked allocs it before
+	// InstallGateway, so a failed-install-then-deleted/pruned policy (st.install
+	// still nil) would otherwise leak the table id forever.
 	m.vrfs.free(uid)
 }
 
