@@ -107,13 +107,24 @@ func (p *SRv6Provider) programDSRService(svc *common.DSRService) error {
 		return nil
 	}
 
-	// Reuse the previously chosen BSID for stability; derive a fresh
-	// (collision-avoiding) one only on first install for this VIP.
+	// BSID selection: reuse the cached one for stability; on first sight (incl.
+	// after an agent-only restart, where dsrServices is empty but VPP still holds
+	// the DSR policy + steering) adopt the BSID from the existing VIP steering so
+	// we neither churn the BSID nor leak the old policy every restart; only when
+	// neither exists do we derive a fresh, collision-avoiding one.
 	var bsid ip_types.IP6Address
-	if st, ok := p.dsrServices[key]; ok {
+	switch st, ok := p.dsrServices[key]; {
+	case ok:
 		bsid = st.bsid
-	} else {
-		bsid = p.dsrBsidForVIP(svc.VIP)
+	default:
+		if adopted, found := p.adoptExistingDSRBsid(svc.VIP); found {
+			bsid = adopted
+		} else if derived, ok := p.dsrBsidForVIP(svc.VIP); ok {
+			bsid = derived
+		} else {
+			p.log.Errorf("SRv6Provider DSR: no free BSID for vip %s; skipping (fail-closed)", key)
+			return nil
+		}
 	}
 	policy := &types.SrPolicy{
 		Bsid:     bsid,
@@ -216,14 +227,35 @@ func (p *SRv6Provider) findNodeForPrefix(ip net.IP) net.IP {
 	return nil
 }
 
+// adoptExistingDSRBsid returns the BSID of an already-installed steering for
+// vip/128, if any. After an agent-only restart dsrServices is empty but VPP
+// still holds the DSR policy + steering; adopting the existing BSID lets the
+// reconcile reuse it (updating the policy in place) instead of deriving a fresh
+// one that would leak the old policy and churn the VIP's BSID every restart.
+func (p *SRv6Provider) adoptExistingDSRBsid(vip net.IP) (ip_types.IP6Address, bool) {
+	wantPrefix, err := ip_types.ParsePrefix(vip.String() + "/128")
+	if err != nil {
+		return ip_types.IP6Address{}, false
+	}
+	steerings, err := p.vpp.ListSRv6Steering()
+	if err != nil {
+		return ip_types.IP6Address{}, false
+	}
+	for _, s := range steerings {
+		if s != nil && s.TrafficType == types.SrSteerIPv6 && s.Prefix.String() == wantPrefix.String() {
+			return s.Bsid, true
+		}
+	}
+	return ip_types.IP6Address{}, false
+}
+
 // dsrBsidForVIP derives a BSID for a service from the policy pool: the pool
 // prefix with the VIP's host bytes overlaid, then perturbed if it would collide
-// with a BSID already in use by another (per-node pod-connectivity) SR policy.
-// Per-node BSIDs are IPAM-allocated from the same pool, so a naive derivation
-// could clobber a node's pod-connectivity policy on install/withdraw; avoiding
-// in-use BSIDs prevents that. The chosen value is cached per service in
-// dsrServices and reused across reconciles for stability.
-func (p *SRv6Provider) dsrBsidForVIP(vip net.IP) ip_types.IP6Address {
+// with a BSID already in use. Per-node pod-connectivity BSIDs are IPAM-allocated
+// from the same pool, so a naive derivation could clobber one; avoiding in-use
+// BSIDs prevents that. Returns ok=false when the perturbation budget is
+// exhausted so the caller fails closed rather than clobbering another policy.
+func (p *SRv6Provider) dsrBsidForVIP(vip net.IP) (ip_types.IP6Address, bool) {
 	bsid := make(net.IP, net.IPv6len)
 	copy(bsid, p.policyIPPool.IP.To16())
 	v := vip.To16()
@@ -231,18 +263,23 @@ func (p *SRv6Provider) dsrBsidForVIP(vip net.IP) ip_types.IP6Address {
 	for i := ones / 8; i < net.IPv6len && i < len(v); i++ {
 		bsid[i] = v[i]
 	}
-	taken := p.takenBsids()
-	for tries := 0; tries < 1024 && taken[bsid.String()]; tries++ {
+	taken := p.takenBsids(vip.String())
+	for tries := 0; tries < 1024; tries++ {
+		if !taken[bsid.String()] {
+			return types.ToVppIP6Address(bsid), true
+		}
 		bsid[net.IPv6len-1]++ // perturb low byte until free
 	}
-	return types.ToVppIP6Address(bsid)
+	return ip_types.IP6Address{}, false
 }
 
-// takenBsids returns the set of BSIDs already in use by non-DSR SR policies
-// (per-node pod-connectivity policies, learned via BGP and/or installed in VPP),
-// so DSR BSID derivation can avoid clobbering them. Our own DSR policies are
-// excluded so we don't perturb away from an already-chosen stable BSID.
-func (p *SRv6Provider) takenBsids() map[string]bool {
+// takenBsids returns the set of BSIDs already in use, so DSR BSID derivation can
+// avoid clobbering them. Per-node pod-connectivity BSIDs (BGP-learned and/or
+// installed in VPP) are always included; other DSR services' BSIDs are included
+// too (to avoid DSR-vs-DSR collision). Only exceptVIP's own cached BSID is
+// excluded, so we don't perturb away from an already-chosen stable value for the
+// VIP currently being derived.
+func (p *SRv6Provider) takenBsids(exceptVIP string) map[string]bool {
 	m := make(map[string]bool)
 	for _, np := range p.nodePolices {
 		for _, t := range np.SRv6Tunnel {
@@ -251,22 +288,18 @@ func (p *SRv6Provider) takenBsids() map[string]bool {
 			}
 		}
 	}
+	var exceptBsid *ip_types.IP6Address
+	if st, ok := p.dsrServices[exceptVIP]; ok {
+		b := st.bsid
+		exceptBsid = &b
+	}
 	if pols, err := p.vpp.ListSRv6Policies(); err == nil {
 		for _, pol := range pols {
-			if p.isOwnDSRBsid(pol.Bsid) {
+			if exceptBsid != nil && pol.Bsid == *exceptBsid {
 				continue
 			}
 			m[pol.Bsid.ToIP().String()] = true
 		}
 	}
 	return m
-}
-
-func (p *SRv6Provider) isOwnDSRBsid(b ip_types.IP6Address) bool {
-	for _, st := range p.dsrServices {
-		if st.bsid == b {
-			return true
-		}
-	}
-	return false
 }

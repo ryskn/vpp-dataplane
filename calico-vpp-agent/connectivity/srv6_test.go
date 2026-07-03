@@ -874,3 +874,69 @@ func TestDelConnectivity_DispatcherRoutesByEventShape(t *testing.T) {
 		t.Fatal("expected error for empty cn")
 	}
 }
+
+// ---------- DSR BSID lifecycle ----------
+
+func newDSRTestProvider(fake *fakeSRv6VPP) *SRv6Provider {
+	p := newTestProvider(fake)
+	_, pool, _ := net.ParseCIDR("cafe::/64")
+	p.policyIPPool = *pool
+	p.dsrServices = map[string]*dsrServiceState{}
+	return p
+}
+
+// A restart leaves dsrServices empty but VPP still holds the VIP steering; the
+// existing BSID must be adopted rather than a fresh one derived (no churn/leak).
+func TestAdoptExistingDSRBsid(t *testing.T) {
+	fake := &fakeSRv6VPP{}
+	p := newDSRTestProvider(fake)
+	want := mustBsid(t, "cafe::99")
+	fake.steering = []*types.SrSteer{{
+		TrafficType: types.SrSteerIPv6,
+		Prefix:      mustPrefix(t, "2001:db8::a/128"),
+		Bsid:        want,
+	}}
+
+	got, ok := p.adoptExistingDSRBsid(net.ParseIP("2001:db8::a"))
+	if !ok || got != want {
+		t.Fatalf("adopt = %v/%v, want %v/true", got, ok, want)
+	}
+	if _, ok := p.adoptExistingDSRBsid(net.ParseIP("2001:db8::b")); ok {
+		t.Fatal("expected no adoption for an unsteered VIP")
+	}
+}
+
+// dsrBsidForVIP must avoid BSIDs already in use and fail closed (ok=false) when
+// the perturbation budget is exhausted, rather than returning a colliding value.
+func TestDsrBsidForVIP_ExclusionAndFailClosed(t *testing.T) {
+	fake := &fakeSRv6VPP{}
+	p := newDSRTestProvider(fake)
+	vip := net.ParseIP("2001:db8::a")
+
+	b1, ok := p.dsrBsidForVIP(vip)
+	if !ok {
+		t.Fatal("expected an initial free BSID")
+	}
+
+	// Mark b1 taken via a node pod-connectivity policy: re-deriving must perturb.
+	p.nodePolices["n1"] = &NodeToPolicies{SRv6Tunnel: []common.SRv6Tunnel{{Bsid: b1.ToIP()}}}
+	b2, ok := p.dsrBsidForVIP(vip)
+	if !ok || b1 == b2 {
+		t.Fatalf("expected perturbation away from taken BSID, got %v (ok=%v)", b2, ok)
+	}
+
+	// Mark every low-byte variant taken: perturbation only walks the low byte, so
+	// all candidates collide and derivation must fail closed.
+	base := b1.ToIP().To16()
+	var tuns []common.SRv6Tunnel
+	for i := 0; i < 256; i++ {
+		v := make(net.IP, net.IPv6len)
+		copy(v, base)
+		v[net.IPv6len-1] = byte(i)
+		tuns = append(tuns, common.SRv6Tunnel{Bsid: v})
+	}
+	p.nodePolices["n1"] = &NodeToPolicies{SRv6Tunnel: tuns}
+	if _, ok := p.dsrBsidForVIP(vip); ok {
+		t.Fatal("expected fail-closed (no free BSID) when all candidates are taken")
+	}
+}
