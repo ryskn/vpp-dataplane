@@ -14,7 +14,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -169,16 +168,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Advertise the cluster pod CIDR to each backbone upstream once at startup
-	// (NAT-less return reachability). Idempotent; re-announced on restart.
-	if err := controller.AdvertiseClusterReturn(context.Background(), cfg, backboneBGP, log); err != nil {
-		log.Error(err, "advertise cluster return reachability")
+	// Keep the cluster pod CIDR advertised to each backbone upstream (NAT-less
+	// return reachability) via a leader-elected Runnable that re-asserts it
+	// periodically, instead of a one-shot at startup that a non-leader would
+	// also fire and a gobgp restart would silently lose.
+	if err := mgr.Add(&controller.ClusterReturnAdvertiser{Config: cfg, BackboneBGP: backboneBGP, Log: log}); err != nil {
+		log.Error(err, "add cluster-return advertiser")
 		os.Exit(1)
 	}
 
 	log.Info("starting bgp-controller", "version", versionString())
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		log.Error(err, "run manager")
+	startErr := mgr.Start(ctrl.SetupSignalHandler())
+
+	// Release the gobgp gRPC connections on shutdown.
+	if err := bgpDist.Close(); err != nil {
+		log.Error(err, "close bgp distributor")
+	}
+	for upstream, dist := range backboneBGP {
+		if err := dist.Close(); err != nil {
+			log.Error(err, "close backbone distributor", "upstream", upstream)
+		}
+	}
+
+	if startErr != nil {
+		log.Error(startErr, "run manager")
 		os.Exit(1)
 	}
 }
