@@ -88,6 +88,7 @@ type EgressSpec struct {
 	// steering so traffic uses the node default egress (fail-open). Defaults to
 	// "Drop".
 	// +kubebuilder:validation:Enum=Drop;Fallback
+	// +kubebuilder:default=Drop
 	// +optional
 	OnUnavailable string `json:"onUnavailable,omitempty"`
 }
