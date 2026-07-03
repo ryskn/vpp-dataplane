@@ -171,6 +171,25 @@ func TestReconcile_InvalidDestinationCIDRs(t *testing.T) {
 	}
 }
 
+// v1 requires the endpoint selector to match exactly one node; zero or more
+// than one must fail closed with EndpointResolution.
+func TestReconcile_EndpointMustMatchExactlyOneNode(t *testing.T) {
+	t.Run("zero nodes", func(t *testing.T) {
+		r := newReconciler(t, newPolicy("tenant-a", "uid-a", 100)) // no egress node
+		_ = reconcile(t, r, "tenant-a")
+		if cond := getReady(t, r, "tenant-a"); cond.Status != metav1.ConditionFalse || cond.Reason != "EndpointResolution" {
+			t.Fatalf("expected Ready=False/EndpointResolution, got %s/%s", cond.Status, cond.Reason)
+		}
+	})
+	t.Run("two nodes", func(t *testing.T) {
+		r := newReconciler(t, egressNode("egress-1"), egressNode("egress-2"), newPolicy("tenant-a", "uid-a", 100))
+		_ = reconcile(t, r, "tenant-a")
+		if cond := getReady(t, r, "tenant-a"); cond.Status != metav1.ConditionFalse || cond.Reason != "EndpointResolution" {
+			t.Fatalf("expected Ready=False/EndpointResolution, got %s/%s", cond.Status, cond.Reason)
+		}
+	})
+}
+
 func TestReconcile_UnknownColorIsTerminal(t *testing.T) {
 	// color 999 is not in the test config -> terminal, not-ready, not requeued.
 	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 999))
