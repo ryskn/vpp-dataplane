@@ -159,14 +159,26 @@ func TestReconcile_InvalidDestinationCIDRs(t *testing.T) {
 			p := newPolicy("tenant-a", "uid-a", 100)
 			p.Spec.DestinationCIDRs = cidrs
 			r := newReconciler(t, egressNode("egress-1"), p)
-			// markNotReady requeues by returning an error; we only care that the
-			// policy was marked not-ready with the right reason.
-			_ = reconcile(t, r, "tenant-a")
+			// Terminal spec error: not-ready recorded, and NOT requeued (nil err).
+			if err := reconcile(t, r, "tenant-a"); err != nil {
+				t.Fatalf("terminal spec error must not requeue, got err=%v", err)
+			}
 			cond := getReady(t, r, "tenant-a")
 			if cond.Status != metav1.ConditionFalse || cond.Reason != "InvalidDestinationCIDRs" {
 				t.Fatalf("expected Ready=False/InvalidDestinationCIDRs, got %s/%s", cond.Status, cond.Reason)
 			}
 		})
+	}
+}
+
+func TestReconcile_UnknownColorIsTerminal(t *testing.T) {
+	// color 999 is not in the test config -> terminal, not-ready, not requeued.
+	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 999))
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("unknown color must not requeue, got err=%v", err)
+	}
+	if cond := getReady(t, r, "tenant-a"); cond.Status != metav1.ConditionFalse || cond.Reason != "UnknownColor" {
+		t.Fatalf("expected Ready=False/UnknownColor, got %s/%s", cond.Status, cond.Reason)
 	}
 }
 
