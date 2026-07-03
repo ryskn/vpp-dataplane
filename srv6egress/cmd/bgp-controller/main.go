@@ -16,6 +16,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -109,6 +110,25 @@ func main() {
 		}
 		encoder = bgp.NewSRPolicyEncoder(bgp.SRPolicyOptions{})
 	case "color-route":
+		// Under the colored-route encoding the NLRI is the terminal SID /128 and
+		// the color is only an attribute, so two colors ending at the same SID
+		// collapse onto one BGP path: the second Announce replaces the first and
+		// withdrawing either withdraws the shared route. Reject that at load.
+		seenSID := map[string]uint32{}
+		for color, cc := range cfg.Colors {
+			if len(cc.SegmentList) == 0 {
+				continue // empty segmentList is already rejected by config.Validate
+			}
+			last := net.ParseIP(cc.SegmentList[len(cc.SegmentList)-1])
+			if last == nil {
+				continue // malformed SID is already rejected by config.Validate
+			}
+			if other, dup := seenSID[last.String()]; dup {
+				log.Error(fmt.Errorf("colors %d and %d share terminal SID %s; they collide under color-route encoding", color, other, last), "invalid config")
+				os.Exit(1)
+			}
+			seenSID[last.String()] = color
+		}
 		encoder = bgp.NewColoredEncoder()
 	default:
 		log.Error(fmt.Errorf("unknown bgp-encoding %q", bgpEncoding), "invalid flag")
