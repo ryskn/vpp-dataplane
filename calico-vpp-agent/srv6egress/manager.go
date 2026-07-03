@@ -220,7 +220,9 @@ func (m *Manager) reconcileLocked(st *policyState) {
 // traffic uses the node default egress. m.mu must be held.
 func (m *Manager) applyUnavailableLocked(st *policyState) {
 	if onUnavailableDrop(st.policy) {
-		desired := m.steering.desired(st.policy)
+		// BSID-agnostic: fail-closed must hold even before the SR Policy BSID is
+		// resolved (bring-up), where desired() would return nil and leak.
+		desired := m.steering.blackholeTargets(st.policy)
 		desiredKeys := make(map[string]struct{}, len(desired))
 		for _, req := range desired {
 			desiredKeys[req.key()] = struct{}{}
