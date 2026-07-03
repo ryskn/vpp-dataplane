@@ -25,6 +25,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
@@ -82,6 +83,12 @@ func main() {
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
+			// Require authn/authz on the metrics endpoint (TokenReview +
+			// SubjectAccessReview) instead of serving it in plaintext to anyone
+			// who can reach the pod. Scrapers need a bearer token and the
+			// controller SA needs auth-delegation RBAC.
+			SecureServing:  true,
+			FilterProvider: filters.WithAuthenticationAndAuthorization,
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
