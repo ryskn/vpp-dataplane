@@ -56,8 +56,15 @@ func (w *Watcher) Watch(t *tomb.Tomb) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		<-t.Dying()
-		cancel()
+		// Exit on ctx.Done() too: when Watch returns for a non-shutdown reason
+		// (List/Watch error, channel closed) the defer cancel() above fires, and
+		// without this case the goroutine would block on t.Dying() forever —
+		// leaking one goroutine per Watch() retry.
+		select {
+		case <-t.Dying():
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	// List-then-watch: feed the current state, prune policies deleted while no
