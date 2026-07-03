@@ -393,7 +393,7 @@ func srPolicyIntentEqual(a, b *srv6egressv1.SRPolicyStatus) bool {
 }
 
 func setReady(ep *srv6egressv1.EgressPolicy, status metav1.ConditionStatus, reason, message string) {
-	setCondition(ep, "Ready", status, reason, message)
+	setCondition(ep, srv6egressv1.ConditionReady, status, reason, message)
 }
 
 func setCondition(ep *srv6egressv1.EgressPolicy, condType string, status metav1.ConditionStatus, reason, message string) {

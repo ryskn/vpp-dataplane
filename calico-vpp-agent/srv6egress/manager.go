@@ -280,7 +280,7 @@ func policyBSID(ep *srv6egressv1.EgressPolicy) net.IP {
 // onUnavailableDrop reports whether the policy should blackhole (fail-closed)
 // when its SR Policy is unavailable. Empty defaults to Drop.
 func onUnavailableDrop(ep *srv6egressv1.EgressPolicy) bool {
-	return ep == nil || ep.Spec.Egress.OnUnavailable != "Fallback"
+	return ep == nil || ep.Spec.Egress.OnUnavailable != srv6egressv1.OnUnavailableFallback
 }
 
 // nopResolver matches no pods. Used by NewManager (unit tests) so the policy
@@ -294,7 +294,7 @@ func (nopResolver) MatchingLocalPodIPs(srv6egressv1.Selector) ([]net.IP, error) 
 // isReady returns true once the controller has marked the policy Ready=True.
 func isReady(ep *srv6egressv1.EgressPolicy) bool {
 	for _, c := range ep.Status.Conditions {
-		if c.Type == "Ready" && c.Status == metav1.ConditionTrue {
+		if c.Type == srv6egressv1.ConditionReady && c.Status == metav1.ConditionTrue {
 			return true
 		}
 	}

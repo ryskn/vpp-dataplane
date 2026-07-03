@@ -7,6 +7,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Shared string constants for the Ready condition type and OnUnavailable modes.
+// Both the control plane (controller) and data plane (agent) compare against
+// these, where a bare-literal typo would silently mis-gate steering.
+const (
+	// ConditionReady is the status condition type set by the controller.
+	ConditionReady = "Ready"
+	// OnUnavailableDrop blackholes destinationCIDRs when the SR Policy is absent
+	// (fail-closed); the empty value defaults to this.
+	OnUnavailableDrop = "Drop"
+	// OnUnavailableFallback removes steering so traffic uses the node default
+	// egress when the SR Policy is absent (fail-open).
+	OnUnavailableFallback = "Fallback"
+)
+
 // EgressPolicy is the Schema for declaring per-tenant SRv6 egress path steering.
 // A namespace/pod selector picks source workloads; matched egress traffic is
 // SRv6-steered through the SR Policy resolved from <color, endpoint> and decapped

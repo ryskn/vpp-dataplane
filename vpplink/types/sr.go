@@ -85,14 +85,6 @@ type SrLocalsid struct {
 	FunctionLen     uint8
 }
 
-func (l *SrLocalsid) SetBehavior(code uint8) {
-	l.Behavior = SrBehavior(code)
-}
-
-func (l *SrLocalsid) CompareBehaviorTo(behavior uint8) bool {
-	return uint8(l.Behavior) == behavior
-}
-
 // IsUSID reports whether the localsid carries a uSID (NEXT-CSID) SID structure and
 // must be programmed via the v2 localsid API.
 func (l *SrLocalsid) IsUSID() bool {
