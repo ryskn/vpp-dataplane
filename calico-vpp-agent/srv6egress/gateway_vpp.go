@@ -107,19 +107,21 @@ func (g *vppGateway) bindVRFs(vrf, upstreamTable uint32) error {
 	return g.cliOK(fmt.Sprintf("ip6 table add %d", vrf), "already")
 }
 
-// localsidExists reports whether a localsid with ls's address is already
-// installed in VPP (AddSRv6Localsid is not idempotent, so callers check first).
-func (g *vppGateway) localsidExists(ls *types.SrLocalsid) bool {
+// findLocalsid returns the installed localsid with ls's address, or nil.
+// AddSRv6Localsid is not idempotent, so callers check first; the returned
+// entry's SwIfIndex carries the decap VRF the persisted localsid uses (the
+// dump maps xconnect_iface_or_vrf_table into SwIfIndex).
+func (g *vppGateway) findLocalsid(ls *types.SrLocalsid) *types.SrLocalsid {
 	list, err := g.vpp.ListSRv6Localsid()
 	if err != nil {
-		return false
+		return nil
 	}
 	for _, l := range list {
 		if l.Localsid == ls.Localsid {
-			return true
+			return l
 		}
 	}
-	return false
+	return nil
 }
 
 // installTenantDataPath installs the End.DT6 decap, the egress default route, and
@@ -128,15 +130,29 @@ func (g *vppGateway) installTenantDataPath(req GatewayRequest) error {
 	vrf := req.VrfTable
 	// End.DT6 (or uDT6 for a uSID upstream): decap straight into the tenant VRF
 	// FIB. No SNAT, no loopback; the pod source address is preserved (L3VPN).
-	// AddSRv6Localsid is NOT idempotent (VPP errors on re-adding an existing
-	// localsid), and the manager re-runs InstallGateway after an agent restart
-	// (VPP keeps the localsid across an agent-only restart, so st.install is lost
-	// but the SID persists). Skip the add when the SID is already present —
-	// otherwise the failing re-add would block the post-install SID advertisement.
+	// AddSRv6Localsid is NOT idempotent, and the manager re-runs InstallGateway
+	// after an agent-only restart (VPP keeps the localsid, but the in-memory
+	// vrfAllocator restarts, so this tenant may now map to a different table id).
 	ls := tenantLocalsid(req)
-	if !g.localsidExists(ls) {
+	switch existing := g.findLocalsid(ls); {
+	case existing == nil:
 		if err := g.vpp.AddSRv6Localsid(ls); err != nil {
 			return fmt.Errorf("install tenant localsid %s: %w", req.TenantSID, err)
+		}
+	case uint32(existing.SwIfIndex) != vrf:
+		// Persisted localsid decaps into a stale VRF (baked from a previous
+		// process's allocation). Left as-is it would decap into a table with no
+		// egress route (blackhole) or another tenant's VRF (cross-wire). Rewrite
+		// it so decap lands in this process's VRF. Delete keys on the SID
+		// address, so ls removes the persisted entry regardless of its old VRF.
+		g.log.WithFields(logrus.Fields{
+			"sid": req.TenantSID, "staleVRF": uint32(existing.SwIfIndex), "vrf": vrf,
+		}).Info("rewriting tenant localsid decap VRF after restart")
+		if err := g.vpp.DelSRv6Localsid(ls); err != nil {
+			return fmt.Errorf("replace tenant localsid %s (del): %w", req.TenantSID, err)
+		}
+		if err := g.vpp.AddSRv6Localsid(ls); err != nil {
+			return fmt.Errorf("replace tenant localsid %s (add): %w", req.TenantSID, err)
 		}
 	}
 	// egress: the tenant VRF default leaves via the shared upstream VRF.
