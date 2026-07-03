@@ -173,6 +173,7 @@ spec:
                         the steering so traffic uses the node default egress
                         (fail-open). Defaults to "Drop".
                       type: string
+                      default: Drop
                       enum: [Drop, Fallback]
             status:
               type: object
