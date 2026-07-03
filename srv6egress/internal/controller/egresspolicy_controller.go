@@ -74,7 +74,9 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// 1) Resolve the desired plan: color → upstream/segments, endpoint, and the
 	// RFC 9256 <color, endpoint> uniqueness check.
 	plan, res, err := r.resolvePlan(ctx, &ep)
-	if err != nil {
+	if err != nil || plan == nil {
+		// plan == nil with err == nil is a terminal not-ready (marked in
+		// resolvePlan): stop without requeue.
 		return res, err
 	}
 
@@ -137,13 +139,13 @@ func validateDestinationCIDRs(cidrs []string) error {
 // it marks the policy not-ready and returns the error to requeue.
 func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egressv1.EgressPolicy) (*reconcilePlan, ctrl.Result, error) {
 	if err := validateDestinationCIDRs(ep.Spec.DestinationCIDRs); err != nil {
-		res, err := r.markNotReady(ctx, ep, "InvalidDestinationCIDRs", err.Error())
+		res, err := r.markNotReadyTerminal(ctx, ep, "InvalidDestinationCIDRs", err.Error())
 		return nil, res, err
 	}
 
 	cc, ok := r.Config.Colors[ep.Spec.Egress.Color]
 	if !ok {
-		res, err := r.markNotReady(ctx, ep, "UnknownColor",
+		res, err := r.markNotReadyTerminal(ctx, ep, "UnknownColor",
 			fmt.Sprintf("color %d is not defined in controller config", ep.Spec.Egress.Color))
 		return nil, res, err
 	}
@@ -351,6 +353,21 @@ func (r *EgressPolicyReconciler) markNotReady(ctx context.Context, ep *srv6egres
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, fmt.Errorf("%s: %s", reason, message)
+}
+
+// markNotReadyTerminal is markNotReady for spec/config errors that cannot be
+// fixed by retrying (unknown color, invalid destinationCIDRs): it records the
+// condition but returns no error, so the reconciler does not hot-loop at error
+// level. A spec edit re-triggers reconcile via the EgressPolicy watch, and a
+// config change requires a process restart, so a rate-limited requeue buys
+// nothing here.
+func (r *EgressPolicyReconciler) markNotReadyTerminal(ctx context.Context, ep *srv6egressv1.EgressPolicy, reason, message string) (ctrl.Result, error) {
+	setReady(ep, metav1.ConditionFalse, reason, message)
+	if err := r.Status().Update(ctx, ep); err != nil {
+		return ctrl.Result{}, err
+	}
+	ctrl.LoggerFrom(ctx).Info("policy not ready (terminal spec error, not requeued)", "reason", reason, "message", message)
+	return ctrl.Result{}, nil
 }
 
 // srPolicyIntentEqual compares the withdraw-relevant fields of two SR Policy
