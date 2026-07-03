@@ -769,9 +769,12 @@ func (p *SRv6Provider) getSidFromPool(poolName string) (newSidAddr ip_types.IP6A
 		IPv6Pools:   poolIPNet,
 		IntendedUse: "Tunnel",
 	})
-	if err != nil || newSids == nil {
+	if err != nil || newSids == nil || len(newSids.IPs) == 0 {
 		p.log.Infof("SRv6Provider Error assigning ip LocalSid")
-		return newSidAddr, errors.Wrapf(err, "SRv6Provider Error getSidFromPool")
+		if err == nil {
+			err = fmt.Errorf("SRv6 SID pool %s exhausted", poolName)
+		}
+		return newSidAddr, errors.Wrap(err, "SRv6Provider Error getSidFromPool")
 	}
 
 	newSidAddr = types.ToVppIP6Address(newSids.IPs[0].IP)
