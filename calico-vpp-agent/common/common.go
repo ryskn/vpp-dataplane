@@ -534,6 +534,27 @@ type SRv6Tunnel struct {
 	Priority      uint32
 	Color         uint32
 	Distinguisher uint32
+
+	// Preference selects the active candidate path among candidates of the same
+	// SR Policy <color, endpoint>: higher wins, default 100 (RFC 9256 §2.7/§2.9).
+	// Priority above is unrelated: it orders revalidation work (§2.12, lower
+	// value first, default 128).
+	Preference uint32
+	// OriginatorASN/OriginatorNode break preference ties (§2.9: lower originator
+	// wins). Filled from the BGP path source (peer ASN / router-id).
+	OriginatorASN  uint32
+	OriginatorNode string
+	// SpecifiedBSIDOnly is the BSID sub-TLV S-Flag (§6.2.3): when set, a
+	// candidate without a usable specified BSID is invalid (no dynamic allocation).
+	SpecifiedBSIDOnly bool
+	// DropUponInvalid is the BSID sub-TLV I-Flag (§8.2): when the policy becomes
+	// invalid, steered traffic is dropped (fail-closed) instead of falling back
+	// to routing.
+	DropUponInvalid bool
+	// VerifyMasks holds, per Policy.SidLists entry, a bitmask of segments that
+	// requested SID verification (V-Flag, bit i = Sids[i]). The first SID is
+	// always verified regardless (RFC 9256 §5.1).
+	VerifyMasks []uint32
 }
 
 func GetBGPSpecAddresses(nodeBGPSpec *LocalNodeSpec) (ip4 *net.IP, ip6 *net.IP) {

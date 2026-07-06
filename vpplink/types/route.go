@@ -63,6 +63,7 @@ func FromFibPath(vppPath fib_types.FibPath) RoutePath {
 		Gw:        FromVppIPAddressUnion(vppPath.Nh.Address, vppPath.Proto == fib_types.FIB_API_PATH_NH_PROTO_IP6),
 		Table:     vppPath.TableID,
 		SwIfIndex: vppPath.SwIfIndex,
+		IsDrop:    vppPath.Type == fib_types.FIB_API_PATH_TYPE_DROP,
 	}
 }
 

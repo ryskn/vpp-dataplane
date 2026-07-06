@@ -58,6 +58,31 @@ func (v *VppLink) GetRoutes(tableID uint32, isIPv6 bool) ([]types.Route, error) 
 	return routes, nil
 }
 
+// RouteLookup performs a longest-prefix-match lookup for dst in the given FIB
+// table and returns the matching route, or nil when the table has no covering
+// entry. Note the IPv6 FIB always holds a default drop entry, so a non-nil
+// result may still be a drop route (check Paths[i].IsDrop).
+func (v *VppLink) RouteLookup(dst *net.IPNet, tableID uint32) (*types.Route, error) {
+	client := vppip.NewServiceClient(v.GetConnection())
+
+	response, err := client.IPRouteLookup(v.GetContext(), &vppip.IPRouteLookup{
+		TableID: tableID,
+		Exact:   0, // LPM
+		Prefix:  types.ToVppPrefix(dst),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to lookup route in VPP: %w", err)
+	}
+	if response.Retval != 0 {
+		return nil, nil // no covering entry
+	}
+	return &types.Route{
+		Dst:   types.FromVppPrefix(response.Route.Prefix),
+		Table: response.Route.TableID,
+		Paths: types.FromFibPathList(response.Route.Paths),
+	}, nil
+}
+
 func (v *VppLink) RoutesAdd(Dsts []*net.IPNet, routepath *types.RoutePath) error {
 	/* add the same route for multiple dsts */
 	for _, dst := range Dsts {

@@ -1,6 +1,7 @@
 package connectivity
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -32,6 +33,11 @@ type fakeSRv6VPP struct {
 	addModPolicyErr error
 	delSteeringErr  error
 	delPolicyErr    error
+
+	// unreachableSids drives RouteLookup: SIDs listed here resolve to a
+	// drop-only route (unreachable); everything else resolves normally.
+	unreachableSids map[string]bool
+	routeLookupErr  error
 }
 
 func (f *fakeSRv6VPP) ListSRv6Localsid() ([]*types.SrLocalsid, error) { return nil, nil }
@@ -66,15 +72,35 @@ func (f *fakeSRv6VPP) ListSRv6Steering() ([]*types.SrSteer, error) {
 	return f.steering, f.listSteeringErr
 }
 
+func (f *fakeSRv6VPP) RouteLookup(dst *net.IPNet, tableID uint32) (*types.Route, error) {
+	if f.routeLookupErr != nil {
+		return nil, f.routeLookupErr
+	}
+	if f.unreachableSids[dst.IP.String()] {
+		return &types.Route{Dst: dst, Paths: []types.RoutePath{{IsDrop: true}}}, nil
+	}
+	return &types.Route{Dst: dst, Paths: []types.RoutePath{{Gw: net.ParseIP("fd00::1")}}}, nil
+}
+
 func newTestProvider(fake *fakeSRv6VPP) *SRv6Provider {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
-	return &SRv6Provider{
+	p := &SRv6Provider{
 		ConnectivityProviderData: &ConnectivityProviderData{log: logrus.NewEntry(logger)},
 		vpp:                      fake,
 		nodePrefixes:             make(map[string]*NodeToPrefixes),
 		nodePolices:              make(map[string]*NodeToPolicies),
+		dynBsids:                 make(map[string]ip_types.IP6Address),
+		droppedPrefixes:          make(map[string]dropState),
 	}
+	// Deterministic fake BSID allocator; tests asserting IPAM interplay override.
+	next := 0
+	p.allocBsid = func(handle string) (net.IP, error) {
+		next++
+		return net.ParseIP(fmt.Sprintf("fd00:b51d::%x", next)), nil
+	}
+	p.releaseBsid = func(handle string) error { return nil }
+	return p
 }
 
 func mustBsid(t *testing.T, s string) ip_types.IP6Address {
@@ -107,7 +133,7 @@ func TestTunnelBsid(t *testing.T) {
 		wantOK  bool
 		wantStr string
 	}{
-		{"policy wins", common.SRv6Tunnel{Policy: &types.SrPolicy{Bsid: policyBsid}, Bsid: netBsid}, true, policyBsid.String()},
+		{"policy wins", common.SRv6Tunnel{Policy: &types.SrPolicy{Bsid: policyBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}, Bsid: netBsid}, true, policyBsid.String()},
 		{"net.IP fallback", common.SRv6Tunnel{Bsid: netBsid}, true, types.ToVppIP6Address(netBsid).String()},
 		{"policy with zero bsid falls back to net.IP", common.SRv6Tunnel{Policy: &types.SrPolicy{}, Bsid: netBsid}, true, types.ToVppIP6Address(netBsid).String()},
 		{"neither set", common.SRv6Tunnel{}, false, ""},
@@ -159,8 +185,8 @@ func TestDelSRPolicy_NLRIKeyMismatchLeavesSiblingsAlone(t *testing.T) {
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node: dst,
 		SRv6Tunnel: []common.SRv6Tunnel{
-			{Dst: dst, Color: 4, Policy: &types.SrPolicy{Bsid: dt4Bsid}, Priority: 100},
-			{Dst: dst, Color: 6, Policy: &types.SrPolicy{Bsid: dt6Bsid}, Priority: 100},
+			{Dst: dst, Color: 4, Policy: &types.SrPolicy{Bsid: dt4Bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}, Priority: 100},
+			{Dst: dst, Color: 6, Policy: &types.SrPolicy{Bsid: dt6Bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}, Priority: 100},
 		},
 	}
 	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 4}}
@@ -213,7 +239,7 @@ func TestDelSRPolicy_DeletesPolicyAndAssociatedSteering(t *testing.T) {
 	p := newTestProvider(fake)
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node:       dst,
-		SRv6Tunnel: []common.SRv6Tunnel{{Dst: dst, Color: 6, Policy: &types.SrPolicy{Bsid: bsid}}},
+		SRv6Tunnel: []common.SRv6Tunnel{{Dst: dst, Color: 6, Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}}},
 	}
 
 	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6}}
@@ -261,8 +287,8 @@ func TestDelSRPolicy_FailoverOntoSurvivingCandidate(t *testing.T) {
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node: dst,
 		SRv6Tunnel: []common.SRv6Tunnel{
-			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: winnerBsid}},
-			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: loserBsid}},
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: winnerBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: loserBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
 		},
 	}
 
@@ -319,8 +345,8 @@ func TestDelSRPolicy_FailoverPreservesNodeIPSteeringFibTable(t *testing.T) {
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node: dst,
 		SRv6Tunnel: []common.SRv6Tunnel{
-			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: winnerBsid}},
-			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: loserBsid}},
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: winnerBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: loserBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
 		},
 	}
 
@@ -363,7 +389,7 @@ func TestDelSRPolicy_TearsDownNodeIPSteeringWhenNoSurvivor(t *testing.T) {
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node: dst,
 		SRv6Tunnel: []common.SRv6Tunnel{
-			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: bsid}},
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
 		},
 	}
 
@@ -396,7 +422,7 @@ func TestDelSRPolicy_NoSurvivingCandidateLeavesPrefixUnsteered(t *testing.T) {
 	p := newTestProvider(fake)
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node:       dst,
-		SRv6Tunnel: []common.SRv6Tunnel{{Dst: dst, Color: 6, Policy: &types.SrPolicy{Bsid: bsid}}},
+		SRv6Tunnel: []common.SRv6Tunnel{{Dst: dst, Color: 6, Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}}},
 	}
 
 	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6}}
@@ -592,7 +618,7 @@ func TestAddConnectivity_BsidChangeCleansUpAfterRePoint(t *testing.T) {
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 100,
-			Policy: &types.SrPolicy{Bsid: oldBsid},
+			Policy: &types.SrPolicy{Bsid: oldBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (old): %v", err)
@@ -605,7 +631,7 @@ func TestAddConnectivity_BsidChangeCleansUpAfterRePoint(t *testing.T) {
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 100,
-			Policy: &types.SrPolicy{Bsid: newBsid},
+			Policy: &types.SrPolicy{Bsid: newBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (new): %v", err)
@@ -659,7 +685,7 @@ func TestAddConnectivity_BsidChangeSkipsCleanupWhenStillReferenced(t *testing.T)
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
-			Policy: &types.SrPolicy{Bsid: oldBsid},
+			Policy: &types.SrPolicy{Bsid: oldBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (old): %v", err)
@@ -668,7 +694,7 @@ func TestAddConnectivity_BsidChangeSkipsCleanupWhenStillReferenced(t *testing.T)
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
-			Policy: &types.SrPolicy{Bsid: newBsid},
+			Policy: &types.SrPolicy{Bsid: newBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (new): %v", err)
@@ -706,7 +732,7 @@ func TestAddConnectivity_BsidChangePendingRetryOnNextEvent(t *testing.T) {
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
-			Policy: &types.SrPolicy{Bsid: oldBsid},
+			Policy: &types.SrPolicy{Bsid: oldBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (old): %v", err)
@@ -715,7 +741,7 @@ func TestAddConnectivity_BsidChangePendingRetryOnNextEvent(t *testing.T) {
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 1, Priority: 100,
-			Policy: &types.SrPolicy{Bsid: newBsid},
+			Policy: &types.SrPolicy{Bsid: newBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (new): %v", err)
@@ -742,7 +768,7 @@ func TestAddConnectivity_BsidChangePendingRetryOnNextEvent(t *testing.T) {
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{
 			Dst: dst, Color: 6, Distinguisher: 99, Priority: 50,
-			Policy: &types.SrPolicy{Bsid: otherBsid},
+			Policy: &types.SrPolicy{Bsid: otherBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}},
 		},
 	}); err != nil {
 		t.Fatalf("AddConnectivity (third event): %v", err)
@@ -805,8 +831,8 @@ func TestAddConnectivity_DifferentNLRIKeysCoexist(t *testing.T) {
 	p := newTestProvider(fake)
 
 	for _, tun := range []common.SRv6Tunnel{
-		{Dst: dst, Color: 6, Distinguisher: 1, Priority: 100, Policy: &types.SrPolicy{Bsid: bsidA}},
-		{Dst: dst, Color: 6, Distinguisher: 2, Priority: 50, Policy: &types.SrPolicy{Bsid: bsidB}},
+		{Dst: dst, Color: 6, Distinguisher: 1, Priority: 100, Policy: &types.SrPolicy{Bsid: bsidA, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+		{Dst: dst, Color: 6, Distinguisher: 2, Priority: 50, Policy: &types.SrPolicy{Bsid: bsidB, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
 	} {
 		tun := tun
 		if err := p.AddConnectivity(&common.NodeConnectivity{NextHop: dst, Custom: &tun}); err != nil {
@@ -841,8 +867,8 @@ func TestDelSRPolicy_IdempotentWhenVPPAlreadyMissing(t *testing.T) {
 	p.nodePolices[dst.String()] = &NodeToPolicies{
 		Node: dst,
 		SRv6Tunnel: []common.SRv6Tunnel{
-			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: bsid}},
-			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: surviverBsid}},
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: dt6Behavior, Priority: 100, Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: dt6Behavior, Priority: 50, Policy: &types.SrPolicy{Bsid: surviverBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
 		},
 	}
 
@@ -938,5 +964,329 @@ func TestDsrBsidForVIP_ExclusionAndFailClosed(t *testing.T) {
 	p.nodePolices["n1"] = &NodeToPolicies{SRv6Tunnel: tuns}
 	if _, ok := p.dsrBsidForVIP(vip); ok {
 		t.Fatal("expected fail-closed (no free BSID) when all candidates are taken")
+	}
+}
+
+// ---------- RFC 9256 candidate-path selection (§2.9) ----------
+
+const testDT6Behavior = uint8(18) // bgpapi.SRv6Behavior_END_DT6
+
+// Preference (not Priority) selects the active candidate: higher wins (§2.7/§2.9).
+func TestGetPolicyNode_SelectsByPreference(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	lowBsid := mustBsid(t, "cafe::aa")
+	highBsid := mustBsid(t, "cafe::bb")
+	p := newTestProvider(&fakeSRv6VPP{})
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			// Priority is intentionally "better" on the losing candidate: it must
+			// not influence selection (it only orders revalidation, §2.12).
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: testDT6Behavior, Preference: 100, Priority: 1,
+				Policy: &types.SrPolicy{Bsid: lowBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: testDT6Behavior, Preference: 200, Priority: 255,
+				Policy: &types.SrPolicy{Bsid: highBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+		},
+	}
+	policy, err := p.getPolicyNode(dst.String(), types.SrBehaviorDT6)
+	if err != nil || policy == nil {
+		t.Fatalf("getPolicyNode: %v policy=%v", err, policy)
+	}
+	if policy.Bsid != highBsid {
+		t.Fatalf("selected bsid=%s, want preference-200 candidate %s", policy.Bsid.String(), highBsid.String())
+	}
+}
+
+// Preference tie → lower originator wins, then higher discriminator (§2.9).
+func TestGetPolicyNode_TieBreaks(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	aBsid := mustBsid(t, "cafe::aa")
+	bBsid := mustBsid(t, "cafe::bb")
+	p := newTestProvider(&fakeSRv6VPP{})
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			{Dst: dst, Color: 6, Distinguisher: 5, Behavior: testDT6Behavior, Preference: 100, OriginatorASN: 65001,
+				Policy: &types.SrPolicy{Bsid: aBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			{Dst: dst, Color: 6, Distinguisher: 9, Behavior: testDT6Behavior, Preference: 100, OriginatorASN: 65000,
+				Policy: &types.SrPolicy{Bsid: bBsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+		},
+	}
+	policy, _ := p.getPolicyNode(dst.String(), types.SrBehaviorDT6)
+	if policy == nil || policy.Bsid != bBsid {
+		t.Fatalf("want lower-originator candidate (ASN 65000), got %+v", policy)
+	}
+
+	// Same originator → higher discriminator wins.
+	p.nodePolices[dst.String()].SRv6Tunnel[0].OriginatorASN = 65000
+	policy, _ = p.getPolicyNode(dst.String(), types.SrBehaviorDT6)
+	if policy == nil || policy.Bsid != bBsid {
+		t.Fatalf("want higher-discriminator candidate (disc 9), got %+v", policy)
+	}
+}
+
+// ---------- dynamic BSID allocation (§6.2.1) ----------
+
+func TestGetPolicyNode_DynamicBSID(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+	released := []string{}
+	p.releaseBsid = func(handle string) error { released = append(released, handle); return nil }
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			// No BSID advertised: the provider must bind one dynamically.
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: testDT6Behavior, Preference: 100,
+				Policy: &types.SrPolicy{SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+		},
+	}
+	policy, err := p.getPolicyNode(dst.String(), types.SrBehaviorDT6)
+	if err != nil || policy == nil {
+		t.Fatalf("getPolicyNode: %v policy=%v", err, policy)
+	}
+	if (policy.Bsid == ip_types.IP6Address{}) {
+		t.Fatal("expected a dynamically bound BSID, got zero")
+	}
+	first := policy.Bsid
+
+	// The binding is policy-scoped: a second selection reuses the same BSID (§6.2.1).
+	policy, _ = p.getPolicyNode(dst.String(), types.SrBehaviorDT6)
+	if policy == nil || policy.Bsid != first {
+		t.Fatalf("dynamic BSID must be stable, got %v want %v", policy.Bsid, first)
+	}
+
+	// Withdrawing the last candidate of the policy releases the binding.
+	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6, Distinguisher: 0}}
+	if err := p.delSRPolicy(cn); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+	if len(released) != 1 {
+		t.Fatalf("expected dynamic BSID released once, got %v", released)
+	}
+	if len(p.dynBsids) != 0 {
+		t.Fatalf("dynBsids not cleaned: %v", p.dynBsids)
+	}
+}
+
+// S-Flag (Specified-BSID-only, §6.2.3) forbids dynamic allocation.
+func TestGetPolicyNode_SFlagWithoutBSIDInvalid(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	p := newTestProvider(&fakeSRv6VPP{})
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			{Dst: dst, Color: 6, Behavior: testDT6Behavior, Preference: 100, SpecifiedBSIDOnly: true,
+				Policy: &types.SrPolicy{SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+		},
+	}
+	if policy, _ := p.getPolicyNode(dst.String(), types.SrBehaviorDT6); policy != nil {
+		t.Fatalf("S-Flag candidate without BSID must be invalid, got %+v", policy)
+	}
+}
+
+// ---------- SID reachability verification (§5.1) ----------
+
+func TestGetPolicyNode_UnreachableFirstSIDInvalidates(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	sid := types.ToVppIP6Address(net.ParseIP("fd10::1"))
+	fake := &fakeSRv6VPP{unreachableSids: map[string]bool{"fd10::1": true}}
+	p := newTestProvider(fake)
+	sids := [16]ip_types.IP6Address{}
+	sids[0] = sid
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			{Dst: dst, Color: 6, Behavior: testDT6Behavior, Preference: 100,
+				Policy: &types.SrPolicy{Bsid: mustBsid(t, "cafe::aa"),
+					SidLists: []types.Srv6SidList{{NumSids: 1, Sids: sids}}}},
+		},
+	}
+	if policy, _ := p.getPolicyNode(dst.String(), types.SrBehaviorDT6); policy != nil {
+		t.Fatalf("candidate with unreachable first SID must be invalid, got %+v", policy)
+	}
+
+	// Lookup failure fails open: the candidate stays valid.
+	fake.unreachableSids = nil
+	fake.routeLookupErr = fmt.Errorf("vpp lookup broken")
+	if policy, _ := p.getPolicyNode(dst.String(), types.SrBehaviorDT6); policy == nil {
+		t.Fatal("lookup failure must fail open (candidate valid)")
+	}
+}
+
+// Non-first SIDs are only verified when their V-Flag is set (§5.1).
+func TestGetPolicyNode_VFlagVerification(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	fake := &fakeSRv6VPP{unreachableSids: map[string]bool{"fd10::2": true}}
+	p := newTestProvider(fake)
+	sids := [16]ip_types.IP6Address{}
+	sids[0] = types.ToVppIP6Address(net.ParseIP("fd10::1"))
+	sids[1] = types.ToVppIP6Address(net.ParseIP("fd10::2")) // unreachable
+	tun := common.SRv6Tunnel{Dst: dst, Color: 6, Behavior: testDT6Behavior, Preference: 100,
+		Policy: &types.SrPolicy{Bsid: mustBsid(t, "cafe::aa"),
+			SidLists: []types.Srv6SidList{{NumSids: 2, Sids: sids}}}}
+
+	// Without V-Flag on the second SID the candidate is fine.
+	p.nodePolices[dst.String()] = &NodeToPolicies{Node: dst, SRv6Tunnel: []common.SRv6Tunnel{tun}}
+	if policy, _ := p.getPolicyNode(dst.String(), types.SrBehaviorDT6); policy == nil {
+		t.Fatal("unverified non-first SID must not invalidate the list")
+	}
+
+	// With V-Flag requesting verification of segment 1 it becomes invalid.
+	tun.VerifyMasks = []uint32{1 << 1}
+	p.nodePolices[dst.String()] = &NodeToPolicies{Node: dst, SRv6Tunnel: []common.SRv6Tunnel{tun}}
+	if policy, _ := p.getPolicyNode(dst.String(), types.SrBehaviorDT6); policy != nil {
+		t.Fatalf("V-Flag SID unreachable must invalidate the list, got %+v", policy)
+	}
+}
+
+// ---------- drop-upon-invalid (§8.2, I-Flag) ----------
+
+func TestDelSRPolicy_DropUponInvalid(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	bsid := mustBsid(t, "cafe::aa")
+	survivorSid := "fd10::99" // unreachable -> survivor invalid -> no failover target
+	prefix := mustPrefix(t, "fd20::1/128")
+	sids := [16]ip_types.IP6Address{}
+	sids[0] = types.ToVppIP6Address(net.ParseIP(survivorSid))
+
+	fake := &fakeSRv6VPP{
+		steering:        []*types.SrSteer{{Bsid: bsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}},
+		unreachableSids: map[string]bool{survivorSid: true},
+	}
+	p := newTestProvider(fake)
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			// active candidate, I-Flag set
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: testDT6Behavior, Preference: 200, DropUponInvalid: true,
+				Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			// surviving candidate is unreachable -> policy exists but is invalid
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: testDT6Behavior, Preference: 100,
+				Policy: &types.SrPolicy{Bsid: mustBsid(t, "cafe::bb"), SidLists: []types.Srv6SidList{{NumSids: 1, Sids: sids}}}},
+		},
+	}
+
+	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6, Distinguisher: 0}}
+	if err := p.delSRPolicy(cn); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+	if len(fake.routeAdd) != 1 || len(fake.routeAdd[0].Paths) != 1 || !fake.routeAdd[0].Paths[0].IsDrop {
+		t.Fatalf("expected one drop route for the orphaned prefix, got %+v", fake.routeAdd)
+	}
+	if len(p.droppedPrefixes) != 1 {
+		t.Fatalf("droppedPrefixes not tracked: %v", p.droppedPrefixes)
+	}
+
+	// The survivor becomes reachable again: revalidation must lift the drop and re-steer.
+	fake.unreachableSids = nil
+	p.nodePrefixes[dst.String()] = &NodeToPrefixes{Node: dst, Prefixes: []ip_types.Prefix{prefix}}
+	p.revalidatePolicies()
+	if len(fake.routeDel) != 1 {
+		t.Fatalf("expected the drop route removed on recovery, got %+v", fake.routeDel)
+	}
+	if len(p.droppedPrefixes) != 0 {
+		t.Fatalf("droppedPrefixes not cleared: %v", p.droppedPrefixes)
+	}
+	if len(fake.addSteering) == 0 {
+		t.Fatal("expected the prefix re-steered after recovery")
+	}
+}
+
+// Without the I-Flag the prefix is left unsteered (fail-open), no drop route.
+func TestDelSRPolicy_NoDropWithoutIFlag(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	bsid := mustBsid(t, "cafe::aa")
+	prefix := mustPrefix(t, "fd20::1/128")
+	fake := &fakeSRv6VPP{steering: []*types.SrSteer{{Bsid: bsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}}}
+	p := newTestProvider(fake)
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: testDT6Behavior, Preference: 200,
+				Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+		},
+	}
+	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6, Distinguisher: 0}}
+	if err := p.delSRPolicy(cn); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+	if len(fake.routeAdd) != 0 {
+		t.Fatalf("no I-Flag: expected no drop route, got %+v", fake.routeAdd)
+	}
+}
+
+// Withdrawing the LAST candidate removes the policy entirely: fail-open even
+// with the I-Flag (RFC 9256 §8.2 applies to an existing-but-invalid policy).
+func TestDelSRPolicy_DropReleasedWhenPolicyGone(t *testing.T) {
+	dst := net.ParseIP("fd00:1::11")
+	bsid := mustBsid(t, "cafe::aa")
+	survivorSid := "fd10::99"
+	prefix := mustPrefix(t, "fd20::1/128")
+	sids := [16]ip_types.IP6Address{}
+	sids[0] = types.ToVppIP6Address(net.ParseIP(survivorSid))
+
+	fake := &fakeSRv6VPP{
+		steering:        []*types.SrSteer{{Bsid: bsid, Prefix: prefix, TrafficType: types.SrSteerIPv6}},
+		unreachableSids: map[string]bool{survivorSid: true},
+	}
+	p := newTestProvider(fake)
+	p.nodePolices[dst.String()] = &NodeToPolicies{
+		Node: dst,
+		SRv6Tunnel: []common.SRv6Tunnel{
+			{Dst: dst, Color: 6, Distinguisher: 0, Behavior: testDT6Behavior, Preference: 200, DropUponInvalid: true,
+				Policy: &types.SrPolicy{Bsid: bsid, SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			{Dst: dst, Color: 6, Distinguisher: 1, Behavior: testDT6Behavior, Preference: 100, DropUponInvalid: true,
+				Policy: &types.SrPolicy{Bsid: mustBsid(t, "cafe::bb"), SidLists: []types.Srv6SidList{{NumSids: 1, Sids: sids}}}},
+		},
+	}
+
+	// First withdraw engages the drop (invalid survivor remains).
+	cn := &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6, Distinguisher: 0}}
+	if err := p.delSRPolicy(cn); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+	if len(p.droppedPrefixes) != 1 {
+		t.Fatalf("expected drop engaged, got %v", p.droppedPrefixes)
+	}
+	// Second withdraw removes the last candidate: the policy is gone, drop lifted.
+	cn = &common.NodeConnectivity{Custom: &common.SRv6Tunnel{Dst: dst, Color: 6, Distinguisher: 1}}
+	if err := p.delSRPolicy(cn); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+	if len(p.droppedPrefixes) != 0 {
+		t.Fatalf("expected drop released when policy ceased to exist, got %v", p.droppedPrefixes)
+	}
+	if len(fake.routeDel) != 1 {
+		t.Fatalf("expected drop route deleted, got %+v", fake.routeDel)
+	}
+}
+
+// ---------- priority-ordered revalidation (§2.12) ----------
+
+func TestRevalidatePolicies_PriorityOrder(t *testing.T) {
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+	mkNode := func(ip string, prio uint32, bsid string) {
+		dst := net.ParseIP(ip)
+		p.nodePolices[dst.String()] = &NodeToPolicies{
+			Node: dst,
+			SRv6Tunnel: []common.SRv6Tunnel{
+				{Dst: dst, Color: 6, Behavior: testDT6Behavior, Preference: 100, Priority: prio,
+					Policy: &types.SrPolicy{Bsid: mustBsid(t, bsid), SidLists: []types.Srv6SidList{{NumSids: 1}}}},
+			},
+		}
+		p.nodePrefixes[dst.String()] = &NodeToPrefixes{Node: dst, Prefixes: []ip_types.Prefix{mustPrefix(t, "fd20::1/128")}}
+	}
+	mkNode("fd00:1::22", 200, "cafe::22") // low priority (higher value)
+	mkNode("fd00:1::11", 10, "cafe::11")  // high priority (lower value, §2.12)
+
+	p.revalidatePolicies()
+
+	if len(fake.addModPolicy) < 2 {
+		t.Fatalf("expected both policies installed, got %d", len(fake.addModPolicy))
+	}
+	if fake.addModPolicy[0].Bsid != mustBsid(t, "cafe::11") {
+		t.Fatalf("priority-10 policy must be processed first, got %s", fake.addModPolicy[0].Bsid.String())
 	}
 }
