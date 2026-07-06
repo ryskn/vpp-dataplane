@@ -144,6 +144,20 @@ func (s *Server) injectRoute(path *bgpapi.Path) error {
 // Fixed size of vl_api_srv6_sid_list_t.sids; lists above this go via SrPolicyMod.
 const vppMaxSRv6Sids = 16
 
+const (
+	// defaultSRPolicyPreference applies when the Preference sub-TLV is absent
+	// (RFC 9256 §2.7). Higher preference wins candidate-path selection.
+	defaultSRPolicyPreference = 100
+	// defaultSRPolicyPriority applies when the Priority sub-TLV is absent
+	// (RFC 9256 §2.12). Lower value means higher revalidation priority, so 0
+	// would wrongly make unsignaled candidates the most urgent.
+	defaultSRPolicyPriority = 128
+	// srv6BindingSIDSubTLVType is the SRv6 Binding SID sub-TLV (RFC 9830
+	// §2.4.3, type 20). gobgp does not parse it off the wire and hands it to us
+	// as TunnelEncapSubTLVUnknown, so we decode the raw value ourselves.
+	srv6BindingSIDSubTLVType = 20
+)
+
 // Sentinel wrapped by getSRPolicy; injectSRv6Policy unwraps to fire teardown signal.
 var errSRPolicyMixedBehavior = errors.New("sr policy: candidate paths disagree on endpoint behavior; this agent installs one Behavior per BSID and cannot represent the candidate-path set safely")
 
@@ -167,10 +181,12 @@ func walkSRPolicyInnerTLVs(path *bgpapi.Path, fn func(*anypb.Any) error) error {
 // SegmentTypeA (SR-MPLS) rejects the list -- skipping it would install a SID chain
 // different from the advertised one. Trailing SegmentTypeB must carry an
 // EndpointBehaviorStructure (drives srv6tunnel.Behavior; would nil-deref otherwise).
+// The returned verifyMask records which segments requested SID verification
+// (V-Flag, bit i = Sids[i], RFC 9830 §2.4.4.2.3).
 func parseSegmentList(
 	sub *bgpapi.TunnelEncapSubTLVSRSegmentList,
 	srnrli *bgpapi.SRPolicyNLRI,
-) (types.Srv6SidList, *bgpapi.SegmentTypeB, error) {
+) (types.Srv6SidList, *bgpapi.SegmentTypeB, uint32, error) {
 	segments := make([]*bgpapi.SegmentTypeB, 0, len(sub.GetSegments()))
 	for i, raw := range sub.GetSegments() {
 		segment := &bgpapi.SegmentTypeB{}
@@ -180,43 +196,63 @@ func parseSegmentList(
 		}
 		typeA := &bgpapi.SegmentTypeA{}
 		if err := raw.UnmarshalTo(typeA); err == nil {
-			return types.Srv6SidList{}, nil, fmt.Errorf(
+			return types.Srv6SidList{}, nil, 0, fmt.Errorf(
 				"sr policy endpoint=%s: SegmentTypeA (SR-MPLS label %d) at index %d cannot be installed by this SRv6 agent; rejecting list to avoid installing a SID chain different from the advertised one",
 				net.IP(srnrli.Endpoint), typeA.GetLabel(), i)
 		}
-		return types.Srv6SidList{}, nil, fmt.Errorf(
+		return types.Srv6SidList{}, nil, 0, fmt.Errorf(
 			"sr policy endpoint=%s has an unsupported or malformed segment at index %d",
 			net.IP(srnrli.Endpoint), i)
 	}
 	if len(segments) == 0 {
-		return types.Srv6SidList{}, nil, fmt.Errorf(
+		return types.Srv6SidList{}, nil, 0, fmt.Errorf(
 			"sr policy endpoint=%s has a segment list with no segments",
 			net.IP(srnrli.Endpoint))
 	}
 	if len(segments) > vppMaxSRv6Sids {
-		return types.Srv6SidList{}, nil, fmt.Errorf(
+		return types.Srv6SidList{}, nil, 0, fmt.Errorf(
 			"sr policy endpoint=%s segment list has %d segments, vpp supports up to %d",
 			net.IP(srnrli.Endpoint), len(segments), vppMaxSRv6Sids)
 	}
 	last := segments[len(segments)-1]
 	if last.GetEndpointBehaviorStructure() == nil {
-		return types.Srv6SidList{}, nil, fmt.Errorf(
+		return types.Srv6SidList{}, nil, 0, fmt.Errorf(
 			"sr policy endpoint=%s last segment has no endpoint behavior structure",
 			net.IP(srnrli.Endpoint))
 	}
 	sids := [vppMaxSRv6Sids]ip_types.IP6Address{}
+	var verifyMask uint32
 	for i, segment := range segments {
 		sids[i] = types.ToVppIP6Address(net.IP(segment.Sid))
+		if segment.GetFlags().GetVFlag() {
+			verifyMask |= 1 << uint(i)
+		}
 	}
 	weight := uint32(1)
 	if w := sub.GetWeight(); w != nil {
 		weight = w.GetWeight()
 	}
+	if weight == 0 {
+		// RFC 9256 §5.1: an explicit weight of 0 invalidates the segment list.
+		return types.Srv6SidList{}, nil, 0, fmt.Errorf(
+			"sr policy endpoint=%s segment list has weight 0 (invalid per RFC 9256 §5.1)",
+			net.IP(srnrli.Endpoint))
+	}
 	return types.Srv6SidList{
 		NumSids: uint8(len(segments)),
 		Weight:  weight,
 		Sids:    sids,
-	}, last, nil
+	}, last, verifyMask, nil
+}
+
+// parseSRv6BindingSIDValue decodes the raw SRv6 Binding SID sub-TLV value
+// (RFC 9830 §2.4.3): Flags(1) + RESERVED(1) + BSID(16) [+ behavior/structure(8)].
+// Flags: S=0x80 (Specified-BSID-only), I=0x40 (Drop-upon-invalid).
+func parseSRv6BindingSIDValue(v []byte) (sid net.IP, sFlag, iFlag, ok bool) {
+	if len(v) < 18 {
+		return nil, false, false, false
+	}
+	return net.IP(v[2:18]), v[0]&0x80 != 0, v[0]&0x40 != 0, true
 }
 
 func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv6tunnel *common.SRv6Tunnel, srnrli *bgpapi.SRPolicyNLRI, err error) {
@@ -239,32 +275,79 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 		return nil, srv6tunnel, srnrli, nil
 	}
 
+	// Defaults per RFC 9256 when the sub-TLVs are absent: Preference 100 (§2.7),
+	// Priority 128 (§2.12; lower value = higher revalidation priority).
+	srv6tunnel.Preference = defaultSRPolicyPreference
+	srv6tunnel.Priority = defaultSRPolicyPriority
+	// Originator for §2.9 tie-breaking: the BGP path source (peer ASN/router-id).
+	srv6tunnel.OriginatorASN = path.GetSourceAsn()
+	srv6tunnel.OriginatorNode = path.GetSourceId()
+
 	var (
 		sidLists      []types.Srv6SidList
+		verifyMasks   []uint32              // parallel to sidLists; V-Flag masks
 		listBehaviors []bgpapi.SRv6Behavior // parallel to sidLists; trailing-segment Behavior per list
+
+		havePref, havePrio, haveBSID, haveSRv6BSID bool
+		bsidSid                                    net.IP
 	)
 
 	err = walkSRPolicyInnerTLVs(path, func(innerTlv *anypb.Any) error {
 		sub := &bgpapi.TunnelEncapSubTLVSRSegmentList{}
 		if e := innerTlv.UnmarshalTo(sub); e == nil {
-			list, last, lerr := parseSegmentList(sub, srnrli)
+			list, last, mask, lerr := parseSegmentList(sub, srnrli)
 			if lerr != nil {
 				return lerr
 			}
 			sidLists = append(sidLists, list)
+			verifyMasks = append(verifyMasks, mask)
 			listBehaviors = append(listBehaviors, last.GetEndpointBehaviorStructure().GetBehavior())
 			return nil
 		}
 		bsid := &bgpapi.TunnelEncapSubTLVSRBindingSID{}
 		if e := innerTlv.UnmarshalTo(bsid); e == nil {
-			if bsid.Bsid != nil {
-				return bsid.Bsid.UnmarshalTo(srv6bsid)
+			// Binding SID sub-TLV (type 13). The SRv6 Binding SID sub-TLV (type
+			// 20) is preferred when both are present (RFC 9830 §2.4.2: type 13 is
+			// retained for backward compatibility). First instance wins (§2.4).
+			if haveBSID || haveSRv6BSID || bsid.Bsid == nil {
+				return nil
+			}
+			if e := bsid.Bsid.UnmarshalTo(srv6bsid); e != nil {
+				return e
+			}
+			bsidSid = net.IP(srv6bsid.Sid)
+			srv6tunnel.SpecifiedBSIDOnly = srv6bsid.GetSFlag()
+			srv6tunnel.DropUponInvalid = srv6bsid.GetIFlag()
+			haveBSID = true
+			return nil
+		}
+		unknown := &bgpapi.TunnelEncapSubTLVUnknown{}
+		if e := innerTlv.UnmarshalTo(unknown); e == nil && unknown.GetType() == srv6BindingSIDSubTLVType {
+			if haveSRv6BSID {
+				return nil
+			}
+			if sid, sFlag, iFlag, ok := parseSRv6BindingSIDValue(unknown.GetValue()); ok {
+				bsidSid = sid
+				srv6tunnel.SpecifiedBSIDOnly = sFlag
+				srv6tunnel.DropUponInvalid = iFlag
+				haveSRv6BSID = true
+			}
+			return nil
+		}
+		pref := &bgpapi.TunnelEncapSubTLVSRPreference{}
+		if e := innerTlv.UnmarshalTo(pref); e == nil {
+			if !havePref {
+				srv6tunnel.Preference = pref.Preference
+				havePref = true
 			}
 			return nil
 		}
 		prio := &bgpapi.TunnelEncapSubTLVSRPriority{}
 		if e := innerTlv.UnmarshalTo(prio); e == nil {
-			srv6tunnel.Priority = prio.Priority
+			if !havePrio {
+				srv6tunnel.Priority = prio.Priority
+				havePrio = true
+			}
 		}
 		return nil
 	})
@@ -275,9 +358,17 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 		return nil, nil, srnrli, fmt.Errorf(
 			"sr policy endpoint=%s has no segments", net.IP(srnrli.Endpoint))
 	}
+	// No usable BSID: with the S-Flag set the candidate is invalid (RFC 9256
+	// §6.2.3, Specified-BSID-only). Otherwise pass the zero BSID through — the
+	// connectivity provider dynamically binds one from the policy pool (§6.2.1).
+	if len(bsidSid) == 0 && srv6tunnel.SpecifiedBSIDOnly {
+		return nil, nil, srnrli, fmt.Errorf(
+			"sr policy endpoint=%s has Specified-BSID-only (S-Flag) set but no usable BSID (RFC 9256 §6.2.3)",
+			net.IP(srnrli.Endpoint))
+	}
 
 	srv6Policy = &types.SrPolicy{
-		Bsid:     types.ToVppIP6Address(net.IP(srv6bsid.Sid)),
+		Bsid:     types.ToVppIP6Address(bsidSid),
 		IsSpray:  false,
 		IsEncap:  true,
 		FibTable: 0,
@@ -285,6 +376,7 @@ func (s *Server) getSRPolicy(path *bgpapi.Path) (srv6Policy *types.SrPolicy, srv
 	}
 	srv6tunnel.Bsid = srv6Policy.Bsid.ToIP()
 	srv6tunnel.Policy = srv6Policy
+	srv6tunnel.VerifyMasks = verifyMasks
 
 	// Mixed-behavior reject: VPP installs all SidLists under one sr_policy with
 	// one Behavior, so ECMP onto a wrong-behavior list would drop/mis-decap.

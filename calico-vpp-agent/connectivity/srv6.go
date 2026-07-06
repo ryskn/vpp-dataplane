@@ -3,7 +3,10 @@ package connectivity
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
+	"sort"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
@@ -59,6 +62,7 @@ type srv6VppAPI interface {
 	SetEncapSource(net.IP) error
 	RouteAdd(*types.Route) error
 	RouteDel(*types.Route) error
+	RouteLookup(dst *net.IPNet, tableID uint32) (*types.Route, error)
 }
 
 // SRv6Provider is node connectivity provider that uses segment routing over IPv6 (SRv6) to connect the nodes
@@ -88,6 +92,28 @@ type SRv6Provider struct {
 	// pendingBsidCleanup holds prior BSIDs not yet freeable (a steering still
 	// resolves through them); drained on later SR-policy events to avoid leaks.
 	pendingBsidCleanup []ip_types.IP6Address
+
+	// dynBsids maps "<endpoint>|<color>" to the BSID dynamically bound to that
+	// SR Policy (RFC 9256 §6.2.1) when candidates arrive without one. The
+	// binding is policy-scoped: it survives candidate-path changes and is
+	// released only when the policy's last candidate is withdrawn.
+	dynBsids map[string]ip_types.IP6Address
+	// allocBsid/releaseBsid provision dynamic BSIDs. Production wires Calico
+	// IPAM on the policy pool (handle-scoped for restart attribution); tests
+	// inject fakes.
+	allocBsid   func(handle string) (net.IP, error)
+	releaseBsid func(handle string) error
+	// droppedPrefixes tracks drop routes installed for drop-upon-invalid
+	// (RFC 9256 §8.2, I-Flag): prefix@table -> the endpoint whose invalid
+	// policy is holding it, plus the route to delete on release.
+	droppedPrefixes map[string]dropState
+}
+
+// dropState is one fail-closed drop route installed while an SR Policy with the
+// I-Flag is invalid (RFC 9256 §8.2).
+type dropState struct {
+	nodeip string
+	route  *types.Route
 }
 
 func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
@@ -98,14 +124,52 @@ func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
 		nodePolices:              make(map[string]*NodeToPolicies),
 		dsrServices:              make(map[string]*dsrServiceState),
 		dsrDesired:               make(map[string]*common.DSRService),
+		dynBsids:                 make(map[string]ip_types.IP6Address),
+		droppedPrefixes:          make(map[string]dropState),
 	}
 	if *config.GetCalicoVppFeatureGates().SRv6Enabled {
 		p.localSidIPPool = cnet.MustParseNetwork(config.GetCalicoVppSrv6().LocalsidPool).IPNet
 		p.policyIPPool = cnet.MustParseNetwork(config.GetCalicoVppSrv6().PolicyPool).IPNet
 	}
+	p.allocBsid = p.ipamAllocBsid
+	p.releaseBsid = p.ipamReleaseBsid
 
 	p.log.Infof("SRv6Provider NewSRv6Provider")
 	return p
+}
+
+// dynBsidKey identifies the SR Policy a dynamic BSID is bound to. RFC 9256
+// §6.2.1 scopes the binding to the policy <color, endpoint>, not the candidate.
+func dynBsidKey(nodeip string, color uint32) string {
+	return nodeip + "|" + fmt.Sprint(color)
+}
+
+// ipamAllocBsid allocates a dynamic BSID from the policy pool through Calico
+// IPAM, attributed to the handle. Any stale allocation under the same handle
+// (left over from a previous agent run) is released first, so restarts do not
+// leak pool addresses.
+func (p *SRv6Provider) ipamAllocBsid(handle string) (net.IP, error) {
+	ctx := context.Background()
+	if err := p.Clientv3().IPAM().ReleaseByHandle(ctx, handle); err != nil {
+		p.log.Debugf("SRv6Provider ipamAllocBsid: no stale allocation for %s: %v", handle, err)
+	}
+	_, v6Assignments, err := p.Clientv3().IPAM().AutoAssign(ctx, ipam.AutoAssignArgs{
+		Num6:        1,
+		IPv6Pools:   []cnet.IPNet{{IPNet: p.policyIPPool}},
+		HandleID:    &handle,
+		IntendedUse: "Tunnel",
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "SRv6Provider dynamic BSID allocation (handle %s)", handle)
+	}
+	if v6Assignments == nil || len(v6Assignments.IPs) == 0 {
+		return nil, fmt.Errorf("SRv6Provider dynamic BSID pool %s exhausted", p.policyIPPool.String())
+	}
+	return v6Assignments.IPs[0].IP, nil
+}
+
+func (p *SRv6Provider) ipamReleaseBsid(handle string) error {
+	return p.Clientv3().IPAM().ReleaseByHandle(context.Background(), handle)
 }
 
 func (p *SRv6Provider) GetSwifindexes() []uint32 {
@@ -143,6 +207,9 @@ func (p *SRv6Provider) RescanState() {
 		p.log.Errorf("SRv6Provider Error creating SRv6Localsid: %v", err)
 	}
 
+	// Re-run candidate selection in priority order (RFC 9256 §2.12): picks up
+	// FIB changes affecting SID reachability and retries failed installs.
+	p.revalidatePolicies()
 }
 
 func (p *SRv6Provider) CreateSRv6Tunnel(dst net.IP, prefixDst ip_types.Prefix, policyTunnel *types.SrPolicy) (err error) {
@@ -163,10 +230,74 @@ func (p *SRv6Provider) CreateSRv6Tunnel(dst net.IP, prefixDst ip_types.Prefix, p
 	if vpplink.IsIP6(srSteer.Prefix.Address.ToIP()) {
 		srSteer.TrafficType = types.SrSteerIPv6
 	}
+	// A valid candidate is taking over: lift any drop-upon-invalid route
+	// (RFC 9256 §8.2) held on this prefix before steering through it.
+	p.clearDropRoute(srSteer.Prefix, srSteer.FibTable)
 	if err := p.vpp.AddSRv6Steering(srSteer); err != nil {
 		return errors.Wrapf(err, "SRv6Provider CreateSRv6Tunnel AddSRv6Steering")
 	}
 	return nil
+}
+
+// dropKey identifies one fail-closed drop route (RFC 9256 §8.2).
+func dropKey(prefix ip_types.Prefix, table uint32) string {
+	return prefix.String() + "@" + fmt.Sprint(table)
+}
+
+// clearDropRoute removes the drop-upon-invalid route held on prefix, if any.
+// Called before (re)steering the prefix through a valid policy.
+func (p *SRv6Provider) clearDropRoute(prefix ip_types.Prefix, table uint32) {
+	key := dropKey(prefix, table)
+	ds, ok := p.droppedPrefixes[key]
+	if !ok {
+		return
+	}
+	if err := p.vpp.RouteDel(ds.route); err != nil && !isAlreadyGoneOnDelete(err) {
+		// Keep it tracked so a later pass retries; the drop route would
+		// otherwise shadow the fresh steering.
+		p.log.Warnf("SRv6Provider clearDropRoute %s: %v; will retry", key, err)
+		return
+	}
+	p.log.Infof("SRv6Provider drop-upon-invalid released for %s", key)
+	delete(p.droppedPrefixes, key)
+}
+
+// engageDropRoute installs the fail-closed drop for a prefix whose SR Policy
+// became invalid with the I-Flag set (RFC 9256 §8.2): the traffic is dropped
+// rather than escaping to ordinary routing.
+func (p *SRv6Provider) engageDropRoute(nodeip string, orphan *types.SrSteer) {
+	key := dropKey(orphan.Prefix, orphan.FibTable)
+	if _, ok := p.droppedPrefixes[key]; ok {
+		return
+	}
+	route := &types.Route{
+		Dst:   orphan.Prefix.ToIPNet(),
+		Table: orphan.FibTable,
+		Paths: []types.RoutePath{{IsDrop: true}},
+	}
+	if err := p.vpp.RouteAdd(route); err != nil {
+		p.log.Warnf("SRv6Provider engageDropRoute %s: %v; falling back to fail-open", key, err)
+		return
+	}
+	p.droppedPrefixes[key] = dropState{nodeip: nodeip, route: route}
+	p.log.Infof("SRv6Provider drop-upon-invalid engaged for %s (RFC 9256 §8.2)", key)
+}
+
+// releaseDropsForNode lifts every drop held for nodeip's policies. Called when
+// the policy ceases to exist (all candidates withdrawn): with no policy left
+// there is no drop-upon-invalid state to honor, traffic reverts to routing.
+func (p *SRv6Provider) releaseDropsForNode(nodeip string) {
+	for key, ds := range p.droppedPrefixes {
+		if ds.nodeip != nodeip {
+			continue
+		}
+		if err := p.vpp.RouteDel(ds.route); err != nil && !isAlreadyGoneOnDelete(err) {
+			p.log.Warnf("SRv6Provider releaseDropsForNode %s: %v; will retry", key, err)
+			continue
+		}
+		p.log.Infof("SRv6Provider drop-upon-invalid released for %s (policy gone)", key)
+		delete(p.droppedPrefixes, key)
+	}
 }
 
 // steerNodeIPViaSID steers pod traffic to a remote node's own IP onto that node's
@@ -193,6 +324,7 @@ func (p *SRv6Provider) steerNodeIPViaSID(nodeip string) {
 		Prefix:      prefix,
 		Bsid:        policy.Bsid,
 	}
+	p.clearDropRoute(srSteer.Prefix, srSteer.FibTable)
 	if err := p.vpp.AddSRv6Steering(srSteer); err != nil {
 		p.log.Errorf("SRv6Provider steerNodeIPViaSID AddSRv6Steering node=%s prefix=%s: %v", nodeip, prefix.String(), err)
 	}
@@ -326,28 +458,7 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 
 	// We got all needed data (normal common.NodeConnectivity and SRv6 tunnel info from tunnel-end node transported by BGP)
 	// we can create dynamic parts of SRv6 tunnel (SR steering and SR policy)
-	if p.nodePrefixes[nodeip] != nil {
-		p.log.Debugf("SRv6Provider check new tunnel for node %s, prefixes %d", nodeip, len(p.nodePrefixes[nodeip].Prefixes))
-
-		for _, prefix := range p.nodePrefixes[nodeip].Prefixes {
-			prefixBehavior := types.SrBehaviorDT4
-			if vpplink.IsIP6(prefix.Address.ToIP()) {
-				prefixBehavior = types.SrBehaviorDT6
-			}
-
-			policy, err := p.getPolicyNode(nodeip, prefixBehavior)
-			if err == nil && policy != nil {
-				if err := p.CreateSRv6Tunnel(p.nodePrefixes[nodeip].Node, prefix, policy); err != nil {
-					p.log.Error(err)
-				}
-			}
-
-		}
-
-		// Bring the host plane onto SRv6 too: steer pod traffic to this node's
-		// IP via its End.DT6 SID so host-network backed ClusterIPs work.
-		p.steerNodeIPViaSID(nodeip)
-	}
+	p.installNode(nodeip)
 
 	p.drainPendingBsidCleanup(orphanedBsid, orphanedBsidValid)
 
@@ -356,6 +467,60 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 	p.reconcileDSRServices()
 
 	return nil
+}
+
+// installNode creates the dynamic parts of the SRv6 tunnel (SR policy and
+// steering) for one endpoint node, once both its prefixes and policy
+// candidates are known. Selection runs per prefix behavior (RFC 9256 §2.9).
+func (p *SRv6Provider) installNode(nodeip string) {
+	if p.nodePrefixes[nodeip] == nil {
+		return
+	}
+	p.log.Debugf("SRv6Provider check new tunnel for node %s, prefixes %d", nodeip, len(p.nodePrefixes[nodeip].Prefixes))
+
+	for _, prefix := range p.nodePrefixes[nodeip].Prefixes {
+		prefixBehavior := types.SrBehaviorDT4
+		if vpplink.IsIP6(prefix.Address.ToIP()) {
+			prefixBehavior = types.SrBehaviorDT6
+		}
+
+		policy, err := p.getPolicyNode(nodeip, prefixBehavior)
+		if err == nil && policy != nil {
+			if err := p.CreateSRv6Tunnel(p.nodePrefixes[nodeip].Node, prefix, policy); err != nil {
+				p.log.Error(err)
+			}
+		}
+	}
+
+	// Bring the host plane onto SRv6 too: steer pod traffic to this node's
+	// IP via its End.DT6 SID so host-network backed ClusterIPs work.
+	p.steerNodeIPViaSID(nodeip)
+}
+
+// revalidatePolicies re-runs candidate selection and installation for every
+// endpoint, ordered by SR Policy priority (RFC 9256 §2.12: lower value first;
+// the policy takes the lowest priority among its candidates). Invoked from
+// RescanState so FIB changes (SID reachability) and previously failed installs
+// are picked up, most important policies first.
+func (p *SRv6Provider) revalidatePolicies() {
+	type item struct {
+		nodeip string
+		prio   uint32
+	}
+	items := make([]item, 0, len(p.nodePolices))
+	for nodeip, entry := range p.nodePolices {
+		prio := uint32(math.MaxUint32)
+		for i := range entry.SRv6Tunnel {
+			if entry.SRv6Tunnel[i].Priority < prio {
+				prio = entry.SRv6Tunnel[i].Priority
+			}
+		}
+		items = append(items, item{nodeip, prio})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].prio < items[j].prio })
+	for _, it := range items {
+		p.installNode(it.nodeip)
+	}
 }
 
 // drainPendingBsidCleanup deletes queued BSIDs no steering resolves through
@@ -427,6 +592,9 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 	// Match cached tunnels by <Distinguisher, Color, Endpoint> NLRI key.
 	// Withdraws carry only the NLRI key (no BSID); the cached tunnel preserves
 	// the BSID we installed, which is what VPP needs to delete.
+	// Withdraws also carry no flags, so drop-upon-invalid (I-Flag) intent is
+	// read from the cached tunnels and the superseding advertisement alike.
+	dropRequested := policyData.DropUponInvalid
 	var matched []ip_types.IP6Address
 	remaining := entry.SRv6Tunnel[:0]
 	for _, tun := range entry.SRv6Tunnel {
@@ -434,6 +602,7 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 			if b, ok := tunnelBsid(&tun); ok {
 				matched = append(matched, b)
 			}
+			dropRequested = dropRequested || tun.DropUponInvalid
 			continue
 		}
 		remaining = append(remaining, tun)
@@ -443,6 +612,12 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 			nodeip, policyData.Color, policyData.Distinguisher)
 		return nil
 	}
+	for _, tun := range remaining {
+		dropRequested = dropRequested || tun.DropUponInvalid
+	}
+	// RFC 9256 §8.2 applies while the policy exists but is invalid. With no
+	// candidate left at all the policy is gone, so fail-open is correct.
+	dropRequested = dropRequested && len(remaining) > 0
 
 	steering, listErr := p.vpp.ListSRv6Steering()
 	if listErr != nil {
@@ -483,31 +658,58 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 
 	if len(remaining) == 0 {
 		delete(p.nodePolices, nodeip)
+		// Policy gone entirely: no drop-upon-invalid state left to honor.
+		p.releaseDropsForNode(nodeip)
 	} else {
 		entry.SRv6Tunnel = remaining
 	}
 
-	// AddConnectivity only installs the highest-priority candidate per behavior;
-	// lower-priority survivors are cached but absent from VPP. Track which we
+	// Release the dynamic BSID binding (RFC 9256 §6.2.1) once the last
+	// candidate of its SR Policy <endpoint, color> is gone.
+	p.releaseUnusedDynBsids(nodeip, policyData.Color, remaining)
+
+	// AddConnectivity only installs the selected candidate per behavior;
+	// other survivors are cached but absent from VPP. Track which we
 	// install on demand here so multiple orphaned prefixes targeting the same
 	// surviving BSID don't churn the install.
 	installed := make(map[ip_types.IP6Address]struct{})
 	for _, st := range orphaned {
-		p.resteerOrphan(nodeip, st, installed)
+		p.resteerOrphan(nodeip, st, installed, dropRequested)
 	}
 	return nil
 }
 
+// releaseUnusedDynBsids frees the dynamic BSID bound to <nodeip, color> when
+// no candidate of that SR Policy survives (RFC 9256 §6.2.1: the binding lives
+// as long as the policy does).
+func (p *SRv6Provider) releaseUnusedDynBsids(nodeip string, color uint32, remaining []common.SRv6Tunnel) {
+	key := dynBsidKey(nodeip, color)
+	if _, ok := p.dynBsids[key]; !ok {
+		return
+	}
+	for i := range remaining {
+		if remaining[i].Color == color {
+			return // policy still has candidates; keep the binding
+		}
+	}
+	if err := p.releaseBsid(dynBsidHandle(nodeip, color)); err != nil {
+		p.log.Warnf("SRv6Provider: release dynamic BSID for endpoint=%s color=%d: %v", nodeip, color, err)
+	}
+	delete(p.dynBsids, key)
+	p.log.Infof("SRv6Provider: released dynamic BSID for endpoint=%s color=%d", nodeip, color)
+}
+
 // resteerOrphan re-points a prefix whose steering BSID just got deleted at the
-// next-best surviving policy of the matching behavior on the same endpoint. The
-// chosen policy may have never been installed in VPP (it was masked by the
-// withdrawn higher-priority candidate), so install it on demand — guarded by
-// `installed` so we install at most once per delSRPolicy call. If no candidate
-// remains the prefix is left unsteered and AddConnectivity picks it up when a
-// new candidate is later advertised. The orphan's FibTable is preserved so the
-// node-IP /128 steering stays in PodVRFIndex (and pod prefixes in the main
-// table) across the failover.
-func (p *SRv6Provider) resteerOrphan(nodeip string, orphan *types.SrSteer, installed map[ip_types.IP6Address]struct{}) {
+// next-best surviving valid candidate (RFC 9256 §2.9) of the matching behavior
+// on the same endpoint. The chosen policy may have never been installed in VPP
+// (it was masked by the withdrawn candidate), so install it on demand — guarded
+// by `installed` so we install at most once per delSRPolicy call. If no valid
+// candidate remains: with dropRequested (I-Flag, RFC 9256 §8.2) the prefix gets
+// a fail-closed drop route; otherwise it is left unsteered and AddConnectivity
+// picks it up when a new candidate is later advertised. The orphan's FibTable
+// is preserved so the node-IP /128 steering stays in PodVRFIndex (and pod
+// prefixes in the main table) across the failover.
+func (p *SRv6Provider) resteerOrphan(nodeip string, orphan *types.SrSteer, installed map[ip_types.IP6Address]struct{}, dropRequested bool) {
 	prefix := orphan.Prefix
 	behavior := types.SrBehaviorDT4
 	if vpplink.IsIP6(prefix.Address.ToIP()) {
@@ -515,6 +717,10 @@ func (p *SRv6Provider) resteerOrphan(nodeip string, orphan *types.SrSteer, insta
 	}
 	policy, err := p.getPolicyNode(nodeip, behavior)
 	if err != nil || policy == nil {
+		if dropRequested {
+			p.engageDropRoute(nodeip, orphan)
+			return
+		}
 		p.log.Infof("SRv6Provider DelConnectivity: no surviving policy for endpoint=%s prefix=%s behavior=%d; prefix left unsteered",
 			nodeip, prefix.String(), behavior)
 		return
@@ -536,6 +742,7 @@ func (p *SRv6Provider) resteerOrphan(nodeip string, orphan *types.SrSteer, insta
 	if vpplink.IsIP6(prefix.Address.ToIP()) {
 		srSteer.TrafficType = types.SrSteerIPv6
 	}
+	p.clearDropRoute(srSteer.Prefix, srSteer.FibTable)
 	if err := p.vpp.AddSRv6Steering(srSteer); err != nil {
 		p.log.Warnf("SRv6Provider DelConnectivity: AddSRv6Steering prefix=%s bsid=%s: %v",
 			prefix.String(), policy.Bsid.String(), err)
@@ -618,38 +825,173 @@ func (p *SRv6Provider) isSRv6TunnelInfoFromBGP(cn *common.NodeConnectivity) bool
 	return cn.Dst.IP == nil
 }
 
-// find the highest priority policy for a specific node
-func (p *SRv6Provider) getPolicyNode(nodeip string, behavior types.SrBehavior) (policy *types.SrPolicy, err error) {
+// getPolicyNode selects the active candidate path for a node+behavior per
+// RFC 9256 §2.9 and returns its installable policy. Selection runs over VALID
+// candidates only: a candidate needs a usable BSID (specified, or dynamically
+// bound per §6.2.1) and at least one segment list whose first SID (and any
+// V-Flag SID) resolves in the FIB (§5.1). Among the valid ones the highest
+// Preference wins, ties broken by lower originator then higher discriminator.
+// Note the Priority field plays no role here — it only orders revalidation
+// (§2.12, see revalidatePolicies).
+func (p *SRv6Provider) getPolicyNode(nodeip string, behavior types.SrBehavior) (*types.SrPolicy, error) {
 	p.log.Debugf("SRv6Provider getPolicyNode node: %s, with behavior: %d", nodeip, behavior)
-	if p.nodePolices[nodeip] != nil {
-		var priority uint32
-		found := false
-		p.log.Debugf("SRv6Provider getPolicyNode: found %d tunnels for node %s", len(p.nodePolices[nodeip].SRv6Tunnel), nodeip)
-		for i, tunnel := range p.nodePolices[nodeip].SRv6Tunnel {
-			converted := types.FromGoBGPSrBehavior(tunnel.Behavior)
-			p.log.Debugf("SRv6Provider getPolicyNode: tunnel[%d] behavior=%d converted=%d want=%d match=%v policy=%v",
-				i, tunnel.Behavior, converted, behavior, converted == behavior, tunnel.Policy != nil)
-			// Skip a candidate with no SrPolicy object (nil-deref guard; a nil
-			// Policy here does not imply not-installed-in-VPP). Strict > keeps
-			// the first candidate on a priority tie.
-			if tunnel.Policy == nil || converted != behavior {
-				continue
-			}
-			if !found || tunnel.Priority > priority {
-				priority = tunnel.Priority
-				policy = tunnel.Policy
-				found = true
+	entry := p.nodePolices[nodeip]
+	if entry == nil {
+		p.log.Debugf("SRv6Provider getPolicyNode: nodePolices[%s] is nil", nodeip)
+		return nil, nil
+	}
+
+	reach := map[string]bool{} // per-selection SID reachability cache
+	var best *common.SRv6Tunnel
+	var bestPolicy *types.SrPolicy
+	for i := range entry.SRv6Tunnel {
+		tunnel := &entry.SRv6Tunnel[i]
+		if tunnel.Policy == nil || types.FromGoBGPSrBehavior(tunnel.Behavior) != behavior {
+			continue
+		}
+		if !p.ensureBsid(nodeip, tunnel) {
+			continue
+		}
+		pol := p.usablePolicy(nodeip, tunnel, reach)
+		if pol == nil {
+			continue
+		}
+		if best == nil || preferredCandidate(tunnel, best) {
+			best, bestPolicy = tunnel, pol
+		}
+	}
+	if bestPolicy == nil {
+		p.log.Debugf("SRv6Provider getPolicyNode: no valid candidate for node %s behavior %d", nodeip, behavior)
+	} else {
+		p.log.Debugf("SRv6Provider getPolicyNode: selected bsid=%s preference=%d discriminator=%d",
+			bestPolicy.Bsid.String(), best.Preference, best.Distinguisher)
+	}
+	return bestPolicy, nil
+}
+
+// preferredCandidate reports whether a beats b per RFC 9256 §2.9: higher
+// Preference, then lower originator <ASN, node>, then higher discriminator.
+// Protocol-Origin is constant here (every candidate arrives via BGP) and the
+// optional "prefer the currently installed path" rule is not implemented.
+func preferredCandidate(a, b *common.SRv6Tunnel) bool {
+	if a.Preference != b.Preference {
+		return a.Preference > b.Preference
+	}
+	if a.OriginatorASN != b.OriginatorASN {
+		return a.OriginatorASN < b.OriginatorASN
+	}
+	if a.OriginatorNode != b.OriginatorNode {
+		return a.OriginatorNode < b.OriginatorNode
+	}
+	return a.Distinguisher > b.Distinguisher
+}
+
+// ensureBsid makes sure the candidate has a usable BSID, dynamically binding
+// one from the policy pool when the advertisement carried none (RFC 9256
+// §6.2.1). The binding is per SR Policy <endpoint, color> and reused across
+// candidate-path changes. Returns false when the candidate cannot get a BSID
+// (S-Flag set, or pool exhausted) — it is then invalid (§6.2.3).
+func (p *SRv6Provider) ensureBsid(nodeip string, tunnel *common.SRv6Tunnel) bool {
+	if _, ok := tunnelBsid(tunnel); ok {
+		return true
+	}
+	if tunnel.SpecifiedBSIDOnly {
+		p.log.Warnf("SRv6Provider: candidate endpoint=%s color=%d has S-Flag but no BSID; invalid (RFC 9256 §6.2.3)",
+			nodeip, tunnel.Color)
+		return false
+	}
+	key := dynBsidKey(nodeip, tunnel.Color)
+	bsid, ok := p.dynBsids[key]
+	if !ok {
+		ip, err := p.allocBsid(dynBsidHandle(nodeip, tunnel.Color))
+		if err != nil {
+			p.log.Warnf("SRv6Provider: dynamic BSID allocation failed for endpoint=%s color=%d: %v",
+				nodeip, tunnel.Color, err)
+			return false
+		}
+		bsid = types.ToVppIP6Address(ip)
+		p.dynBsids[key] = bsid
+		p.log.Infof("SRv6Provider: dynamically bound BSID %s to policy endpoint=%s color=%d (RFC 9256 §6.2.1)",
+			bsid.String(), nodeip, tunnel.Color)
+	}
+	tunnel.Policy.Bsid = bsid
+	tunnel.Bsid = bsid.ToIP()
+	return true
+}
+
+// dynBsidHandle is the Calico IPAM handle attributing a dynamic BSID to its SR
+// Policy; stable across agent restarts so stale allocations can be reclaimed.
+func dynBsidHandle(nodeip string, color uint32) string {
+	return "cvp-srv6-dyn-bsid-" + strings.ReplaceAll(nodeip, ":", "-") + "-" + fmt.Sprint(color)
+}
+
+// usablePolicy applies RFC 9256 §5.1 SID resolution to the candidate's segment
+// lists: the first SID always, plus any segment whose V-Flag requested
+// verification. Lists that do not resolve are dropped; returns nil when none
+// survive (candidate invalid). Lookup failures fail open (assumed reachable).
+func (p *SRv6Provider) usablePolicy(nodeip string, tunnel *common.SRv6Tunnel, reach map[string]bool) *types.SrPolicy {
+	kept := make([]types.Srv6SidList, 0, len(tunnel.Policy.SidLists))
+	for i, sl := range tunnel.Policy.SidLists {
+		var mask uint32
+		if i < len(tunnel.VerifyMasks) {
+			mask = tunnel.VerifyMasks[i]
+		}
+		if p.sidListResolvable(sl, mask, reach) {
+			kept = append(kept, sl)
+		} else {
+			p.log.Warnf("SRv6Provider: segment list %d of endpoint=%s color=%d invalid: SID unresolvable in FIB (RFC 9256 §5.1)",
+				i, nodeip, tunnel.Color)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	if len(kept) == len(tunnel.Policy.SidLists) {
+		return tunnel.Policy
+	}
+	filtered := *tunnel.Policy
+	filtered.SidLists = kept
+	return &filtered
+}
+
+func (p *SRv6Provider) sidListResolvable(sl types.Srv6SidList, verifyMask uint32, cache map[string]bool) bool {
+	for i := 0; i < int(sl.NumSids) && i < len(sl.Sids); i++ {
+		if i != 0 && (i >= 32 || verifyMask&(1<<uint(i)) == 0) {
+			continue // first SID always verified; others only on V-Flag (§5.1)
+		}
+		if !p.sidReachable(sl.Sids[i], cache) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *SRv6Provider) sidReachable(sid ip_types.IP6Address, cache map[string]bool) bool {
+	key := sid.String()
+	if v, hit := cache[key]; hit {
+		return v
+	}
+	dst := &net.IPNet{IP: sid.ToIP(), Mask: net.CIDRMask(128, 128)}
+	route, err := p.vpp.RouteLookup(dst, 0)
+	ok := false
+	switch {
+	case err != nil:
+		// Fail open: a lookup failure must not invalidate every policy.
+		p.log.Warnf("SRv6Provider: SID reachability lookup %s failed; assuming reachable: %v", key, err)
+		ok = true
+	case route == nil:
+		// no covering entry
+	default:
+		// The IPv6 FIB always matches ::/0 (default drop); only count non-drop paths.
+		for _, path := range route.Paths {
+			if !path.IsDrop {
+				ok = true
+				break
 			}
 		}
-	} else {
-		p.log.Debugf("SRv6Provider getPolicyNode: nodePolices[%s] is nil", nodeip)
 	}
-	if policy == nil {
-		p.log.Debugf("SRv6Provider getPolicyNode: no matching policy found")
-	} else {
-		p.log.Debugf("SRv6Provider getPolicyNode: found policy bsid=%s", policy.Bsid.String())
-	}
-	return policy, err
+	cache[key] = ok
+	return ok
 }
 
 func (p *SRv6Provider) setEncapSource() (err error) {
