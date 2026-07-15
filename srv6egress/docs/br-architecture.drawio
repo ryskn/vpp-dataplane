@@ -1,0 +1,148 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram name="br-architecture-8-5-3" id="br8530">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1320" pageHeight="1340" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===== Title ===== -->
+        <mxCell id="title" value="EgressPolicy CRD — SRv6 backbone 統合 全体図（§8.5.3 / issue #5）　egress GW = ToR-PE、WAN edge = vendor BR（§4.4。vendor BR 不在時は GW が BR を兼ねる）" style="text;html=1;align=left;verticalAlign=middle;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="18" width="1240" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ===== domain band labels ===== -->
+        <mxCell id="band_cluster" value="cluster SR domain" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=2;fontColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="70" y="56" width="260" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="band_backbone" value="operator SRv6 backbone" style="text;html=1;align=right;verticalAlign=middle;fontSize=12;fontStyle=2;fontColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="56" width="280" height="20" as="geometry" />
+        </mxCell>
+
+        <!-- ===== CRD ===== -->
+        <mxCell id="crd" value="EgressPolicy（CRD）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="460" y="62" width="240" height="46" as="geometry" />
+        </mxCell>
+
+        <!-- ===== bgp-controller ===== -->
+        <mxCell id="ctrl" value="bgp-controller VM&#10;• color→SID 解決 / SR Policy 配布&#10;• cluster return advertise（RFC 9252）&#10;• （backbone）color マップ / service SID 取込" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;verticalAlign=top;fontSize=11;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="420" y="150" width="320" height="118" as="geometry" />
+        </mxCell>
+
+        <!-- ===== headend ===== -->
+        <mxCell id="headend" value="headend = pod ノード&#10;color / dst で SR encap" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="400" y="320" width="360" height="64" as="geometry" />
+        </mxCell>
+
+        <!-- ===== egress GW (BR) container ===== -->
+        <mxCell id="gw" value="egress GW ノード（ToR-PE: cluster ⇄ backbone、§4.4）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;align=center;verticalAlign=top;fontSize=13;fontStyle=1;spacingTop=8;arcSize=2;" vertex="1" parent="1">
+          <mxGeometry x="70" y="440" width="1010" height="470" as="geometry" />
+        </mxCell>
+
+        <!-- VRF backbone-A container -->
+        <mxCell id="vrfA" value="VRF backbone-A" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;align=center;verticalAlign=top;fontSize=12;fontStyle=1;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="100" y="486" width="470" height="406" as="geometry" />
+        </mxCell>
+        <!-- VRF backbone-B container -->
+        <mxCell id="vrfB" value="VRF backbone-B" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;align=center;verticalAlign=top;fontSize=12;fontStyle=1;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="600" y="486" width="470" height="406" as="geometry" />
+        </mxCell>
+
+        <!-- VRF-A sub-cells -->
+        <mxCell id="a_dt6" value="End.DT6　fcff::e0:A::" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=middle;fontSize=11;fontStyle=1;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="118" y="516" width="434" height="32" as="geometry" />
+        </mxCell>
+        <mxCell id="a_safi" value="gobgp eBGP w/ SAFIs:&#10;• IPv6 unicast&#10;• SRv6 Services（RFC 9252）&#10;• SR Policy（RFC 9012）&#10;• Color ext-community" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="118" y="552" width="434" height="94" as="geometry" />
+        </mxCell>
+        <mxCell id="a_fib" value="FIB / actions:&#10;• cluster prefix を own SID 付きで backbone へ adv（RFC 9252）&#10;• backbone service SID を SR encap action で install&#10;• backbone SR Policy 使用可能" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="118" y="650" width="434" height="94" as="geometry" />
+        </mxCell>
+        <mxCell id="a_bridge" value="SR domain 橋渡し:&#10;cluster SID decap → backbone SID list re-encap&#10;（[…（via-P）, uA(ISP-x)] ― upstream 選択は BR の EPE SID）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;fontSize=10;fontStyle=1;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="118" y="748" width="434" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="a_snat" value="NAT-less：source 保持（SNAT 無し）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=center;verticalAlign=middle;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="118" y="804" width="434" height="32" as="geometry" />
+        </mxCell>
+
+        <!-- VRF-B sub-cells -->
+        <mxCell id="b_dt6" value="End.DT6　fcff::e0:B::" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=middle;fontSize=11;fontStyle=1;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="618" y="516" width="434" height="32" as="geometry" />
+        </mxCell>
+        <mxCell id="b_safi" value="gobgp eBGP w/ SAFIs:&#10;• IPv6 unicast&#10;• SRv6 Services（RFC 9252）&#10;• SR Policy（RFC 9012）&#10;• Color ext-community" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="618" y="552" width="434" height="94" as="geometry" />
+        </mxCell>
+        <mxCell id="b_fib" value="FIB / actions:&#10;• cluster prefix を own SID 付きで backbone へ adv（RFC 9252）&#10;• backbone service SID を SR encap action で install&#10;• backbone SR Policy 使用可能" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;align=left;verticalAlign=top;fontSize=10;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="618" y="650" width="434" height="94" as="geometry" />
+        </mxCell>
+        <mxCell id="b_bridge" value="SR domain 橋渡し:&#10;cluster SID decap → backbone SID list re-encap&#10;（[…（via-P）, uA(ISP-x)] ― upstream 選択は BR の EPE SID）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=top;fontSize=10;fontStyle=1;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="618" y="748" width="434" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="b_snat" value="NAT-less：source 保持（SNAT 無し）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=center;verticalAlign=middle;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="618" y="804" width="434" height="32" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Backbone PE-edge A / B ===== -->
+        <mxCell id="peA" value="vendor BR-A（Cisco 8000 系）&#10;• uA = EPE peering SID（RFC 9087）&#10;• own End SID / uDT46&#10;• ISP peering の経路解決&#10;• backbone SR Policy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;verticalAlign=top;fontSize=11;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="180" y="980" width="250" height="118" as="geometry" />
+        </mxCell>
+        <mxCell id="peB" value="vendor BR-B（Cisco 8000 系）&#10;• uA = EPE peering SID（RFC 9087）&#10;• own End SID / uDT46&#10;• ISP peering の経路解決&#10;• backbone SR Policy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;verticalAlign=top;fontSize=11;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="720" y="980" width="250" height="118" as="geometry" />
+        </mxCell>
+
+        <!-- ===== backbone fabric ===== -->
+        <mxCell id="fabric" value="SRv6 backbone fabric（operator）&#10;PE-A ── P ── P ── PE-Z ── service-X ／ BR ── ISP peers（EPE）&#10;• end-to-end SR-TE　• color steering（backbone-wide）　• SRv6 L3VPN / EVPN services　• upstream 選択 = BR の uA" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#333333;strokeWidth=2;align=center;verticalAlign=middle;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="240" y="1170" width="720" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- ===== core note (8.5.1) ===== -->
+        <mxCell id="note" value="一体化の核（§8.5.1）&#10;&#10;cluster の color と backbone の color が&#10;inter-AS Color Extended Community で&#10;連続する。&#10;&#10;intent（color）は source 保持（NAT-less）でも&#10;失われず、backbone TE class に対応づく。&#10;&#10;upstream（peer/transit）選択は BR の&#10;uA（EPE, RFC 9087）を segment list 末尾に&#10;積むだけ ― GW に per-ISP eBGP 不要。" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;align=left;verticalAlign=top;fontSize=11;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="486" width="200" height="290" as="geometry" />
+        </mxCell>
+
+        <!-- ===== legend ===== -->
+        <mxCell id="lg_t" value="凡例" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1146" width="180" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="cluster control / headend" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1168" width="190" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="egress GW（ToR-PE）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1194" width="190" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3" value="backbone PE / fabric" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1220" width="190" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="lg4" value="鍵となる SR action / 注記" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=center;verticalAlign=middle;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1246" width="190" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- ===== edges ===== -->
+        <mxCell id="e_crd_ctrl" value="watch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#333333;fontSize=10;" edge="1" parent="1" source="crd" target="ctrl">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_ctrl_he" value="cluster-internal BGP&#10;（SR Policy SAFI + Color ext-community）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9673a6;fontSize=10;" edge="1" parent="1" source="ctrl" target="headend">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_he_gw" value="SRv6 encap（cluster SID）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#6c8ebf;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="headend" target="gw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_gwA_peA" value="NIC1 · eBGP MP-BGP（9252 / 9012 / Color）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;startArrow=block;startFill=1;strokeColor=#d79b00;strokeWidth=2;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="vrfA" target="peA">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_gwB_peB" value="NIC2 · eBGP MP-BGP（9252 / 9012 / Color）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;startArrow=block;startFill=1;strokeColor=#d79b00;strokeWidth=2;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="vrfB" target="peB">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_peA_fab" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#82b366;strokeWidth=2;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="peA" target="fabric">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_peB_fab" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#82b366;strokeWidth=2;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="peB" target="fabric">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="brmode" value="BR モード（vendor BR 不在環境、§4.4）&#10;本図の vendor BR-A/B を畳み、GW が per-VRF eBGP で upstream/backbone PE と直接 peer（v20 図の構成）。CRD / controller / headend / SAFI 群は不変。" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;align=left;verticalAlign=top;fontSize=10;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="980" width="240" height="118" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
