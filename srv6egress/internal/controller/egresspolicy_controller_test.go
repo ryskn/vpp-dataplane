@@ -35,8 +35,11 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
+// testConfig builds a controller config in the DEPRECATED single form and runs
+// Validate() so CandidatePaths is normalized exactly as production does (via
+// config.Load). This proves the single form still flows through the controller.
 func testConfig() *config.ControllerConfig {
-	return &config.ControllerConfig{
+	cfg := &config.ControllerConfig{
 		Upstreams: map[string]config.UpstreamConfig{
 			"isp-a": {SID: "fcff:0:0:e0:a::", VRF: "upstream-a"},
 			"isp-b": {SID: "fcff:0:0:e0:b::", VRF: "upstream-b"},
@@ -46,6 +49,32 @@ func testConfig() *config.ControllerConfig {
 			200: {Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}},
 		},
 	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+// multiCandidateConfig has color 100 resolve to two candidate paths (isp-a pref
+// 200 primary, isp-b pref 100 backup) for the multi-candidate controller tests.
+func multiCandidateConfig() *config.ControllerConfig {
+	cfg := &config.ControllerConfig{
+		Upstreams: map[string]config.UpstreamConfig{
+			"isp-a": {SID: "fcff:0:0:e0:a::", VRF: "upstream-a"},
+			"isp-b": {SID: "fcff:0:0:e0:b::", VRF: "upstream-b"},
+		},
+		Colors: map[uint32]config.ColorConfig{
+			100: {CandidatePaths: []config.CandidatePathConfig{
+				{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 200},
+				{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}, Preference: 100},
+			}},
+			200: {Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
 }
 
 func egressNode(name string) *corev1.Node {
@@ -101,18 +130,24 @@ func newReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler 
 	}
 }
 
-// recordingBGP records the args of the last Announce/Withdraw. Cluster adverts
-// are colored-route encoded (see newReconciler), so it decodes the PolicyKey +
-// segment list straight off the recorded Advertisement.
+// recordingBGP records the args of the last Announce/Withdraw plus the full
+// lists across a reconcile. Cluster adverts are colored-route encoded (see
+// newReconciler), so it decodes the PolicyKey + segment list straight off the
+// recorded Advertisement.
 type recordingBGP struct {
-	wOwner string
-	wKey   bgp.PolicyKey
-	wSegs  []string
+	wOwner    string
+	wKey      bgp.PolicyKey
+	wSegs     []string
+	announced []bgp.ColoredAdvert // every Announce (colored encoding)
+	withdrawn []bgp.ColoredAdvert // every Withdraw (colored encoding)
 }
 
 func (b *recordingBGP) Announce(_ context.Context, _ string, adv bgp.Advertisement) (string, error) {
 	if adv == nil {
 		return "", nil
+	}
+	if ca, ok := adv.(*bgp.ColoredAdvert); ok {
+		b.announced = append(b.announced, *ca)
 	}
 	return adv.BSID(), nil
 }
@@ -120,6 +155,7 @@ func (b *recordingBGP) Withdraw(_ context.Context, owner string, adv bgp.Adverti
 	b.wOwner = owner
 	if ca, ok := adv.(*bgp.ColoredAdvert); ok {
 		b.wKey, b.wSegs = ca.Key, ca.SegmentList
+		b.withdrawn = append(b.withdrawn, *ca)
 	}
 	return nil
 }
@@ -405,6 +441,136 @@ func TestReconcile_SpecEditWithdrawsOldAnnounce(t *testing.T) {
 	}
 	if c := getReady(t, r, "tenant-a"); c.Status != metav1.ConditionTrue {
 		t.Fatalf("expected Ready=True after edit reconcile, got %s (%s)", c.Status, c.Reason)
+	}
+}
+
+// --- multi-candidate distribution (RFC 9256 candidate paths) ---
+
+func newMultiReconciler(t *testing.T, rec bgp.Distributor, objs ...client.Object) *EgressPolicyReconciler {
+	t.Helper()
+	s := testScheme(t)
+	c := fakeclient.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
+		Build()
+	return &EgressPolicyReconciler{Client: c, Scheme: s, Config: multiCandidateConfig(),
+		BGP: rec, Encoder: bgp.NewColoredEncoder()}
+}
+
+// A 2-candidate color announces two adverts with distinguishers 1,2 in config
+// order, carrying each candidate's preference. Status persists both candidates.
+func TestReconcile_MultiCandidateAnnouncesBoth(t *testing.T) {
+	rec := &recordingBGP{}
+	r := newMultiReconciler(t, rec, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rec.announced) != 2 {
+		t.Fatalf("announced %d adverts, want 2", len(rec.announced))
+	}
+	// Config order = distinguisher order: [0]=isp-a pref 200 d1, [1]=isp-b pref 100 d2.
+	if rec.announced[0].Key.Distinguisher != 1 || rec.announced[0].Key.Preference != 200 {
+		t.Fatalf("candidate 0 key = %+v, want distinguisher 1 / preference 200", rec.announced[0].Key)
+	}
+	if rec.announced[1].Key.Distinguisher != 2 || rec.announced[1].Key.Preference != 100 {
+		t.Fatalf("candidate 1 key = %+v, want distinguisher 2 / preference 100", rec.announced[1].Key)
+	}
+	if rec.announced[0].SegmentList[0] != "fcff:0:0:e0:a::" || rec.announced[1].SegmentList[0] != "fcff:0:0:e0:b::" {
+		t.Fatalf("candidate segment lists = %v, %v", rec.announced[0].SegmentList, rec.announced[1].SegmentList)
+	}
+
+	var ep srv6egressv1.EgressPolicy
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Status.SRPolicy == nil || len(ep.Status.SRPolicy.CandidatePaths) != 2 {
+		t.Fatalf("status.srPolicy.candidatePaths = %+v, want 2", ep.Status.SRPolicy)
+	}
+	// The deprecated single-form status mirrors the primary (highest-preference).
+	if ep.Status.Upstream != "isp-a" || ep.Status.SRPolicy.SegmentList[0] != "fcff:0:0:e0:a::" {
+		t.Fatalf("primary mirror = upstream %q segs %v, want isp-a/fcff:0:0:e0:a::", ep.Status.Upstream, ep.Status.SRPolicy.SegmentList)
+	}
+	if c := getReady(t, r, "tenant-a"); c.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Ready=True, got %s (%s)", c.Status, c.Reason)
+	}
+}
+
+// Editing the spec to a single-candidate color must withdraw BOTH stale
+// candidate adverts of the prior multi-candidate color, then re-announce the new
+// single candidate.
+func TestReconcile_MultiCandidateShrinkWithdrawsStale(t *testing.T) {
+	ctx := context.Background()
+	rec := &recordingBGP{}
+	r := newMultiReconciler(t, rec, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var ep srv6egressv1.EgressPolicy
+	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	ep.Spec.Egress.Color = 200 // single-candidate color
+	if err := r.Update(ctx, &ep); err != nil {
+		t.Fatal(err)
+	}
+	rec.withdrawn = nil
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile after edit: %v", err)
+	}
+
+	// Both prior candidates (isp-a, isp-b terminal SIDs) must have been withdrawn.
+	if len(rec.withdrawn) != 2 {
+		t.Fatalf("withdrew %d stale adverts, want 2", len(rec.withdrawn))
+	}
+	gotSIDs := map[string]bool{}
+	for _, w := range rec.withdrawn {
+		gotSIDs[w.SegmentList[len(w.SegmentList)-1]] = true
+	}
+	if !gotSIDs["fcff:0:0:e0:a::"] || !gotSIDs["fcff:0:0:e0:b::"] {
+		t.Fatalf("stale withdraws = %v, want both isp-a and isp-b terminal SIDs", gotSIDs)
+	}
+	// New color 200 persisted as a single candidate.
+	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Status.SRPolicy == nil || ep.Status.SRPolicy.Color != 200 || len(ep.Status.SRPolicy.CandidatePaths) != 1 {
+		t.Fatalf("status.srPolicy = %+v, want color 200 / 1 candidate", ep.Status.SRPolicy)
+	}
+}
+
+// Deleting a multi-candidate policy must withdraw EVERY candidate advert from
+// the persisted status (restart-safe teardown).
+func TestReconcile_MultiCandidateDeleteWithdrawsAll(t *testing.T) {
+	ctx := context.Background()
+	rec := &recordingBGP{}
+	r := newMultiReconciler(t, rec, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var ep srv6egressv1.EgressPolicy
+	if err := r.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &ep); err != nil {
+		t.Fatal(err)
+	}
+	rec.withdrawn = nil
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcileDelete: %v", err)
+	}
+	if len(rec.withdrawn) != 2 {
+		t.Fatalf("delete withdrew %d adverts, want 2 (all candidates)", len(rec.withdrawn))
+	}
+	// Distinguishers 1 and 2 must both have been rebuilt from status.
+	gotD := map[uint32]bool{}
+	for _, w := range rec.withdrawn {
+		gotD[w.Key.Distinguisher] = true
+	}
+	if !gotD[1] || !gotD[2] {
+		t.Fatalf("delete withdrew distinguishers %v, want 1 and 2", gotD)
 	}
 }
 

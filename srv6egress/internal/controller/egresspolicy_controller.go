@@ -86,7 +86,7 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	log.Info("reconciled", "name", ep.Name, "color", ep.Spec.Egress.Color,
-		"upstream", plan.cc.Upstream, "endpoint", plan.endpoint)
+		"candidates", len(plan.cc.CandidatePaths), "primary", plan.cc.Primary().Upstream, "endpoint", plan.endpoint)
 	return ctrl.Result{}, nil
 }
 
@@ -168,40 +168,82 @@ func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egress
 	return &reconcilePlan{cc: cc, endpoint: endpoint, endpointAddr: endpointAddr}, ctrl.Result{}, nil
 }
 
+// candidateStatus builds the persisted candidate-path array from the resolved
+// color config, in config order (= distinguisher order).
+func candidateStatus(cc config.ColorConfig) []srv6egressv1.CandidatePathStatus {
+	out := make([]srv6egressv1.CandidatePathStatus, len(cc.CandidatePaths))
+	for i, cp := range cc.CandidatePaths {
+		out[i] = srv6egressv1.CandidatePathStatus{
+			Upstream:    cp.Upstream,
+			SegmentList: cp.SegmentList,
+			Preference:  cp.Preference,
+		}
+	}
+	return out
+}
+
+// primaryCandidate returns the highest-preference candidate from a persisted
+// array (the deprecated single-form status mirrors it). The array is never
+// empty here — resolvePlan derives it from a validated, non-empty color config.
+func primaryCandidate(cps []srv6egressv1.CandidatePathStatus) srv6egressv1.CandidatePathStatus {
+	best := cps[0]
+	for _, cp := range cps[1:] {
+		if cp.Preference > best.Preference {
+			best = cp
+		}
+	}
+	return best
+}
+
+// candidateKey builds the per-candidate SR Policy key. The distinguisher is the
+// config index+1 (RFC 9256 §2.1: candidates sharing <color, endpoint> differ by
+// distinguisher); the preference rides in the Tunnel Encap sub-TLV.
+func candidateKey(ep *srv6egressv1.EgressPolicy, endpoint, endpointAddr, bsid string, idx int, cp srv6egressv1.CandidatePathStatus) bgp.PolicyKey {
+	return bgp.PolicyKey{
+		Color:         ep.Spec.Egress.Color,
+		Endpoint:      endpoint,
+		EndpointAddr:  endpointAddr,
+		BSID:          bsid,
+		Distinguisher: uint32(idx + 1),
+		Preference:    cp.Preference,
+	}
+}
+
 // distributeCluster reconciles the headend-facing SR Policy distribution:
-// withdraw a drifted prior announce, persist the announce intent BEFORE
-// announcing (persist-then-announce, so deletion can always rebuild an exact
-// withdraw), announce, then record the effective BSID and mark Ready.
+// withdraw a drifted prior announce (all candidates), persist the announce
+// intent BEFORE announcing (persist-then-announce, so deletion can always
+// rebuild an exact withdraw), announce every candidate, then record the
+// effective BSID and mark Ready.
 func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6egressv1.EgressPolicy, plan *reconcilePlan) (ctrl.Result, error) {
 	owner := string(ep.UID)
 	cc := plan.cc
+	cps := candidateStatus(cc)
+	primary := primaryCandidate(cps)
 	intent := &srv6egressv1.SRPolicyStatus{
-		BSID:         cc.BSID,
-		Color:        ep.Spec.Egress.Color,
-		SegmentList:  cc.SegmentList,
-		EndpointAddr: plan.endpointAddr,
+		BSID:           cc.BSID,
+		Color:          ep.Spec.Egress.Color,
+		SegmentList:    primary.SegmentList, // deprecated single-form mirror
+		CandidatePaths: cps,
+		EndpointAddr:   plan.endpointAddr,
 	}
 
-	// Withdraw a previously announced SR Policy whose key/segments no longer
-	// match the current intent (spec edit) — otherwise the old path would stay
-	// in BGP forever.
+	// Withdraw a previously announced SR Policy whose candidate set no longer
+	// matches the current intent (spec edit) — otherwise the old candidate paths
+	// would stay in BGP forever. v1 is coarse: on any drift, withdraw every prior
+	// candidate before re-announcing the current set.
 	if prior := ep.Status.SRPolicy; prior != nil && !srPolicyIntentEqual(prior, intent) {
-		priorKey := bgp.PolicyKey{
-			Color:        prior.Color,
-			Endpoint:     ep.Status.ActiveEndpoint,
-			EndpointAddr: prior.EndpointAddr,
-			BSID:         prior.BSID,
-		}
-		if err := r.BGP.Withdraw(ctx, owner, r.Encoder.ClusterAdvert(priorKey, prior.SegmentList)); err != nil {
-			return r.markNotReady(ctx, ep, "BGPWithdrawStale", err.Error())
+		for _, adv := range priorAdverts(r.Encoder, ep, prior) {
+			if err := r.BGP.Withdraw(ctx, owner, adv); err != nil {
+				return r.markNotReady(ctx, ep, "BGPWithdrawStale", err.Error())
+			}
 		}
 	}
 
 	// Persist the announce intent BEFORE announcing.
 	if ep.Status.ActiveEndpoint != plan.endpoint ||
-		ep.Status.Upstream != cc.Upstream || !srPolicyIntentEqual(ep.Status.SRPolicy, intent) {
+		ep.Status.Upstream != primary.Upstream || !srPolicyIntentEqual(ep.Status.SRPolicy, intent) {
 		ep.Status.ActiveEndpoint = plan.endpoint
-		ep.Status.Upstream = cc.Upstream
+		ep.Status.Upstream = primary.Upstream
 		ep.Status.SRPolicy = intent
 		setReady(ep, metav1.ConditionFalse, "Announcing", "SR Policy recorded; BGP announce in progress")
 		if err := r.Status().Update(ctx, ep); err != nil {
@@ -209,26 +251,55 @@ func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6
 		}
 	}
 
-	// Distribute (idempotent: re-announcing refreshes the path).
-	adv := r.Encoder.ClusterAdvert(bgp.PolicyKey{
-		Color:        ep.Spec.Egress.Color,
-		Endpoint:     plan.endpoint,
-		EndpointAddr: plan.endpointAddr,
-		BSID:         cc.BSID,
-	}, cc.SegmentList)
-	bsid, err := r.BGP.Announce(ctx, owner, adv)
-	if err != nil {
-		return r.markNotReady(ctx, ep, "BGPDistribution", err.Error())
+	// Distribute every candidate (idempotent: re-announcing refreshes the path).
+	// The primary candidate's BSID is recorded in status; a partial failure marks
+	// not-ready and re-reconcile re-announces the full set.
+	var primaryBSID string
+	for i, cp := range cps {
+		adv := r.Encoder.ClusterAdvert(candidateKey(ep, plan.endpoint, plan.endpointAddr, cc.BSID, i, cp), cp.SegmentList)
+		bsid, err := r.BGP.Announce(ctx, owner, adv)
+		if err != nil {
+			return r.markNotReady(ctx, ep, "BGPDistribution", err.Error())
+		}
+		if cp.Upstream == primary.Upstream && cp.Preference == primary.Preference {
+			primaryBSID = bsid
+		}
 	}
 
 	// Mark Ready; record the BSID the distributor actually used (the colored
 	// encoding reports the terminal SID, the SR Policy SAFI the configured BSID).
-	ep.Status.SRPolicy.BSID = bsid
+	ep.Status.SRPolicy.BSID = primaryBSID
 	setReady(ep, metav1.ConditionTrue, "Reconciled", "EgressPolicy installed")
 	if err := r.Status().Update(ctx, ep); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// priorAdverts rebuilds the per-candidate withdraw adverts from a persisted SR
+// Policy status. It replays config-order (= distinguisher order) so each
+// withdraw reconstructs the exact NLRI key that was announced — restart-safe and
+// independent of any in-memory state.
+func priorAdverts(enc bgp.Encoder, ep *srv6egressv1.EgressPolicy, sp *srv6egressv1.SRPolicyStatus) []bgp.Advertisement {
+	cps := sp.CandidatePaths
+	if len(cps) == 0 && len(sp.SegmentList) > 0 {
+		// Legacy status written before candidatePaths existed: treat the
+		// single-form segment list as one candidate (distinguisher 1).
+		cps = []srv6egressv1.CandidatePathStatus{{SegmentList: sp.SegmentList}}
+	}
+	out := make([]bgp.Advertisement, 0, len(cps))
+	for i, cp := range cps {
+		key := bgp.PolicyKey{
+			Color:         sp.Color,
+			Endpoint:      ep.Status.ActiveEndpoint,
+			EndpointAddr:  sp.EndpointAddr,
+			BSID:          sp.BSID,
+			Distinguisher: uint32(i + 1),
+			Preference:    cp.Preference,
+		}
+		out = append(out, enc.ClusterAdvert(key, cp.SegmentList))
+	}
+	return out
 }
 
 func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6egressv1.EgressPolicy) (ctrl.Result, error) {
@@ -239,31 +310,28 @@ func (r *EgressPolicyReconciler) reconcileDelete(ctx context.Context, ep *srv6eg
 
 	owner := string(ep.UID)
 
-	// Rebuild the SR Policy key + segment list from the PERSISTED ANNOUNCED
-	// values in status (not the mutable spec): the route in BGP was announced
-	// with status.srPolicy.{color,segmentList}, which may differ from the
-	// current spec if it was edited. Using status guarantees we delete exactly
-	// what we added — and it works after a controller restart too (the in-memory
-	// announce cache would be empty). The intent is persisted BEFORE Announce,
-	// so SRPolicy is nil only if no announce was ever attempted (Withdraw of a
-	// recorded-but-never-announced path is a safe no-op).
+	// Rebuild every candidate's SR Policy key + segment list from the PERSISTED
+	// ANNOUNCED values in status (not the mutable spec): the routes in BGP were
+	// announced with status.srPolicy.{color,candidatePaths}, which may differ
+	// from the current spec if it was edited. Using status guarantees we delete
+	// exactly what we added — and it works after a controller restart too (the
+	// in-memory announce cache would be empty). The intent is persisted BEFORE
+	// Announce, so SRPolicy is nil only if no announce was ever attempted
+	// (Withdraw of a recorded-but-never-announced path is a safe no-op).
 	if sp := ep.Status.SRPolicy; sp != nil {
-		key := bgp.PolicyKey{
-			Color:        sp.Color,
-			Endpoint:     ep.Status.ActiveEndpoint,
-			EndpointAddr: sp.EndpointAddr,
-			BSID:         sp.BSID,
-		}
-		adv := r.Encoder.ClusterAdvert(key, sp.SegmentList)
-		if _, err := adv.BuildPath(); err != nil {
-			// Deterministic encode failure (e.g. sr-policy with an empty
-			// BSID/endpoint): nothing valid could have been announced, so there
-			// is nothing to withdraw. Log and drop the finalizer rather than
-			// wedging the object in Terminating forever on every reconcile.
-			log.Error(err, "cannot rebuild withdraw advert; dropping finalizer without withdraw", "name", ep.Name)
-		} else if err := r.BGP.Withdraw(ctx, owner, adv); err != nil {
-			// Transient transport error: keep the finalizer and retry.
-			return ctrl.Result{}, err
+		for _, adv := range priorAdverts(r.Encoder, ep, sp) {
+			if _, err := adv.BuildPath(); err != nil {
+				// Deterministic encode failure (e.g. sr-policy with an empty
+				// BSID/endpoint): nothing valid could have been announced, so there
+				// is nothing to withdraw. Log and continue rather than wedging the
+				// object in Terminating forever on every reconcile.
+				log.Error(err, "cannot rebuild withdraw advert; skipping without withdraw", "name", ep.Name, "advert", adv.String())
+				continue
+			}
+			if err := r.BGP.Withdraw(ctx, owner, adv); err != nil {
+				// Transient transport error: keep the finalizer and retry.
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
@@ -371,14 +439,32 @@ func (r *EgressPolicyReconciler) markNotReadyTerminal(ctx context.Context, ep *s
 }
 
 // srPolicyIntentEqual compares the withdraw-relevant fields of two SR Policy
-// status records. BSID is deliberately excluded: the colored-route encoding
-// reports the terminal SID as the effective BSID after announce, which must
-// not register as drift on the next reconcile (it would flap Ready).
+// status records, including the FULL candidate-path set (config order matters:
+// it fixes the distinguisher). BSID is deliberately excluded: the colored-route
+// encoding reports the terminal SID as the effective BSID after announce, which
+// must not register as drift on the next reconcile (it would flap Ready).
 func srPolicyIntentEqual(a, b *srv6egressv1.SRPolicyStatus) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
 	if a.Color != b.Color || a.EndpointAddr != b.EndpointAddr {
+		return false
+	}
+	if len(a.CandidatePaths) != len(b.CandidatePaths) {
+		return false
+	}
+	for i := range a.CandidatePaths {
+		if !candidatePathEqual(a.CandidatePaths[i], b.CandidatePaths[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// candidatePathEqual compares two candidate paths by upstream, preference, and
+// segment list (order-sensitive).
+func candidatePathEqual(a, b srv6egressv1.CandidatePathStatus) bool {
+	if a.Upstream != b.Upstream || a.Preference != b.Preference {
 		return false
 	}
 	if len(a.SegmentList) != len(b.SegmentList) {

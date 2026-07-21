@@ -138,17 +138,59 @@ func (u UpstreamConfig) ResolvedSIDStructure() SIDStructure {
 	return classicSIDStructure
 }
 
-// ColorConfig binds a color to an upstream + segment list.
+// defaultCandidatePreference is the preference assigned to a color's implicit
+// candidate path when a legacy single-form config is normalized (RFC 9256 §2.7;
+// higher wins).
+const defaultCandidatePreference = 100
+
+// ColorConfig binds a color (RFC 9256 intent) to one or more candidate paths.
+// A color resolves to a set of candidate paths; the headend selects among them
+// by preference (§2.7). The BSID keys the color's SR Policy at the headend and
+// is shared across the candidate paths (RFC 9256 policy/candidate hierarchy).
 type ColorConfig struct {
-	Upstream    string   `json:"upstream"`
-	SegmentList []string `json:"segmentList"`
+	// CandidatePaths are the RFC 9256 candidate paths for this color, higher
+	// preference winning at the headend. Populated directly, or normalized from
+	// the deprecated single-form (Upstream+SegmentList) by Validate().
+	// +optional
+	CandidatePaths []CandidatePathConfig `json:"candidatePaths,omitempty"`
+
+	// Upstream is the deprecated single-candidate form. Use CandidatePaths.
+	// +optional
+	Upstream string `json:"upstream,omitempty"`
+	// SegmentList is the deprecated single-candidate form. Use CandidatePaths.
+	// +optional
+	SegmentList []string `json:"segmentList,omitempty"`
+
 	// BSID is the Binding SID for this color's SR Policy. It is REQUIRED when
 	// distributing over SR Policy SAFI (--bgp-encoding=sr-policy): the receiving
 	// headend keys the installed VPP SR Policy on the BSID, so an absent BSID
 	// yields an unusable all-zero key. Ignored by the colored-route encoding.
-	// Must be an IPv6 SID, unique per color.
+	// Must be an IPv6 SID, unique per color; shared across candidate paths.
 	// +optional
 	BSID string `json:"bsid,omitempty"`
+}
+
+// CandidatePathConfig is one RFC 9256 candidate path for a color: a concrete
+// upstream + segment list, selected among a color's candidates by Preference.
+type CandidatePathConfig struct {
+	Upstream    string   `json:"upstream"`
+	SegmentList []string `json:"segmentList"`
+	// Preference is the RFC 9256 §2.7 candidate-path preference; higher wins.
+	Preference uint32 `json:"preference"`
+}
+
+// Primary returns the highest-preference candidate path. Callers that need a
+// single representative (status printcolumns, legacy single-form status) use it.
+// Ties never occur: Validate() rejects duplicate preferences within a color.
+// Only valid after Validate() has normalized CandidatePaths (never empty then).
+func (c ColorConfig) Primary() CandidatePathConfig {
+	best := c.CandidatePaths[0]
+	for _, cp := range c.CandidatePaths[1:] {
+		if cp.Preference > best.Preference {
+			best = cp
+		}
+	}
+	return best
 }
 
 // Load reads a controller config yaml file.
@@ -182,12 +224,39 @@ func parseSID(s string) (net.IP, error) {
 	return ip.To16(), nil
 }
 
+// normalizeCandidatePaths folds the deprecated single-candidate form
+// (Upstream+SegmentList directly on ColorConfig) into CandidatePaths so the rest
+// of the pipeline only ever reads CandidatePaths. Specifying both forms is
+// ambiguous and rejected. Runs before per-color validation.
+func (c *ControllerConfig) normalizeCandidatePaths() error {
+	for color, cc := range c.Colors {
+		singleSet := cc.Upstream != "" || len(cc.SegmentList) > 0
+		if singleSet && len(cc.CandidatePaths) > 0 {
+			return fmt.Errorf("color %d: set either candidatePaths or the deprecated upstream/segmentList, not both", color)
+		}
+		if singleSet {
+			cc.CandidatePaths = []CandidatePathConfig{{
+				Upstream:    cc.Upstream,
+				SegmentList: cc.SegmentList,
+				Preference:  defaultCandidatePreference,
+			}}
+			cc.Upstream = ""
+			cc.SegmentList = nil
+			c.Colors[color] = cc
+		}
+	}
+	return nil
+}
+
 // Validate checks internal consistency (color → upstream cross-references) and
 // that every SID (upstream SIDs and segment-list entries) is a well-formed
 // IPv6 address. SID equality is checked by canonical value, not raw string.
 func (c *ControllerConfig) Validate() error {
 	if len(c.Colors) == 0 {
 		return fmt.Errorf("no colors defined")
+	}
+	if err := c.normalizeCandidatePaths(); err != nil {
+		return err
 	}
 
 	// Validate upstream SIDs up front and cache their canonical form.
@@ -211,18 +280,12 @@ func (c *ControllerConfig) Validate() error {
 	seenBSID := make(map[string]uint32, len(c.Colors))
 
 	for color, cc := range c.Colors {
-		if cc.Upstream == "" {
-			return fmt.Errorf("color %d: upstream is required", color)
-		}
-		wantSID, ok := upstreamSID[cc.Upstream]
-		if !ok {
-			return fmt.Errorf("color %d: upstream %q not defined in upstreams", color, cc.Upstream)
-		}
-		if len(cc.SegmentList) == 0 {
-			return fmt.Errorf("color %d: segmentList must not be empty", color)
+		if len(cc.CandidatePaths) == 0 {
+			return fmt.Errorf("color %d: candidatePaths must not be empty", color)
 		}
 		// BSID is optional in the schema (the colored-route encoding ignores it),
 		// but if set it must be a well-formed IPv6 SID and unique across colors.
+		// It is per color, shared across the candidate paths.
 		if cc.BSID != "" {
 			bsid, err := parseSID(cc.BSID)
 			if err != nil {
@@ -234,22 +297,42 @@ func (c *ControllerConfig) Validate() error {
 			}
 			seenBSID[bsid.String()] = color
 		}
-		// Every segment must be a syntactically valid IPv6 SID.
-		segs := make([]net.IP, len(cc.SegmentList))
-		for i, s := range cc.SegmentList {
-			sid, err := parseSID(s)
-			if err != nil {
-				return fmt.Errorf("color %d: segmentList[%d] %v", color, i, err)
+		// Reject duplicate preferences within a color: the headend tie-break
+		// between candidate paths would otherwise be undefined.
+		seenPref := make(map[uint32]int, len(cc.CandidatePaths))
+		for i, cp := range cc.CandidatePaths {
+			if cp.Upstream == "" {
+				return fmt.Errorf("color %d: candidatePaths[%d].upstream is required", color, i)
 			}
-			segs[i] = sid
-		}
-		// The SR Policy terminates at the upstream's End.DT6 SID, so the last
-		// segment MUST equal that upstream's SID (compared by canonical value).
-		// Otherwise the headend would steer traffic to the wrong SID
-		// (VRF-isolation bypass / blackhole).
-		if last := segs[len(segs)-1]; !last.Equal(wantSID) {
-			return fmt.Errorf("color %d: last segment %q must equal upstream %q SID %q",
-				color, cc.SegmentList[len(cc.SegmentList)-1], cc.Upstream, c.Upstreams[cc.Upstream].SID)
+			wantSID, ok := upstreamSID[cp.Upstream]
+			if !ok {
+				return fmt.Errorf("color %d: candidatePaths[%d].upstream %q not defined in upstreams", color, i, cp.Upstream)
+			}
+			if len(cp.SegmentList) == 0 {
+				return fmt.Errorf("color %d: candidatePaths[%d].segmentList must not be empty", color, i)
+			}
+			if other, dup := seenPref[cp.Preference]; dup {
+				return fmt.Errorf("color %d: candidatePaths[%d] and [%d] share preference %d; preferences must be unique per color",
+					color, i, other, cp.Preference)
+			}
+			seenPref[cp.Preference] = i
+			// Every segment must be a syntactically valid IPv6 SID.
+			segs := make([]net.IP, len(cp.SegmentList))
+			for j, s := range cp.SegmentList {
+				sid, err := parseSID(s)
+				if err != nil {
+					return fmt.Errorf("color %d: candidatePaths[%d].segmentList[%d] %v", color, i, j, err)
+				}
+				segs[j] = sid
+			}
+			// The SR Policy terminates at the upstream's End.DT6 SID, so the last
+			// segment MUST equal that upstream's SID (compared by canonical value).
+			// Otherwise the headend would steer traffic to the wrong SID
+			// (VRF-isolation bypass / blackhole).
+			if last := segs[len(segs)-1]; !last.Equal(wantSID) {
+				return fmt.Errorf("color %d: candidatePaths[%d] last segment %q must equal upstream %q SID %q",
+					color, i, cp.SegmentList[len(cp.SegmentList)-1], cp.Upstream, c.Upstreams[cp.Upstream].SID)
+			}
 		}
 	}
 

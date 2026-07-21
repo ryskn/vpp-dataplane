@@ -148,15 +148,36 @@ type SRPolicyStatus struct {
 	// +optional
 	Color uint32 `json:"color,omitempty"`
 
-	// SegmentList is the SR Policy segment list resolved by the controller.
+	// SegmentList is DEPRECATED (use CandidatePaths): the primary
+	// (highest-preference) candidate's segment list, kept for agents that read
+	// the single-form status.
 	// +optional
 	SegmentList []string `json:"segmentList,omitempty"`
+
+	// CandidatePaths are the announced candidate paths in config order
+	// (= distinguisher order). Persisted so reconcileDelete rebuilds the exact
+	// per-candidate withdraws after a controller restart.
+	// +optional
+	CandidatePaths []CandidatePathStatus `json:"candidatePaths,omitempty"`
 
 	// EndpointAddr is the SR Policy endpoint IPv6 address advertised in the SR
 	// Policy SAFI NLRI. Persisted so Withdraw can rebuild the exact NLRI key
 	// (<distinguisher, color, endpoint>) after a controller restart.
 	// +optional
 	EndpointAddr string `json:"endpointAddr,omitempty"`
+}
+
+// CandidatePathStatus is one announced RFC 9256 candidate path.
+type CandidatePathStatus struct {
+	// Upstream is the symbolic upstream this candidate exits through.
+	// +optional
+	Upstream string `json:"upstream,omitempty"`
+	// SegmentList is this candidate's SR Policy segment list.
+	// +optional
+	SegmentList []string `json:"segmentList,omitempty"`
+	// Preference is the RFC 9256 §2.7 candidate-path preference (higher wins).
+	// +optional
+	Preference uint32 `json:"preference,omitempty"`
 }
 
 func init() {

@@ -42,6 +42,15 @@ type PolicyKey struct {
 	// advertises it (the receiving headend keys its installed VPP SR Policy on
 	// the BSID); the colored-route encoding ignores it.
 	BSID string
+	// Distinguisher disambiguates SR Policy SAFI NLRIs that share <color,
+	// endpoint> — one per candidate path (RFC 9256 §2.1). The controller assigns
+	// it deterministically from candidate order (index+1). Zero defaults to 1 in
+	// the encoder; the colored-route encoding ignores it.
+	Distinguisher uint32
+	// Preference is this candidate path's RFC 9256 §2.7 preference, carried in
+	// the SR Policy SAFI Tunnel Encap Preference sub-TLV (higher wins at the
+	// headend). Zero defaults to 100; the colored-route encoding ignores it.
+	Preference uint32
 }
 
 // Advertisement is one BGP advertisement the controller distributes. An

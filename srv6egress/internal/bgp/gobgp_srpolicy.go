@@ -12,7 +12,10 @@ import (
 // (RFC 9012, "SR Policy" tunnel type = 15).
 const srPolicyTunnelType = 15
 
-// SRPolicyOptions tunes the SR Policy SAFI encoding.
+// SRPolicyOptions holds the per-advert defaults for the SR Policy SAFI encoding.
+// The controller assigns a distinguisher/preference per candidate path on the
+// PolicyKey; these defaults apply only when a key leaves them zero (the
+// single-candidate case).
 type SRPolicyOptions struct {
 	// Distinguisher disambiguates SR Policy NLRIs that share <color, endpoint>
 	// (RFC 9256 §2.1). Defaults to 1.
@@ -22,13 +25,20 @@ type SRPolicyOptions struct {
 	Preference uint32
 }
 
+// defaultDistinguisher / defaultPreference are the single-candidate fallbacks
+// used when a PolicyKey does not carry per-candidate values.
+const (
+	defaultDistinguisher = 1
+	defaultPreference    = 100
+)
+
 func (o *SRPolicyOptions) withDefaults() SRPolicyOptions {
 	out := *o
 	if out.Distinguisher == 0 {
-		out.Distinguisher = 1
+		out.Distinguisher = defaultDistinguisher
 	}
 	if out.Preference == 0 {
-		out.Preference = 100
+		out.Preference = defaultPreference
 	}
 	return out
 }
@@ -72,10 +82,16 @@ func parseV6SID(s string) (net.IP, error) {
 // The Binding SID sub-TLV is mandatory: the receiving headend keys its VPP SR
 // Policy on the BSID, so omitting it would advertise an SR Policy the receiver
 // installs under an all-zero, unusable BSID.
-func (d *srPolicyEncoder) srPolicyPath(color uint32, endpoint, bsid net.IP, segmentList []string) (*api.Path, error) {
+func (d *srPolicyEncoder) srPolicyPath(color, distinguisher, preference uint32, endpoint, bsid net.IP, segmentList []string) (*api.Path, error) {
+	if distinguisher == 0 {
+		distinguisher = d.opts.Distinguisher
+	}
+	if preference == 0 {
+		preference = d.opts.Preference
+	}
 	nlri, err := apb.New(&api.SRPolicyNLRI{
 		Length:        192, // bits: 4 (distinguisher) + 4 (color) + 16 (endpoint) octets
-		Distinguisher: d.opts.Distinguisher,
+		Distinguisher: distinguisher,
 		Color:         color,
 		Endpoint:      endpoint,
 	})
@@ -119,7 +135,7 @@ func (d *srPolicyEncoder) srPolicyPath(color uint32, endpoint, bsid net.IP, segm
 	if err != nil {
 		return nil, err
 	}
-	pref, err := apb.New(&api.TunnelEncapSubTLVSRPreference{Preference: d.opts.Preference})
+	pref, err := apb.New(&api.TunnelEncapSubTLVSRPreference{Preference: preference})
 	if err != nil {
 		return nil, err
 	}
@@ -190,12 +206,12 @@ func (a *SRPolicyAdvert) BuildPath() (*api.Path, error) {
 	if err != nil {
 		return nil, err
 	}
-	return a.enc.srPolicyPath(a.Key.Color, endpoint, bsid, a.SegmentList)
+	return a.enc.srPolicyPath(a.Key.Color, a.Key.Distinguisher, a.Key.Preference, endpoint, bsid, a.SegmentList)
 }
 
 func (a *SRPolicyAdvert) BSID() string { return a.Key.BSID }
 
 func (a *SRPolicyAdvert) String() string {
-	return fmt.Sprintf("sr-policy color=%d endpoint=%s bsid=%s segments=%d",
-		a.Key.Color, a.Key.EndpointAddr, a.Key.BSID, len(a.SegmentList))
+	return fmt.Sprintf("sr-policy color=%d distinguisher=%d preference=%d endpoint=%s bsid=%s segments=%d",
+		a.Key.Color, a.Key.Distinguisher, a.Key.Preference, a.Key.EndpointAddr, a.Key.BSID, len(a.SegmentList))
 }

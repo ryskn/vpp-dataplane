@@ -159,6 +159,12 @@ func (in *SRPolicyStatus) DeepCopyInto(out *SRPolicyStatus) {
 	if in.SegmentList != nil {
 		out.SegmentList = append([]string(nil), in.SegmentList...)
 	}
+	if in.CandidatePaths != nil {
+		out.CandidatePaths = make([]CandidatePathStatus, len(in.CandidatePaths))
+		for i := range in.CandidatePaths {
+			in.CandidatePaths[i].DeepCopyInto(&out.CandidatePaths[i])
+		}
+	}
 }
 
 func (in *SRPolicyStatus) DeepCopy() *SRPolicyStatus {
@@ -166,6 +172,22 @@ func (in *SRPolicyStatus) DeepCopy() *SRPolicyStatus {
 		return nil
 	}
 	out := new(SRPolicyStatus)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *CandidatePathStatus) DeepCopyInto(out *CandidatePathStatus) {
+	*out = *in
+	if in.SegmentList != nil {
+		out.SegmentList = append([]string(nil), in.SegmentList...)
+	}
+}
+
+func (in *CandidatePathStatus) DeepCopy() *CandidatePathStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(CandidatePathStatus)
 	in.DeepCopyInto(out)
 	return out
 }
