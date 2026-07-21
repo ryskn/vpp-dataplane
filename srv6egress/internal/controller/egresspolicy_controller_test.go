@@ -77,6 +77,26 @@ func multiCandidateConfig() *config.ControllerConfig {
 	return cfg
 }
 
+// exclusiveConfig marks color 200 as an exclusive (closed compliance boundary)
+// color for the OnUnavailable=Fallback reject tests. Color 100 stays a normal
+// intent color.
+func exclusiveConfig() *config.ControllerConfig {
+	cfg := &config.ControllerConfig{
+		Upstreams: map[string]config.UpstreamConfig{
+			"isp-a": {SID: "fcff:0:0:e0:a::", VRF: "upstream-a"},
+			"isp-b": {SID: "fcff:0:0:e0:b::", VRF: "upstream-b"},
+		},
+		Colors: map[uint32]config.ColorConfig{
+			100: {Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}},
+			200: {Exclusive: true, Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
 func egressNode(name string) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
@@ -234,6 +254,156 @@ func TestReconcile_UnknownColorIsTerminal(t *testing.T) {
 	}
 	if cond := getReady(t, r, "tenant-a"); cond.Status != metav1.ConditionFalse || cond.Reason != "UnknownColor" {
 		t.Fatalf("expected Ready=False/UnknownColor, got %s/%s", cond.Status, cond.Reason)
+	}
+}
+
+// exclusiveReconciler builds a reconciler on exclusiveConfig() with a recording
+// BGP stub so tests can assert whether any announce fired.
+func exclusiveReconciler(t *testing.T, rec bgp.Distributor, objs ...client.Object) *EgressPolicyReconciler {
+	t.Helper()
+	s := testScheme(t)
+	c := fakeclient.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).
+		Build()
+	return &EgressPolicyReconciler{Client: c, Scheme: s, Config: exclusiveConfig(),
+		BGP: rec, Encoder: bgp.NewColoredEncoder()}
+}
+
+// An exclusive color with OnUnavailable=Fallback is a sovereignty violation
+// (§14.3): reject as terminal (Ready:False/ExclusiveColorFallback, no requeue,
+// no error) and never announce anything.
+func TestReconcile_ExclusiveColorFallbackRejected(t *testing.T) {
+	rec := &recordingBGP{}
+	p := newPolicy("tenant-a", "uid-a", 200) // exclusive color
+	p.Spec.Egress.OnUnavailable = srv6egressv1.OnUnavailableFallback
+	r := exclusiveReconciler(t, rec, egressNode("egress-1"), p)
+
+	// Terminal spec error: not-ready recorded, NOT requeued (nil err).
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("exclusive+Fallback must be terminal (no requeue), got err=%v", err)
+	}
+	cond := getReady(t, r, "tenant-a")
+	if cond.Status != metav1.ConditionFalse || cond.Reason != "ExclusiveColorFallback" {
+		t.Fatalf("expected Ready=False/ExclusiveColorFallback, got %s/%s", cond.Status, cond.Reason)
+	}
+	if len(rec.announced) != 0 {
+		t.Fatalf("expected no announce on a rejected exclusive+Fallback policy, got %d", len(rec.announced))
+	}
+}
+
+// An exclusive color with Drop (and with the default unset OnUnavailable) is
+// allowed: reconcile normally to Ready:True.
+func TestReconcile_ExclusiveColorDropAllowed(t *testing.T) {
+	cases := map[string]string{
+		"explicit Drop": srv6egressv1.OnUnavailableDrop,
+		"unset":         "",
+	}
+	for name, mode := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := &recordingBGP{}
+			p := newPolicy("tenant-a", "uid-a", 200) // exclusive color
+			p.Spec.Egress.OnUnavailable = mode
+			r := exclusiveReconciler(t, rec, egressNode("egress-1"), p)
+			if err := reconcile(t, r, "tenant-a"); err != nil {
+				t.Fatalf("exclusive+Drop must reconcile cleanly, got err=%v", err)
+			}
+			if cond := getReady(t, r, "tenant-a"); cond.Status != metav1.ConditionTrue {
+				t.Fatalf("expected Ready=True, got %s/%s", cond.Status, cond.Reason)
+			}
+			if len(rec.announced) != 1 {
+				t.Fatalf("expected one announce for the exclusive single-candidate color, got %d", len(rec.announced))
+			}
+		})
+	}
+}
+
+// --- tenant sovereignty mixing check (§14.3 validation (2) / §14.4) ---
+
+// tenantSovereigntyConfig has a backbone with tenant team-a and colors: 10 =
+// intent {isp-a pref 200, isp-b pref 100}, 20 = exclusive {isp-a}. A tenant
+// using color 20 makes {isp-a} sovereign; a color-10 policy in the same tenant
+// exits via isp-b, which is outside sovereignty.
+func tenantSovereigntyConfig() *config.ControllerConfig {
+	cfg := &config.ControllerConfig{
+		Upstreams: map[string]config.UpstreamConfig{
+			"isp-a": {SID: "fcff:0:0:e0:a::", VRF: "upstream-a"},
+			"isp-b": {SID: "fcff:0:0:e0:b::", VRF: "upstream-b"},
+		},
+		Colors: map[uint32]config.ColorConfig{
+			10: {CandidatePaths: []config.CandidatePathConfig{
+				{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 200},
+				{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}, Preference: 100},
+			}},
+			20: {Exclusive: true, CandidatePaths: []config.CandidatePathConfig{
+				{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 100},
+			}},
+		},
+		Backbone: &config.BackboneConfig{
+			Peers: map[string]config.BackbonePeerConfig{
+				"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
+				"isp-b": {GoBGPAddr: "192.0.2.15:50052", Nexthop: "fda2::2"},
+			},
+			Tenants: map[string]config.TenantConfig{
+				"tenant-a": {Namespace: "team-a", PodCIDR: "2001:db8:2000::/48"},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+func teamPolicy(name, uid string, color uint32) *srv6egressv1.EgressPolicy {
+	p := newPolicy(name, uid, color)
+	p.Spec.Selector.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"team": "a"}}
+	return p
+}
+
+func newSovereigntyReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler {
+	t.Helper()
+	s := testScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(objs...).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).Build()
+	return &EgressPolicyReconciler{Client: c, Scheme: s, Config: tenantSovereigntyConfig(),
+		BGP: bgp.NewLoggingStub(logr.Discard()), Encoder: bgp.NewColoredEncoder()}
+}
+
+// A tenant using an exclusive color {isp-a} plus an intent color exiting via
+// isp-b (outside the sovereign set) must be rejected Ready:False /
+// TenantSovereigntyConflict (not terminal — a config/sibling change fixes it).
+func TestReconcile_TenantSovereigntyConflict(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{"team": "a"}}}
+	r := newSovereigntyReconciler(t,
+		ns, egressNode("egress-1"),
+		teamPolicy("p-excl", "u1", 20),    // exclusive {isp-a} => sovereign
+		teamPolicy("p-violate", "u2", 10), // intent {isp-a, isp-b}: isp-b is outside
+	)
+	if err := reconcile(t, r, "p-excl"); err != nil {
+		t.Fatalf("exclusive policy should reconcile: %v", err)
+	}
+	// p-violate must fail the mixing check.
+	_ = reconcile(t, r, "p-violate")
+	c := getReady(t, r, "p-violate")
+	if c.Status != metav1.ConditionFalse || c.Reason != "TenantSovereigntyConflict" {
+		t.Fatalf("expected Ready=False/TenantSovereigntyConflict, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+// A tenant whose policies all stay inside the sovereign set reconciles cleanly.
+func TestReconcile_TenantSovereigntyCompliant(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{"team": "a"}}}
+	r := newSovereigntyReconciler(t,
+		ns, egressNode("egress-1"),
+		teamPolicy("p-excl", "u1", 20), // exclusive {isp-a}: fully inside its own sovereign set
+	)
+	if err := reconcile(t, r, "p-excl"); err != nil {
+		t.Fatalf("compliant policy should reconcile: %v", err)
+	}
+	if c := getReady(t, r, "p-excl"); c.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Ready=True, got %s/%s", c.Status, c.Reason)
 	}
 }
 

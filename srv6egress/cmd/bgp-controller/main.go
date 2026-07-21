@@ -213,7 +213,7 @@ func main() {
 	// return reachability) via a leader-elected Runnable that re-asserts it
 	// periodically, instead of a one-shot at startup that a non-leader would
 	// also fire and a gobgp restart would silently lose.
-	if err := mgr.Add(&controller.ClusterReturnAdvertiser{Config: cfg, BackboneBGP: backboneBGP, Log: log}); err != nil {
+	if err := mgr.Add(&controller.ClusterReturnAdvertiser{Config: cfg, BackboneBGP: backboneBGP, Log: log, Client: mgr.GetClient()}); err != nil {
 		log.Error(err, "add cluster-return advertiser")
 		os.Exit(1)
 	}
