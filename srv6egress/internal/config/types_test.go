@@ -233,6 +233,38 @@ func TestValidate_EmptyCandidatePathsRejected(t *testing.T) {
 	}
 }
 
+// An exclusive color (closed compliance boundary, §14.2) parses and validates;
+// exclusivity is an explicit bit, orthogonal to candidate-set size.
+func TestValidate_ExclusiveColorOK(t *testing.T) {
+	c := baseValid()
+	c.Colors[200] = ColorConfig{
+		Exclusive: true,
+		CandidatePaths: []CandidatePathConfig{
+			{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}, Preference: 100},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("exclusive color should validate, got: %v", err)
+	}
+	if !c.Colors[200].Exclusive {
+		t.Fatal("exclusive bit did not survive validation")
+	}
+}
+
+// An explicit preference: 0 is reserved (the encoder's zero-fallback would widen
+// it to 100 on the wire, diverging from the config) and must be rejected.
+func TestValidate_ExplicitZeroPreferenceRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		CandidatePaths: []CandidatePathConfig{
+			{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 0},
+		},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for explicit candidate-path preference 0")
+	}
+}
+
 // --- backbone stitching validation ---
 
 func validBackbone() *BackboneConfig {

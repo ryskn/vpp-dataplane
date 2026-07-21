@@ -150,6 +150,16 @@ func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egress
 		return nil, res, err
 	}
 
+	// An exclusive color is a closed compliance boundary (§14.2): OnUnavailable
+	// Fallback would leak traffic to the node's default egress, outside the
+	// sovereign set — a sovereignty violation. Only a spec edit fixes it, so this
+	// is terminal. Empty (default Drop) and explicit Drop are allowed.
+	if cc.Exclusive && ep.Spec.Egress.OnUnavailable == srv6egressv1.OnUnavailableFallback {
+		res, err := r.markNotReadyTerminal(ctx, ep, "ExclusiveColorFallback",
+			fmt.Sprintf("color %d is exclusive: OnUnavailable=Fallback would leak egress to the node default (sovereignty violation); use Drop", ep.Spec.Egress.Color))
+		return nil, res, err
+	}
+
 	endpoint, endpointAddr, err := r.resolveEndpoint(ctx, ep.Spec.Egress.EndpointSelector)
 	if err != nil {
 		res, err := r.markNotReady(ctx, ep, "EndpointResolution", err.Error())

@@ -168,6 +168,12 @@ type ColorConfig struct {
 	// Must be an IPv6 SID, unique per color; shared across candidate paths.
 	// +optional
 	BSID string `json:"bsid,omitempty"`
+
+	// Exclusive marks this color's candidate set as a closed compliance boundary
+	// (§14.2): egress outside the set is a violation, so OnUnavailable=Fallback is
+	// rejected. Explicit by design — never inferred from candidate-set size.
+	// +optional
+	Exclusive bool `json:"exclusive,omitempty"`
 }
 
 // CandidatePathConfig is one RFC 9256 candidate path for a color: a concrete
@@ -310,6 +316,14 @@ func (c *ControllerConfig) Validate() error {
 			}
 			if len(cp.SegmentList) == 0 {
 				return fmt.Errorf("color %d: candidatePaths[%d].segmentList must not be empty", color, i)
+			}
+			// An explicit preference: 0 is reserved: the SR Policy encoder's
+			// zero-fallback would widen it to 100 on the wire, diverging from what
+			// the config reads. normalizeCandidatePaths already stamped the legacy
+			// single form with defaultCandidatePreference before this loop, so only
+			// an explicitly-written 0 reaches here.
+			if cp.Preference == 0 {
+				return fmt.Errorf("color %d: candidatePaths[%d].preference must be >= 1; 0 is reserved for the encoder's legacy default", color, i)
 			}
 			if other, dup := seenPref[cp.Preference]; dup {
 				return fmt.Errorf("color %d: candidatePaths[%d] and [%d] share preference %d; preferences must be unique per color",
