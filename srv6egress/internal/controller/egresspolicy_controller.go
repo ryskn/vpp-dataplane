@@ -19,8 +19,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -51,6 +53,7 @@ type EgressPolicyReconciler struct {
 // +kubebuilder:rbac:groups=srv6egress.ryskn.io,resources=egresspolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=srv6egress.ryskn.io,resources=egresspolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile performs one reconciliation pass as a pipeline of single-purpose
@@ -175,7 +178,119 @@ func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egress
 		return nil, res, err
 	}
 
+	// Tenant-mixing check (§14.3 validation (2) / §14.4 granularity theorem): if
+	// this policy's tenant uses an exclusive color, every color it references must
+	// stay inside the sovereign set — otherwise the tenant prefix would be
+	// advertised to an upstream outside sovereignty and return traffic could enter
+	// there (return control is bounded by source-prefix granularity, so a stray
+	// candidate upstream leaks the whole tenant's reachability). Not terminal:
+	// changing config or a sibling policy fixes it, so requeue.
+	if tenant, excess, err := r.findTenantSovereigntyConflict(ctx, ep, cc); err != nil {
+		return nil, ctrl.Result{}, err
+	} else if len(excess) > 0 {
+		res, err := r.markNotReady(ctx, ep, "TenantSovereigntyConflict",
+			fmt.Sprintf("tenant %q uses an exclusive color; color %d exits via upstream(s) %v outside the sovereign set",
+				tenant, ep.Spec.Egress.Color, excess))
+		return nil, res, err
+	}
+
 	return &reconcilePlan{cc: cc, endpoint: endpoint, endpointAddr: endpointAddr}, ctrl.Result{}, nil
+}
+
+// findTenantSovereigntyConflict returns (tenant, excess-upstreams) when this
+// policy references upstreams outside its tenant's sovereign set. It is a no-op
+// (returns "", nil) unless Backbone.Tenants is configured. The sovereign set is
+// the intersection of every exclusive color's upstream set among the policies
+// that select the tenant's namespace; the policy's own candidate upstreams must
+// be a subset of it. Only the reconciler writes status (single-writer), so this
+// mixing check lives here — the advertiser only clamps the advertisement.
+func (r *EgressPolicyReconciler) findTenantSovereigntyConflict(ctx context.Context, me *srv6egressv1.EgressPolicy, cc config.ColorConfig) (string, []string, error) {
+	if r.Config.Backbone == nil || len(r.Config.Backbone.Tenants) == 0 {
+		return "", nil, nil
+	}
+	myUpstreams := map[string]bool{}
+	for _, cp := range cc.CandidatePaths {
+		myUpstreams[cp.Upstream] = true
+	}
+
+	var list srv6egressv1.EgressPolicyList
+	if err := r.List(ctx, &list); err != nil {
+		return "", nil, fmt.Errorf("list egresspolicies: %w", err)
+	}
+
+	for tenant, tc := range r.Config.Backbone.Tenants {
+		nsLabels, err := r.namespaceLabels(ctx, tc.Namespace)
+		if err != nil {
+			return "", nil, err
+		}
+		if !r.policyMatchesNamespace(me, nsLabels) {
+			continue
+		}
+		// Sovereign set = intersection of every matched exclusive color's upstream
+		// set. nil until the first exclusive color is seen; empty non-nil = no
+		// upstream is universally sovereign (disjoint exclusive sets).
+		var sovereign map[string]bool
+		for i := range list.Items {
+			p := &list.Items[i]
+			if !p.DeletionTimestamp.IsZero() || !r.policyMatchesNamespace(p, nsLabels) {
+				continue
+			}
+			pc, ok := r.Config.Colors[p.Spec.Egress.Color]
+			if !ok || !pc.Exclusive {
+				continue
+			}
+			ups := map[string]bool{}
+			for _, cp := range pc.CandidatePaths {
+				ups[cp.Upstream] = true
+			}
+			if sovereign == nil {
+				sovereign = ups
+			} else {
+				sovereign = intersect(sovereign, ups)
+			}
+		}
+		if sovereign == nil {
+			continue // no exclusive color in this tenant: nothing to enforce
+		}
+		var excess []string
+		for up := range myUpstreams {
+			if !sovereign[up] {
+				excess = append(excess, up)
+			}
+		}
+		if len(excess) > 0 {
+			sort.Strings(excess)
+			return tenant, excess, nil
+		}
+	}
+	return "", nil, nil
+}
+
+// namespaceLabels reads a namespace's labels for tenant matching. A missing
+// namespace yields nil labels (only a nil namespaceSelector then matches it).
+func (r *EgressPolicyReconciler) namespaceLabels(ctx context.Context, ns string) (map[string]string, error) {
+	var namespace corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: ns}, &namespace); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get namespace %q: %w", ns, err)
+	}
+	return namespace.Labels, nil
+}
+
+// policyMatchesNamespace reports whether a policy's namespaceSelector selects a
+// namespace with the given labels. A nil selector matches all namespaces.
+func (r *EgressPolicyReconciler) policyMatchesNamespace(p *srv6egressv1.EgressPolicy, nsLabels map[string]string) bool {
+	ns := p.Spec.Selector.NamespaceSelector
+	if ns == nil {
+		return true
+	}
+	sel, err := metav1.LabelSelectorAsSelector(ns)
+	if err != nil {
+		return false // a malformed selector never matches (fail-closed)
+	}
+	return sel.Matches(labels.Set(nsLabels))
 }
 
 // candidateStatus builds the persisted candidate-path array from the resolved

@@ -35,10 +35,20 @@ type SIDStructure struct {
 // node + 16-bit function).
 var DefaultSIDStructure = SIDStructure{LocatorBlockBits: 40, LocatorNodeBits: 24, FunctionBits: 16}
 
+// PrependSpec makes a service route AS-path-longer (less preferred) so a backup
+// upstream's return advertisement loses to the primary's plain one, without an
+// exclusive advertisement that would blackhole a failed-over forward path
+// (§14.3). Count 0 = no prepend.
+type PrependSpec struct {
+	ASN   uint32
+	Count int
+}
+
 // serviceRoutePath builds the IPv6-unicast path for route: MP_REACH + Color
 // Extended Community + Prefix-SID attribute carrying the SRv6 L3 Service TLV
-// (Information Sub-TLV with the End SID/behavior + SID Structure).
-func serviceRoutePath(route ServiceRoute, structure SIDStructure) (*api.Path, error) {
+// (Information Sub-TLV with the End SID/behavior + SID Structure). An optional
+// AS_PATH attribute (prepend.Count > 0) demotes a backup return advertisement.
+func serviceRoutePath(route ServiceRoute, structure SIDStructure, prepend PrependSpec) (*api.Path, error) {
 	ip, ipnet, err := net.ParseCIDR(route.Prefix)
 	if err != nil {
 		return nil, fmt.Errorf("prefix %q: %w", route.Prefix, err)
@@ -113,10 +123,25 @@ func serviceRoutePath(route ServiceRoute, structure SIDStructure) (*api.Path, er
 		return nil, err
 	}
 
+	pattrs := []*apb.Any{origin, mpReach, extComm, psid}
+	if prepend.Count > 0 && prepend.ASN != 0 {
+		nums := make([]uint32, prepend.Count)
+		for i := range nums {
+			nums[i] = prepend.ASN
+		}
+		asPath, err := apb.New(&api.AsPathAttribute{
+			Segments: []*api.AsSegment{{Type: api.AsSegment_AS_SEQUENCE, Numbers: nums}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		pattrs = append(pattrs, asPath)
+	}
+
 	return &api.Path{
 		Nlri:   nlri,
 		Family: v6family,
-		Pattrs: []*apb.Any{origin, mpReach, extComm, psid},
+		Pattrs: pattrs,
 	}, nil
 }
 
@@ -126,10 +151,13 @@ func serviceRoutePath(route ServiceRoute, structure SIDStructure) (*api.Path, er
 type ServiceAdvert struct {
 	Route     ServiceRoute
 	Structure SIDStructure
+	// Prepend demotes this advertisement via AS_PATH prepending (a backup
+	// upstream's per-tenant return route, §14.3). Zero value = plain advertise.
+	Prepend PrependSpec
 }
 
 func (a ServiceAdvert) BuildPath() (*api.Path, error) {
-	return serviceRoutePath(a.Route, a.Structure)
+	return serviceRoutePath(a.Route, a.Structure, a.Prepend)
 }
 
 // BSID is empty: RFC 9252 service routes carry no Binding SID.

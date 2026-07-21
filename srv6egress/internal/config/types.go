@@ -50,8 +50,65 @@ type BackboneConfig struct {
 	// backbone upstream (with that upstream's End SID) as the NAT-less return
 	// reachability: the backbone SR-encapsulates return traffic toward the
 	// gateway, which decaps into the upstream VRF and bounces it into the cluster
-	// fabric to the pod's node.
-	ClusterPodCIDR string `json:"clusterPodCIDR"`
+	// fabric to the pod's node. Required unless Tenants is set (mutually
+	// exclusive — one cluster-wide aggregate OR per-tenant derivation).
+	// +optional
+	ClusterPodCIDR string `json:"clusterPodCIDR,omitempty"`
+
+	// Tenants maps a tenant name to its namespace and pod prefix (§14.4). When
+	// set, the cluster-return advertisement becomes per-tenant toward the AdvSet
+	// derived from each tenant's EgressPolicy → color → candidatePaths (§14.3
+	// invariant Upstreams(CandidateSet(color(p))) ⊆ AdvSet(T)) — the operator
+	// never hand-writes the advertisement targets. Mutually exclusive with
+	// ClusterPodCIDR (Validate rejects both): per-tenant minimal advertisement
+	// would be pointless if subsumed by a cluster-wide advertisement.
+	// +optional
+	Tenants map[string]TenantConfig `json:"tenants,omitempty"`
+
+	// ReturnPrependASN is the local ASN prepended onto backup-upstream return
+	// advertisements to make them AS-path-longer (less preferred) than the
+	// primary's plain advertisement (§14.3). Backup ISPs must still carry the
+	// tenant prefix — an exclusive (primary-only) advertisement blackholes the
+	// forward path the instant a candidate-path failover succeeds (the backup
+	// ISP's uRPF drops a source it never learned a route for). Zero (unset)
+	// disables prepending: every AdvSet member is advertised plainly.
+	// +optional
+	ReturnPrependASN uint32 `json:"returnPrependASN,omitempty"`
+
+	// ReturnPrependCount is how many times ReturnPrependASN is prepended onto a
+	// backup advertisement. Defaults to defaultReturnPrependCount when
+	// ReturnPrependASN is set but this is zero.
+	// +optional
+	ReturnPrependCount int `json:"returnPrependCount,omitempty"`
+}
+
+// TenantConfig maps a tenant to its namespace and pod prefix. tenant = namespace
+// is a deliberate design decision (§14.4): sovereignty is a tenant-level property
+// and the return-control granularity is bounded by source-prefix granularity, so
+// the finest usable unit is a pool split = a namespace with its own /48.
+type TenantConfig struct {
+	// Namespace is the Kubernetes namespace this tenant maps to.
+	Namespace string `json:"namespace"`
+	// PodCIDR is the tenant's GUA pod prefix (e.g. "2001:db8:2000::/48"),
+	// advertised for return reachability toward the derived AdvSet.
+	PodCIDR string `json:"podCIDR"`
+}
+
+// defaultReturnPrependCount is the AS-path prepend depth applied to backup
+// upstreams when ReturnPrependASN is set but ReturnPrependCount is left zero.
+const defaultReturnPrependCount = 3
+
+// ResolvedReturnPrependCount returns the effective backup prepend depth: zero
+// when prepending is disabled (no ReturnPrependASN), else the configured count
+// or defaultReturnPrependCount.
+func (b *BackboneConfig) ResolvedReturnPrependCount() int {
+	if b == nil || b.ReturnPrependASN == 0 {
+		return 0
+	}
+	if b.ReturnPrependCount > 0 {
+		return b.ReturnPrependCount
+	}
+	return defaultReturnPrependCount
 }
 
 // BackbonePeerConfig is one backbone-facing gobgp (per-VRF, on the egress GW).
@@ -354,11 +411,44 @@ func (c *ControllerConfig) Validate() error {
 		if len(c.Backbone.Peers) == 0 {
 			return fmt.Errorf("backbone: peers must not be empty when backbone is set")
 		}
-		if c.Backbone.ClusterPodCIDR == "" {
-			return fmt.Errorf("backbone: clusterPodCIDR is required when backbone is set")
+		// ClusterPodCIDR (one cluster-wide aggregate) and Tenants (per-tenant
+		// derivation) are mutually exclusive: a per-tenant minimal advertisement
+		// would be pointless if a cluster-wide advertisement subsumed it. Reject
+		// both, and require exactly one (fail-fast on ambiguous config).
+		hasTenants := len(c.Backbone.Tenants) > 0
+		if c.Backbone.ClusterPodCIDR != "" && hasTenants {
+			return fmt.Errorf("backbone: set either clusterPodCIDR or tenants, not both (§14.3: per-tenant advertisement must not be subsumed by a cluster-wide one)")
 		}
-		if ip, _, err := net.ParseCIDR(c.Backbone.ClusterPodCIDR); err != nil || ip.To4() != nil {
-			return fmt.Errorf("backbone: clusterPodCIDR %q must be an IPv6 CIDR", c.Backbone.ClusterPodCIDR)
+		if c.Backbone.ClusterPodCIDR == "" && !hasTenants {
+			return fmt.Errorf("backbone: one of clusterPodCIDR or tenants is required when backbone is set")
+		}
+		if c.Backbone.ClusterPodCIDR != "" {
+			if ip, _, err := net.ParseCIDR(c.Backbone.ClusterPodCIDR); err != nil || ip.To4() != nil {
+				return fmt.Errorf("backbone: clusterPodCIDR %q must be an IPv6 CIDR", c.Backbone.ClusterPodCIDR)
+			}
+		}
+		for name, t := range c.Backbone.Tenants {
+			if t.Namespace == "" {
+				return fmt.Errorf("backbone.tenants[%q]: namespace is required", name)
+			}
+			if ip, _, err := net.ParseCIDR(t.PodCIDR); err != nil || ip.To4() != nil {
+				return fmt.Errorf("backbone.tenants[%q]: podCIDR %q must be an IPv6 CIDR", name, t.PodCIDR)
+			}
+		}
+		// Per-tenant return invariant (§14.3): candidate upstream requires a
+		// backbone peer. Every upstream a candidate path can steer to must have a
+		// backbone peer so its tenant return route is advertised — otherwise a
+		// forward failover onto that upstream would be dropped by its uRPF (no
+		// return route learned). Fail-fast here rather than let the advertiser
+		// silently narrow the AdvSet at runtime.
+		if hasTenants {
+			for color, cc := range c.Colors {
+				for i, cp := range cc.CandidatePaths {
+					if _, ok := c.Backbone.Peers[cp.Upstream]; !ok {
+						return fmt.Errorf("per-tenant return invariant (§14.3): color %d candidatePaths[%d] upstream %q must have a backbone peer (candidate upstreams require backbone.peers)", color, i, cp.Upstream)
+					}
+				}
+			}
 		}
 		for name, p := range c.Backbone.Peers {
 			if _, ok := c.Upstreams[name]; !ok {

@@ -319,6 +319,94 @@ func TestReconcile_ExclusiveColorDropAllowed(t *testing.T) {
 	}
 }
 
+// --- tenant sovereignty mixing check (§14.3 validation (2) / §14.4) ---
+
+// tenantSovereigntyConfig has a backbone with tenant team-a and colors: 10 =
+// intent {isp-a pref 200, isp-b pref 100}, 20 = exclusive {isp-a}. A tenant
+// using color 20 makes {isp-a} sovereign; a color-10 policy in the same tenant
+// exits via isp-b, which is outside sovereignty.
+func tenantSovereigntyConfig() *config.ControllerConfig {
+	cfg := &config.ControllerConfig{
+		Upstreams: map[string]config.UpstreamConfig{
+			"isp-a": {SID: "fcff:0:0:e0:a::", VRF: "upstream-a"},
+			"isp-b": {SID: "fcff:0:0:e0:b::", VRF: "upstream-b"},
+		},
+		Colors: map[uint32]config.ColorConfig{
+			10: {CandidatePaths: []config.CandidatePathConfig{
+				{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 200},
+				{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}, Preference: 100},
+			}},
+			20: {Exclusive: true, CandidatePaths: []config.CandidatePathConfig{
+				{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 100},
+			}},
+		},
+		Backbone: &config.BackboneConfig{
+			Peers: map[string]config.BackbonePeerConfig{
+				"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
+				"isp-b": {GoBGPAddr: "192.0.2.15:50052", Nexthop: "fda2::2"},
+			},
+			Tenants: map[string]config.TenantConfig{
+				"tenant-a": {Namespace: "team-a", PodCIDR: "2001:db8:2000::/48"},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+func teamPolicy(name, uid string, color uint32) *srv6egressv1.EgressPolicy {
+	p := newPolicy(name, uid, color)
+	p.Spec.Selector.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"team": "a"}}
+	return p
+}
+
+func newSovereigntyReconciler(t *testing.T, objs ...client.Object) *EgressPolicyReconciler {
+	t.Helper()
+	s := testScheme(t)
+	c := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(objs...).
+		WithStatusSubresource(&srv6egressv1.EgressPolicy{}).Build()
+	return &EgressPolicyReconciler{Client: c, Scheme: s, Config: tenantSovereigntyConfig(),
+		BGP: bgp.NewLoggingStub(logr.Discard()), Encoder: bgp.NewColoredEncoder()}
+}
+
+// A tenant using an exclusive color {isp-a} plus an intent color exiting via
+// isp-b (outside the sovereign set) must be rejected Ready:False /
+// TenantSovereigntyConflict (not terminal — a config/sibling change fixes it).
+func TestReconcile_TenantSovereigntyConflict(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{"team": "a"}}}
+	r := newSovereigntyReconciler(t,
+		ns, egressNode("egress-1"),
+		teamPolicy("p-excl", "u1", 20),    // exclusive {isp-a} => sovereign
+		teamPolicy("p-violate", "u2", 10), // intent {isp-a, isp-b}: isp-b is outside
+	)
+	if err := reconcile(t, r, "p-excl"); err != nil {
+		t.Fatalf("exclusive policy should reconcile: %v", err)
+	}
+	// p-violate must fail the mixing check.
+	_ = reconcile(t, r, "p-violate")
+	c := getReady(t, r, "p-violate")
+	if c.Status != metav1.ConditionFalse || c.Reason != "TenantSovereigntyConflict" {
+		t.Fatalf("expected Ready=False/TenantSovereigntyConflict, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+// A tenant whose policies all stay inside the sovereign set reconciles cleanly.
+func TestReconcile_TenantSovereigntyCompliant(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{"team": "a"}}}
+	r := newSovereigntyReconciler(t,
+		ns, egressNode("egress-1"),
+		teamPolicy("p-excl", "u1", 20), // exclusive {isp-a}: fully inside its own sovereign set
+	)
+	if err := reconcile(t, r, "p-excl"); err != nil {
+		t.Fatalf("compliant policy should reconcile: %v", err)
+	}
+	if c := getReady(t, r, "p-excl"); c.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Ready=True, got %s/%s", c.Status, c.Reason)
+	}
+}
+
 func TestReconcile_HappyPath(t *testing.T) {
 	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
 	if err := reconcile(t, r, "tenant-a"); err != nil {
