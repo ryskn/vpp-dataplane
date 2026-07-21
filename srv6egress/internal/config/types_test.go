@@ -350,6 +350,118 @@ func TestValidate_UnknownSidModeRejected(t *testing.T) {
 	}
 }
 
+// --- per-tenant backbone (§14.3 / §14.4) ---
+
+func tenantBackbone() *BackboneConfig {
+	// A peer per baseValid() upstream (isp-a, isp-b): the per-tenant return
+	// invariant (§14.3) requires every candidate upstream to have a backbone peer.
+	return &BackboneConfig{
+		Peers: map[string]BackbonePeerConfig{
+			"isp-a": {GoBGPAddr: "192.0.2.14:50052", Nexthop: "fda1::2"},
+			"isp-b": {GoBGPAddr: "192.0.2.15:50052", Nexthop: "fda2::2"},
+		},
+		Tenants: map[string]TenantConfig{
+			"tenant-a": {Namespace: "team-a", PodCIDR: "2001:db8:2000::/48"},
+		},
+	}
+}
+
+// A backbone with tenants (and no clusterPodCIDR) must validate: tenants are the
+// per-tenant alternative to the single cluster-wide aggregate.
+func TestValidate_BackboneTenantsOK(t *testing.T) {
+	c := baseValid()
+	c.Backbone = tenantBackbone()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("tenant backbone should validate, got: %v", err)
+	}
+}
+
+// Setting both clusterPodCIDR and tenants is ambiguous (§14.3) and must be
+// rejected — the two return-advertisement modes are mutually exclusive.
+func TestValidate_BackboneClusterAndTenantsRejected(t *testing.T) {
+	c := baseValid()
+	c.Backbone = tenantBackbone()
+	c.Backbone.ClusterPodCIDR = "fd00:dead::/48"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when both clusterPodCIDR and tenants are set")
+	}
+}
+
+// A backbone with neither clusterPodCIDR nor tenants has no return prefix and
+// must be rejected.
+func TestValidate_BackboneNeitherClusterNorTenantsRejected(t *testing.T) {
+	c := baseValid()
+	c.Backbone = tenantBackbone()
+	c.Backbone.Tenants = nil // and no clusterPodCIDR
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when neither clusterPodCIDR nor tenants is set")
+	}
+}
+
+// A tenant with an empty namespace must be rejected.
+func TestValidate_TenantEmptyNamespaceRejected(t *testing.T) {
+	c := baseValid()
+	c.Backbone = tenantBackbone()
+	c.Backbone.Tenants["tenant-a"] = TenantConfig{Namespace: "", PodCIDR: "2001:db8:2000::/48"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for tenant with empty namespace")
+	}
+}
+
+// A tenant whose podCIDR is not an IPv6 CIDR must be rejected.
+func TestValidate_TenantBadPodCIDRRejected(t *testing.T) {
+	c := baseValid()
+	c.Backbone = tenantBackbone()
+	for _, bad := range []string{"", "10.0.0.0/8", "not-a-cidr", "2001:db8::1"} {
+		c.Backbone.Tenants["tenant-a"] = TenantConfig{Namespace: "team-a", PodCIDR: bad}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected error for tenant podCIDR %q", bad)
+		}
+	}
+}
+
+// Per-tenant return invariant (§14.3): a candidate upstream without a backbone
+// peer must be rejected — its tenant return route would never be advertised, so
+// a forward failover onto it would be uRPF-dropped. baseValid()'s color 200
+// uses isp-b; dropping isp-b's peer must fail validation.
+func TestValidate_TenantCandidateWithoutPeerRejected(t *testing.T) {
+	c := baseValid()
+	c.Backbone = tenantBackbone()
+	delete(c.Backbone.Peers, "isp-b") // color 200 candidate isp-b now peerless
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for a candidate upstream without a backbone peer")
+	}
+}
+
+// The invariant only applies in per-tenant mode: in cluster-wide mode a color
+// candidate may legitimately lack a backbone peer (return is one aggregate, not
+// per candidate), so the same peer set must pass there.
+func TestValidate_ClusterWideCandidateWithoutPeerOK(t *testing.T) {
+	c := baseValid()
+	c.Backbone = validBackbone() // cluster-wide, only isp-a has a peer
+	if err := c.Validate(); err != nil {
+		t.Fatalf("cluster-wide mode must not enforce per-candidate peers, got: %v", err)
+	}
+}
+
+// The backup prepend depth resolves to a default when the ASN is set but the
+// count is left zero, and to zero (disabled) when the ASN is unset.
+func TestResolvedReturnPrependCount(t *testing.T) {
+	if got := (&BackboneConfig{}).ResolvedReturnPrependCount(); got != 0 {
+		t.Fatalf("no ASN = %d, want 0 (disabled)", got)
+	}
+	if got := (&BackboneConfig{ReturnPrependASN: 65000}).ResolvedReturnPrependCount(); got != defaultReturnPrependCount {
+		t.Fatalf("ASN set, count unset = %d, want default %d", got, defaultReturnPrependCount)
+	}
+	if got := (&BackboneConfig{ReturnPrependASN: 65000, ReturnPrependCount: 5}).ResolvedReturnPrependCount(); got != 5 {
+		t.Fatalf("explicit count = %d, want 5", got)
+	}
+	var nilB *BackboneConfig
+	if got := nilB.ResolvedReturnPrependCount(); got != 0 {
+		t.Fatalf("nil backbone = %d, want 0", got)
+	}
+}
+
 func TestResolvedSIDStructure_PerMode(t *testing.T) {
 	if got := (UpstreamConfig{SidMode: SidModeFull}).ResolvedSIDStructure(); got != classicSIDStructure {
 		t.Fatalf("full = %+v, want classic %+v", got, classicSIDStructure)

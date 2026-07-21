@@ -23,7 +23,7 @@ func testServiceRoute() ServiceRoute {
 // (Wire-level transport of exactly this attribute set was verified against a
 // real gobgp eBGP session in the 2026-06-13 spike.)
 func TestServiceRoutePath_Attributes(t *testing.T) {
-	path, err := serviceRoutePath(testServiceRoute(), DefaultSIDStructure)
+	path, err := serviceRoutePath(testServiceRoute(), DefaultSIDStructure, PrependSpec{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +114,47 @@ func TestServiceRoutePath_Attributes(t *testing.T) {
 	}
 }
 
+// A backup return advertisement carries an AS_PATH with the local ASN prepended
+// Count times, so it loses BGP best-path to the primary's plain advertisement
+// (§14.3 — demoted, not withheld).
+func TestServiceRoutePath_Prepend(t *testing.T) {
+	path, err := serviceRoutePath(testServiceRoute(), DefaultSIDStructure, PrependSpec{ASN: 65001, Count: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq []uint32
+	for _, attAny := range path.Pattrs {
+		m, err := attAny.UnmarshalNew()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ap, ok := m.(*api.AsPathAttribute); ok {
+			for _, seg := range ap.Segments {
+				if seg.Type == api.AsSegment_AS_SEQUENCE {
+					seq = append(seq, seg.Numbers...)
+				}
+			}
+		}
+	}
+	if len(seq) != 3 || seq[0] != 65001 || seq[1] != 65001 || seq[2] != 65001 {
+		t.Fatalf("AS_PATH sequence = %v, want [65001 65001 65001]", seq)
+	}
+}
+
+// No prepend spec => no AS_PATH attribute (the plain primary advertisement).
+func TestServiceRoutePath_NoPrepend(t *testing.T) {
+	path, err := serviceRoutePath(testServiceRoute(), DefaultSIDStructure, PrependSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, attAny := range path.Pattrs {
+		m, _ := attAny.UnmarshalNew()
+		if _, ok := m.(*api.AsPathAttribute); ok {
+			t.Fatal("plain advertisement must carry no AS_PATH attribute")
+		}
+	}
+}
+
 func TestServiceRoutePath_Validation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -126,7 +167,7 @@ func TestServiceRoutePath_Validation(t *testing.T) {
 	} {
 		r := testServiceRoute()
 		tc.mod(&r)
-		if _, err := serviceRoutePath(r, DefaultSIDStructure); err == nil {
+		if _, err := serviceRoutePath(r, DefaultSIDStructure, PrependSpec{}); err == nil {
 			t.Fatalf("%s: expected error", tc.name)
 		}
 	}
