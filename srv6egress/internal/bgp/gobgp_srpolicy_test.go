@@ -19,11 +19,11 @@ var testBSID = net.ParseIP("cafe::64").To16()
 func TestSRPolicyPath_Deterministic(t *testing.T) {
 	d := testSRDist()
 	ep := net.ParseIP("fd00:1::14").To16()
-	p1, err := d.srPolicyPath(100, ep, testBSID, []string{"fcff:0:0:e0:a::"})
+	p1, err := d.srPolicyPath(100, 0, 0, ep, testBSID, []string{"fcff:0:0:e0:a::"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2, err := d.srPolicyPath(100, ep, testBSID, []string{"fcff:0:0:e0:a::"})
+	p2, err := d.srPolicyPath(100, 0, 0, ep, testBSID, []string{"fcff:0:0:e0:a::"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,9 +36,9 @@ func TestSRPolicyPath_DistinctByColorAndEndpoint(t *testing.T) {
 	d := testSRDist()
 	epA := net.ParseIP("fd00:1::14").To16()
 	epB := net.ParseIP("fd00:1::15").To16()
-	base, _ := d.srPolicyPath(100, epA, testBSID, []string{"fcff:0:0:e0:a::"})
-	otherColor, _ := d.srPolicyPath(200, epA, testBSID, []string{"fcff:0:0:e0:a::"})
-	otherEndpoint, _ := d.srPolicyPath(100, epB, testBSID, []string{"fcff:0:0:e0:a::"})
+	base, _ := d.srPolicyPath(100, 0, 0, epA, testBSID, []string{"fcff:0:0:e0:a::"})
+	otherColor, _ := d.srPolicyPath(200, 0, 0, epA, testBSID, []string{"fcff:0:0:e0:a::"})
+	otherEndpoint, _ := d.srPolicyPath(100, 0, 0, epB, testBSID, []string{"fcff:0:0:e0:a::"})
 	if proto.Equal(base, otherColor) {
 		t.Fatal("paths with different color compare equal")
 	}
@@ -47,11 +47,70 @@ func TestSRPolicyPath_DistinctByColorAndEndpoint(t *testing.T) {
 	}
 }
 
+// Two candidate paths of the same <color, endpoint> differ by distinguisher and
+// carry their own preference in the Tunnel Encap sub-TLV (RFC 9256 §2.1/§2.7).
+func TestSRPolicyPath_PerCandidateDistinguisherAndPreference(t *testing.T) {
+	d := testSRDist()
+	ep := net.ParseIP("fd00:1::14").To16()
+	c1, err := d.srPolicyPath(100, 1, 200, ep, testBSID, []string{"fcff:0:0:e0:a::"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := d.srPolicyPath(100, 2, 100, ep, testBSID, []string{"fcff:0:0:e0:b::"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proto.Equal(c1, c2) {
+		t.Fatal("candidate paths with different distinguishers compare equal")
+	}
+
+	// NLRI distinguishers must be 1 and 2.
+	var n1, n2 api.SRPolicyNLRI
+	if err := c1.Nlri.UnmarshalTo(&n1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Nlri.UnmarshalTo(&n2); err != nil {
+		t.Fatal(err)
+	}
+	if n1.Distinguisher != 1 || n2.Distinguisher != 2 {
+		t.Fatalf("distinguishers = %d,%d, want 1,2", n1.Distinguisher, n2.Distinguisher)
+	}
+
+	// Each path's preference sub-TLV must carry the candidate's preference.
+	if got := preferenceOf(t, c1); got != 200 {
+		t.Fatalf("candidate 1 preference = %d, want 200", got)
+	}
+	if got := preferenceOf(t, c2); got != 100 {
+		t.Fatalf("candidate 2 preference = %d, want 100", got)
+	}
+}
+
+// preferenceOf extracts the SR Preference sub-TLV value from a path.
+func preferenceOf(t *testing.T, p *api.Path) uint32 {
+	t.Helper()
+	for _, a := range p.Pattrs {
+		var tun api.TunnelEncapAttribute
+		if a.UnmarshalTo(&tun) != nil {
+			continue
+		}
+		for _, tlv := range tun.Tlvs {
+			for _, sub := range tlv.Tlvs {
+				var pref api.TunnelEncapSubTLVSRPreference
+				if sub.UnmarshalTo(&pref) == nil {
+					return pref.Preference
+				}
+			}
+		}
+	}
+	t.Fatal("no SR Preference sub-TLV found")
+	return 0
+}
+
 func TestSRPolicyPath_Shape(t *testing.T) {
 	d := testSRDist()
 	ep := net.ParseIP("fd00:1::14").To16()
 	segList := []string{"fcff:0:0:e0:a::", "fcff:0:0:e0:b::"}
-	p, err := d.srPolicyPath(100, ep, testBSID, segList)
+	p, err := d.srPolicyPath(100, 0, 0, ep, testBSID, segList)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +203,7 @@ func TestSRPolicyPath_Shape(t *testing.T) {
 func TestSRPolicyPath_RejectsIPv4Segment(t *testing.T) {
 	d := testSRDist()
 	ep := net.ParseIP("fd00:1::14").To16()
-	if _, err := d.srPolicyPath(100, ep, testBSID, []string{"10.0.0.1"}); err == nil {
+	if _, err := d.srPolicyPath(100, 0, 0, ep, testBSID, []string{"10.0.0.1"}); err == nil {
 		t.Fatal("expected IPv4 segment to be rejected")
 	}
 }

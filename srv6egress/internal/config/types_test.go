@@ -136,6 +136,103 @@ func TestValidate_DuplicateBSIDRejected(t *testing.T) {
 	}
 }
 
+// --- candidatePaths (RFC 9256) ---
+
+// The deprecated single form (upstream+segmentList) must normalize into one
+// candidate path with the default preference, proving backward compatibility.
+func TestValidate_SingleFormNormalizedToCandidate(t *testing.T) {
+	c := baseValid() // uses the deprecated single form
+	if err := c.Validate(); err != nil {
+		t.Fatalf("single-form config must validate, got: %v", err)
+	}
+	cc := c.Colors[100]
+	if len(cc.CandidatePaths) != 1 {
+		t.Fatalf("expected 1 normalized candidate, got %d", len(cc.CandidatePaths))
+	}
+	cp := cc.CandidatePaths[0]
+	if cp.Upstream != "isp-a" || cp.Preference != defaultCandidatePreference ||
+		len(cp.SegmentList) != 1 || cp.SegmentList[0] != "fcff:0:0:e0:a::" {
+		t.Fatalf("normalized candidate = %+v", cp)
+	}
+	// The deprecated fields must be cleared so the rest of the pipeline reads
+	// only CandidatePaths.
+	if cc.Upstream != "" || cc.SegmentList != nil {
+		t.Fatalf("deprecated fields not cleared after normalize: %+v", cc)
+	}
+}
+
+// Specifying both the single form and candidatePaths is ambiguous and rejected.
+func TestValidate_BothFormsRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		Upstream:    "isp-a",
+		SegmentList: []string{"fcff:0:0:e0:a::"},
+		CandidatePaths: []CandidatePathConfig{
+			{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 100},
+		},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when both single form and candidatePaths are set")
+	}
+}
+
+// A color with two candidate paths (distinct preferences) must validate; each
+// candidate must terminate at its own upstream's SID.
+func TestValidate_MultiCandidateOK(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		CandidatePaths: []CandidatePathConfig{
+			{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 200},
+			{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}, Preference: 100},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("multi-candidate config should validate, got: %v", err)
+	}
+	if got := c.Colors[100].Primary().Upstream; got != "isp-a" {
+		t.Fatalf("primary upstream = %q, want isp-a (pref 200)", got)
+	}
+}
+
+// Duplicate preferences within a color make the headend tie-break undefined and
+// must be rejected.
+func TestValidate_DuplicatePreferenceRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		CandidatePaths: []CandidatePathConfig{
+			{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 100},
+			{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:b::"}, Preference: 100},
+		},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for duplicate candidate-path preference within a color")
+	}
+}
+
+// A candidate whose last segment does not equal its upstream's SID must be
+// rejected (same invariant as the single form, now per candidate).
+func TestValidate_MultiCandidateWrongTerminalSID(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{
+		CandidatePaths: []CandidatePathConfig{
+			{Upstream: "isp-a", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 200},
+			{Upstream: "isp-b", SegmentList: []string{"fcff:0:0:e0:a::"}, Preference: 100}, // wrong terminal
+		},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error when a candidate's last segment != its upstream SID")
+	}
+}
+
+// An empty candidatePaths (and no single form) must be rejected.
+func TestValidate_EmptyCandidatePathsRejected(t *testing.T) {
+	c := baseValid()
+	c.Colors[100] = ColorConfig{}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for a color with no candidate paths")
+	}
+}
+
 // --- backbone stitching validation ---
 
 func validBackbone() *BackboneConfig {

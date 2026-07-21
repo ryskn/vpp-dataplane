@@ -196,6 +196,20 @@ spec:
                       type: array
                       items:
                         type: string
+                    candidatePaths:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          upstream:
+                            type: string
+                          segmentList:
+                            type: array
+                            items:
+                              type: string
+                          preference:
+                            type: integer
+                            format: int64
                 conditions:
                   type: array
                   items:

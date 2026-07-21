@@ -117,16 +117,30 @@ func main() {
 		}
 		encoder = bgp.NewSRPolicyEncoder(bgp.SRPolicyOptions{})
 	case "color-route":
+		// The colored-route NLRI is a single terminal SID /128, so it cannot
+		// express a color's multiple candidate paths (each with its own terminal
+		// SID). Reject multi-candidate colors under this encoding; sr-policy SAFI
+		// is required for candidate-path failover.
+		for color, cc := range cfg.Colors {
+			if len(cc.CandidatePaths) > 1 {
+				log.Error(fmt.Errorf("color %d has %d candidate paths; color-route encoding cannot express multiple candidates (use --bgp-encoding=sr-policy)", color, len(cc.CandidatePaths)), "invalid config")
+				os.Exit(1)
+			}
+		}
 		// Under the colored-route encoding the NLRI is the terminal SID /128 and
 		// the color is only an attribute, so two colors ending at the same SID
 		// collapse onto one BGP path: the second Announce replaces the first and
 		// withdrawing either withdraws the shared route. Reject that at load.
 		seenSID := map[string]uint32{}
 		for color, cc := range cfg.Colors {
-			if len(cc.SegmentList) == 0 {
+			if len(cc.CandidatePaths) == 0 {
+				continue // empty candidatePaths is already rejected by config.Validate
+			}
+			segs := cc.CandidatePaths[0].SegmentList
+			if len(segs) == 0 {
 				continue // empty segmentList is already rejected by config.Validate
 			}
-			last := net.ParseIP(cc.SegmentList[len(cc.SegmentList)-1])
+			last := net.ParseIP(segs[len(segs)-1])
 			if last == nil {
 				continue // malformed SID is already rejected by config.Validate
 			}
