@@ -153,6 +153,17 @@ type GatewayManager struct {
 	// sidModes is the per-upstream SID encoding (see SetUpstreamSIDModes); an
 	// upstream absent from the map defaults to classic End.DT6.
 	sidModes map[string]UpstreamSIDSpec
+
+	// synced flips true once PruneExcept has run (the watcher completed its
+	// first successful List). It gates the legacy-aggregate sweep: on an agent
+	// restart with the apiserver unreachable the policies map is empty, and an
+	// ungated sweep would rip the aggregate that legacy policies still need.
+	synced bool
+	// legacySwept marks upstream tables whose stale legacy shared aggregate the
+	// sweep already removed, so the periodic sweep does not re-issue the VPP
+	// delete every tick. A table is un-marked while some legacy policy still
+	// wants the aggregate there (its install may re-create the route).
+	legacySwept map[uint32]struct{}
 }
 
 // SetSIDAdvertiser wires BGP advertisement of provisioned tenant SIDs. Call
@@ -200,6 +211,7 @@ func NewGatewayManager(log *logrus.Entry, vpp VPPGateway, nodeName string,
 		vrfs:           newVRFAllocator(vrfBase),
 		returnRoutes:   make(map[string]map[tenantReturnRoute]struct{}),
 		returnRefs:     make(map[tenantReturnRoute]int),
+		legacySwept:    make(map[uint32]struct{}),
 	}
 }
 
@@ -231,7 +243,7 @@ func (m *GatewayManager) OnPolicyDelete(uid string) {
 	if !ok {
 		return
 	}
-	m.teardownLocked(uid, st)
+	m.teardownLocked(uid, st, true)
 	delete(m.policies, uid)
 }
 
@@ -251,6 +263,57 @@ func (m *GatewayManager) ReconcileAll() {
 		if _, ok := m.policies[uid]; !ok {
 			m.reconcileReturnLocked(uid, nil)
 		}
+	}
+	m.sweepLegacyAggregateLocked()
+}
+
+// sweepLegacyAggregateLocked removes the legacy shared return aggregate
+// (returnCIDR -> cluster VRF) from every upstream VRF where no tracked policy
+// still wants it. The aggregate was historically installed by InstallGateway
+// and deliberately left in place on teardown, and it predates this manager's
+// bookkeeping across restarts — so when a policy migrates to per-tenant
+// returnPrefixes, the already-installed aggregate would silently keep
+// forwarding tenant-covering traffic out of VRFs whose BGP advertisement was
+// withdrawn (a standing sovereignty-fence hole). Gated on synced (see field
+// doc). legacySwept keeps the sweep quiet: at most one VPP delete (and one
+// Info log) per table until a legacy policy wants the aggregate back there.
+// m.mu must be held.
+func (m *GatewayManager) sweepLegacyAggregateLocked() {
+	if !m.synced || m.returnCIDR == "" {
+		return
+	}
+	// Tables where a tracked policy still runs in legacy shared-aggregate mode:
+	// desired() want==true with no status.returnPrefixes (desired() then keeps
+	// ReturnCIDR set on the request).
+	wanted := map[uint32]struct{}{}
+	for _, st := range m.policies {
+		if want, req := m.desired(st.policy); want && req.ReturnCIDR != "" {
+			wanted[req.UpstreamTable] = struct{}{}
+		}
+	}
+	for _, table := range m.upstreamTables {
+		if _, ok := wanted[table]; ok {
+			delete(m.legacySwept, table) // legacy install may re-create it
+			continue
+		}
+		if _, done := m.legacySwept[table]; done {
+			continue
+		}
+		// Never rip a refcounted per-tenant route that happens to coincide with
+		// the aggregate (same prefix/table/target).
+		if m.returnRefs[tenantReturnRoute{prefix: m.returnCIDR, upstreamTable: table, clusterTable: m.returnTable}] > 0 {
+			continue
+		}
+		if err := m.vpp.DelTenantReturnRoute(m.returnCIDR, table, m.returnTable); err != nil {
+			m.log.WithError(err).WithFields(logrus.Fields{
+				"prefix": m.returnCIDR, "upstreamTable": table,
+			}).Warn("legacy aggregate sweep failed; will retry")
+			continue
+		}
+		m.legacySwept[table] = struct{}{}
+		m.log.WithFields(logrus.Fields{
+			"prefix": m.returnCIDR, "upstreamTable": table,
+		}).Info("swept stale legacy shared return aggregate from upstream VRF")
 	}
 }
 
@@ -277,7 +340,7 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 	// failed after the return reconcile) — prune them too (fail-closed).
 	if !want {
 		if st.install != nil || len(m.returnRoutes[uid]) > 0 {
-			m.teardownLocked(uid, st)
+			m.teardownLocked(uid, st, true)
 		}
 		return
 	}
@@ -285,7 +348,9 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 	// Per-tenant return fence: converge the (prefix × candidate-upstream-VRF)
 	// route set on every pass — prefix/candidate drift must prune stale routes
 	// even when the localsid install below is unchanged. Deferred so it runs
-	// after a drift-triggered teardown (which prunes) has been re-installed.
+	// after a drift-triggered reinstall; the drift teardown itself keeps the
+	// return routes (pruneReturn=false) so unchanged routes are never churned
+	// del→add, and this diff converges the stale ones away.
 	defer func() { m.reconcileReturnLocked(uid, m.desiredReturnRoutes(st.policy)) }()
 
 	// Allocate (or recover) the per-tenant VRF BEFORE the drift check so the
@@ -301,7 +366,10 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 			return
 		}
 		// Parameters drifted (SID/VIP changed): tear the old one down first.
-		m.teardownLocked(uid, st)
+		// pruneReturn=false: the deferred return reconcile diffs against the
+		// desired set, so unchanged return routes stay installed across the
+		// reinstall (no transient fence gap) and stale ones are still removed.
+		m.teardownLocked(uid, st, false)
 		req.VrfTable = m.vrfs.alloc(uid) // teardown freed it; re-allocate
 	}
 
@@ -329,11 +397,18 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 	}).Info("installed egress gateway entry")
 }
 
-func (m *GatewayManager) teardownLocked(uid string, st *gwState) {
+// teardownLocked removes the policy's gateway install (localsid, SID
+// advertisement, VRF). pruneReturn additionally prunes its per-tenant return
+// routes — true when the policy stops contributing (delete / NotReady /
+// prune), false on a drift reinstall where the deferred diff-based return
+// reconcile converges the set without churning unchanged routes. m.mu held.
+func (m *GatewayManager) teardownLocked(uid string, st *gwState, pruneReturn bool) {
 	// Per-tenant return routes contribute nothing once the policy is gone or
 	// NotReady: prune them (refcounted — a route shared with a sibling policy
 	// of the same tenant survives).
-	m.reconcileReturnLocked(uid, nil)
+	if pruneReturn {
+		m.reconcileReturnLocked(uid, nil)
+	}
 	if st.install != nil {
 		// Deferred off the lock: WithdrawSID broadcasts a blocking pub/sub event.
 		if m.sids != nil && st.install.TenantSID != nil {
@@ -503,9 +578,12 @@ func (m *GatewayManager) PruneExcept(live map[string]struct{}) {
 		if _, ok := live[uid]; ok {
 			continue
 		}
-		m.teardownLocked(uid, st)
+		m.teardownLocked(uid, st, true)
 		delete(m.policies, uid)
 	}
+	// The watcher has completed a successful List: the policies map now reflects
+	// the full live set, so the legacy-aggregate sweep in ReconcileAll may run.
+	m.synced = true
 }
 
 // Reset tears down every gateway entry (graceful shutdown). Best-effort.
@@ -513,7 +591,7 @@ func (m *GatewayManager) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for uid, st := range m.policies {
-		m.teardownLocked(uid, st)
+		m.teardownLocked(uid, st, true)
 	}
 	m.policies = make(map[string]*gwState)
 }
