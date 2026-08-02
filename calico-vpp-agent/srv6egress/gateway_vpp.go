@@ -188,3 +188,20 @@ func (g *vppGateway) RemoveGateway(req GatewayRequest) error {
 	// VRF while the SR FIB still references it can crash some VPP builds.
 	return firstErr
 }
+
+// AddTenantReturnRoute installs the per-tenant return route "prefix ->
+// lookup-in-table clusterTable" in the upstream VRF. Idempotent; the upstream
+// VRF is ensured first (install ordering with InstallGateway is not guaranteed).
+func (g *vppGateway) AddTenantReturnRoute(prefix string, upstreamTable, clusterTable uint32) error {
+	if err := g.cliOK(fmt.Sprintf("ip6 table add %d", upstreamTable), "already"); err != nil {
+		return err
+	}
+	return g.cliOK(fmt.Sprintf("ip route add %s table %d via ip6-lookup-in-table %d", prefix, upstreamTable, clusterTable), "already", "exist")
+}
+
+// DelTenantReturnRoute removes the per-tenant return route. Unlike the shared
+// aggregate (left in place on teardown) this MUST go: a stale route keeps
+// forwarding from a VRF whose BGP advertisement was already withdrawn.
+func (g *vppGateway) DelTenantReturnRoute(prefix string, upstreamTable, clusterTable uint32) error {
+	return g.cliOK(fmt.Sprintf("ip route del %s table %d via ip6-lookup-in-table %d", prefix, upstreamTable, clusterTable), "no such", "not found")
+}

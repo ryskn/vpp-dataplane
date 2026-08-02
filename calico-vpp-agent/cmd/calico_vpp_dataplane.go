@@ -339,11 +339,10 @@ func main() {
 						}
 						egressGateway.SetUpstreamSIDModes(modes)
 					}
-					// NAT-less return aggregate: bounce the cluster pod CIDR back
-					// into the cluster SRv6 fabric so return traffic reaches the pod.
-					if srv6cfg.EgressClusterPodCIDR != "" {
-						egressGateway.SetClusterReturn(srv6cfg.EgressClusterPodCIDR, srv6cfg.EgressClusterVrf)
-					}
+					// NAT-less return: the cluster VRF targets both the legacy
+					// shared aggregate (empty pod CIDR disables it) and the
+					// per-tenant return routes from status.returnPrefixes.
+					egressGateway.SetClusterReturn(srv6cfg.EgressClusterPodCIDR, srv6cfg.EgressClusterVrf)
 					egressWatcher.SetGatewayManager(egressGateway)
 					egressLog.WithField("upstreamTables", srv6cfg.EgressUpstreamTables).
 						Info("egress gateway provisioning enabled on this node")

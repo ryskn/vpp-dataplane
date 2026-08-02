@@ -125,6 +125,14 @@ type EgressPolicyStatus struct {
 	// +optional
 	Upstream string `json:"upstream,omitempty"`
 
+	// ReturnPrefixes are the pod prefixes (tenant podCIDRs) of every configured
+	// tenant this policy's namespaceSelector selects (sorted; normally one).
+	// The gateway agent routes each prefix from every candidate upstream's VRF
+	// into the cluster VRF — the dataplane counterpart of the per-tenant BGP
+	// return advertisement. Empty means legacy shared-aggregate return.
+	// +optional
+	ReturnPrefixes []string `json:"returnPrefixes,omitempty"`
+
 	// SRPolicy is the resolved SR Policy (BSID + segment list).
 	// +optional
 	SRPolicy *SRPolicyStatus `json:"srPolicy,omitempty"`

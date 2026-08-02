@@ -19,10 +19,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -114,6 +114,10 @@ type reconcilePlan struct {
 	cc           config.ColorConfig
 	endpoint     string
 	endpointAddr string
+	// returnPrefixes are the matched tenants' podCIDRs persisted in status so
+	// the gateway agent can enforce the per-tenant return fence (empty in
+	// legacy shared-aggregate mode).
+	returnPrefixes []string
 }
 
 // validateDestinationCIDRs enforces the v1 IPv6-only invariant on the policy's
@@ -194,7 +198,16 @@ func (r *EgressPolicyReconciler) resolvePlan(ctx context.Context, ep *srv6egress
 		return nil, res, err
 	}
 
-	return &reconcilePlan{cc: cc, endpoint: endpoint, endpointAddr: endpointAddr}, ctrl.Result{}, nil
+	// Per-tenant return fence: persist the matched tenants' podCIDRs so the
+	// gateway agent installs return routes in exactly the candidate upstream
+	// VRFs. The reconciler is the single derivation (and status-writer) point;
+	// the agent only enforces what status carries.
+	returnPrefixes, err := tenantReturnPrefixes(ctx, r.Client, r.Config.Backbone, ep)
+	if err != nil {
+		return nil, ctrl.Result{}, err
+	}
+
+	return &reconcilePlan{cc: cc, endpoint: endpoint, endpointAddr: endpointAddr, returnPrefixes: returnPrefixes}, ctrl.Result{}, nil
 }
 
 // findTenantSovereigntyConflict returns (tenant, excess-upstreams) when this
@@ -219,11 +232,11 @@ func (r *EgressPolicyReconciler) findTenantSovereigntyConflict(ctx context.Conte
 	}
 
 	for tenant, tc := range r.Config.Backbone.Tenants {
-		nsLabels, err := r.namespaceLabels(ctx, tc.Namespace)
+		nsLabels, err := getNamespaceLabels(ctx, r.Client, tc.Namespace)
 		if err != nil {
 			return "", nil, err
 		}
-		if !r.policyMatchesNamespace(me, nsLabels) {
+		if !policySelectsNamespace(me, nsLabels) {
 			continue
 		}
 		// Sovereign set = intersection of every matched exclusive color's upstream
@@ -232,7 +245,7 @@ func (r *EgressPolicyReconciler) findTenantSovereigntyConflict(ctx context.Conte
 		var sovereign map[string]bool
 		for i := range list.Items {
 			p := &list.Items[i]
-			if !p.DeletionTimestamp.IsZero() || !r.policyMatchesNamespace(p, nsLabels) {
+			if !p.DeletionTimestamp.IsZero() || !policySelectsNamespace(p, nsLabels) {
 				continue
 			}
 			pc, ok := r.Config.Colors[p.Spec.Egress.Color]
@@ -264,33 +277,6 @@ func (r *EgressPolicyReconciler) findTenantSovereigntyConflict(ctx context.Conte
 		}
 	}
 	return "", nil, nil
-}
-
-// namespaceLabels reads a namespace's labels for tenant matching. A missing
-// namespace yields nil labels (only a nil namespaceSelector then matches it).
-func (r *EgressPolicyReconciler) namespaceLabels(ctx context.Context, ns string) (map[string]string, error) {
-	var namespace corev1.Namespace
-	if err := r.Get(ctx, client.ObjectKey{Name: ns}, &namespace); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get namespace %q: %w", ns, err)
-	}
-	return namespace.Labels, nil
-}
-
-// policyMatchesNamespace reports whether a policy's namespaceSelector selects a
-// namespace with the given labels. A nil selector matches all namespaces.
-func (r *EgressPolicyReconciler) policyMatchesNamespace(p *srv6egressv1.EgressPolicy, nsLabels map[string]string) bool {
-	ns := p.Spec.Selector.NamespaceSelector
-	if ns == nil {
-		return true
-	}
-	sel, err := metav1.LabelSelectorAsSelector(ns)
-	if err != nil {
-		return false // a malformed selector never matches (fail-closed)
-	}
-	return sel.Matches(labels.Set(nsLabels))
 }
 
 // candidateStatus builds the persisted candidate-path array from the resolved
@@ -366,9 +352,12 @@ func (r *EgressPolicyReconciler) distributeCluster(ctx context.Context, ep *srv6
 
 	// Persist the announce intent BEFORE announcing.
 	if ep.Status.ActiveEndpoint != plan.endpoint ||
-		ep.Status.Upstream != primary.Upstream || !srPolicyIntentEqual(ep.Status.SRPolicy, intent) {
+		ep.Status.Upstream != primary.Upstream ||
+		!slices.Equal(ep.Status.ReturnPrefixes, plan.returnPrefixes) ||
+		!srPolicyIntentEqual(ep.Status.SRPolicy, intent) {
 		ep.Status.ActiveEndpoint = plan.endpoint
 		ep.Status.Upstream = primary.Upstream
+		ep.Status.ReturnPrefixes = plan.returnPrefixes
 		ep.Status.SRPolicy = intent
 		setReady(ep, metav1.ConditionFalse, "Announcing", "SR Policy recorded; BGP announce in progress")
 		if err := r.Status().Update(ctx, ep); err != nil {
