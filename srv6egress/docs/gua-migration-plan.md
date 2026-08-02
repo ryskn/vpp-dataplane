@@ -200,6 +200,7 @@ ssh sim-isp-a 'gobgp global rib -a ipv6 | grep 2001:db8:2000'
 ## 8. 残骸掃除(手順 ⑦、soak 後)
 
 - GW table100 の `fd20::/16 → lookup-in-table 0`(tenant 用途分)を削除 ※ system pod が GW 経由の何かに依存していない事を確認してから
+  - PR D 以降の agent は upgrade 時にこの stale 共有集約を upstream VRF から**自動 sweep** する(watcher の初回 List 完了後、ReconcileAll 1 周期以内)。手動 `ip route del` は不要 — legacy mode の policy が残る upstream VRF だけは温存される
 - sim-ISP 側の fd20 static/学習経路の削除
 - fd20 pool は **default pool として存続**(system pod 用)。tenant 専用 fd20 pool が別にあれば `disabled: true` → 全 pod 退去確認 → 削除
 - 旧 VIP 残骸(`2001:db8:e::/64` 関連の route/steering)が VPP に残っていないか `vppctl show sr steering-policies` で最終確認(過去に dangling steering の実績あり)
