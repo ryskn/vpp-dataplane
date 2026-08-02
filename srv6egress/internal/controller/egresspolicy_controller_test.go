@@ -407,6 +407,74 @@ func TestReconcile_TenantSovereigntyCompliant(t *testing.T) {
 	}
 }
 
+// --- per-tenant return prefixes (status carrier for the gateway fence) ---
+
+// A policy selecting a tenant namespace must get the tenant podCIDR persisted
+// in status.returnPrefixes — the single derivation point for the gateway's
+// per-tenant return fence.
+func TestReconcile_WritesReturnPrefixes(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{"team": "a"}}}
+	r := newSovereigntyReconciler(t, ns, egressNode("egress-1"), teamPolicy("p", "u1", 10))
+	if err := reconcile(t, r, "p"); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+	var ep srv6egressv1.EgressPolicy
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "p"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if len(ep.Status.ReturnPrefixes) != 1 || ep.Status.ReturnPrefixes[0] != "2001:db8:2000::/48" {
+		t.Fatalf("status.returnPrefixes = %v, want [2001:db8:2000::/48]", ep.Status.ReturnPrefixes)
+	}
+}
+
+// Editing the selector so the policy no longer selects any tenant namespace
+// must clear status.returnPrefixes on the next reconcile (the agent then
+// prunes the per-tenant routes and falls back to the legacy aggregate).
+func TestReconcile_ClearsReturnPrefixesWhenTenantUnmatched(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{"team": "a"}}}
+	r := newSovereigntyReconciler(t, ns, egressNode("egress-1"), teamPolicy("p", "u1", 10))
+	if err := reconcile(t, r, "p"); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+
+	var ep srv6egressv1.EgressPolicy
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "p"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if len(ep.Status.ReturnPrefixes) != 1 {
+		t.Fatalf("precondition: returnPrefixes not written: %v", ep.Status.ReturnPrefixes)
+	}
+	ep.Spec.Selector.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"team": "b"}}
+	if err := r.Update(context.Background(), &ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcile(t, r, "p"); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "p"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if len(ep.Status.ReturnPrefixes) != 0 {
+		t.Fatalf("returnPrefixes must be cleared when no tenant matches, got %v", ep.Status.ReturnPrefixes)
+	}
+}
+
+// Without Backbone.Tenants (legacy shared-aggregate mode) status must carry no
+// returnPrefixes at all.
+func TestReconcile_NoTenantsNoReturnPrefixes(t *testing.T) {
+	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
+	if err := reconcile(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+	var ep srv6egressv1.EgressPolicy
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tenant-a"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if len(ep.Status.ReturnPrefixes) != 0 {
+		t.Fatalf("legacy mode must not write returnPrefixes, got %v", ep.Status.ReturnPrefixes)
+	}
+}
+
 func TestReconcile_HappyPath(t *testing.T) {
 	r := newReconciler(t, egressNode("egress-1"), newPolicy("tenant-a", "uid-a", 100))
 	if err := reconcile(t, r, "tenant-a"); err != nil {

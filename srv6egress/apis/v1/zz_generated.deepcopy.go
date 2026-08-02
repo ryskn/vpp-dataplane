@@ -134,6 +134,9 @@ func (in *EndpointSelector) DeepCopy() *EndpointSelector {
 
 func (in *EgressPolicyStatus) DeepCopyInto(out *EgressPolicyStatus) {
 	*out = *in
+	if in.ReturnPrefixes != nil {
+		out.ReturnPrefixes = append([]string(nil), in.ReturnPrefixes...)
+	}
 	if in.SRPolicy != nil {
 		out.SRPolicy = in.SRPolicy.DeepCopy()
 	}

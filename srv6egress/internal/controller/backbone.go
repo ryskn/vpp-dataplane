@@ -8,10 +8,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	srv6egressv1 "github.com/projectcalico/vpp-dataplane/v3/srv6egress/apis/v1"
@@ -343,7 +339,7 @@ func (a *ClusterReturnAdvertiser) deriveAdvSet(policies *srv6egressv1.EgressPoli
 		if !p.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if !a.policyMatchesNamespace(p, nsLabels) {
+		if !policySelectsNamespace(p, nsLabels) {
 			continue
 		}
 		cc, ok := a.Config.Colors[p.Spec.Egress.Color]
@@ -385,7 +381,7 @@ func (a *ClusterReturnAdvertiser) deriveAdvSet(policies *srv6egressv1.EgressPoli
 			bestPref = int64(-1)
 			for i := range policies.Items {
 				p := &policies.Items[i]
-				if !p.DeletionTimestamp.IsZero() || !a.policyMatchesNamespace(p, nsLabels) {
+				if !p.DeletionTimestamp.IsZero() || !policySelectsNamespace(p, nsLabels) {
 					continue
 				}
 				cc, ok := a.Config.Colors[p.Spec.Egress.Color]
@@ -416,38 +412,19 @@ func (a *ClusterReturnAdvertiser) deriveAdvSet(policies *srv6egressv1.EgressPoli
 	return advSet, primary
 }
 
-// policyMatchesNamespace reports whether a policy's namespaceSelector selects a
-// namespace with the given labels. A nil selector matches all namespaces.
-func (a *ClusterReturnAdvertiser) policyMatchesNamespace(p *srv6egressv1.EgressPolicy, nsLabels map[string]string) bool {
-	ns := p.Spec.Selector.NamespaceSelector
-	if ns == nil {
-		return true
-	}
-	sel, err := metav1.LabelSelectorAsSelector(ns)
-	if err != nil {
-		return false // a malformed selector never matches (fail-closed)
-	}
-	return sel.Matches(labels.Set(nsLabels))
-}
-
 // namespaceLabels fetches the label map of every tenant's namespace once per
-// tick. A missing namespace yields nil labels (only a nil namespaceSelector then
-// matches it).
+// tick (see getNamespaceLabels for the missing-namespace semantics).
 func (a *ClusterReturnAdvertiser) namespaceLabels(ctx context.Context, bb *config.BackboneConfig) (map[string]map[string]string, error) {
 	out := make(map[string]map[string]string, len(bb.Tenants))
 	for _, tc := range bb.Tenants {
 		if _, done := out[tc.Namespace]; done {
 			continue
 		}
-		var ns corev1.Namespace
-		if err := a.Client.Get(ctx, client.ObjectKey{Name: tc.Namespace}, &ns); err != nil {
-			if apierrors.IsNotFound(err) {
-				out[tc.Namespace] = nil
-				continue
-			}
-			return nil, fmt.Errorf("get namespace %q: %w", tc.Namespace, err)
+		l, err := getNamespaceLabels(ctx, a.Client, tc.Namespace)
+		if err != nil {
+			return nil, err
 		}
-		out[tc.Namespace] = ns.Labels
+		out[tc.Namespace] = l
 	}
 	return out, nil
 }

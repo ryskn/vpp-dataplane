@@ -28,6 +28,16 @@ type VPPGateway interface {
 	// RemoveGateway tears down everything InstallGateway created for req.
 	// Safe to call when nothing is installed.
 	RemoveGateway(req GatewayRequest) error
+	// AddTenantReturnRoute installs the per-tenant return route "prefix ->
+	// lookup-in-table clusterTable" in the upstream VRF — the dataplane
+	// counterpart of the per-tenant BGP return advertisement (AdvSet).
+	// Idempotent.
+	AddTenantReturnRoute(prefix string, upstreamTable, clusterTable uint32) error
+	// DelTenantReturnRoute removes it. Unlike the legacy shared aggregate it
+	// MUST be removed once no policy needs it: a stale route forwards traffic
+	// arriving in a VRF whose BGP advertisement was already withdrawn
+	// (sovereignty leak). Safe to call when absent.
+	DelTenantReturnRoute(prefix string, upstreamTable, clusterTable uint32) error
 }
 
 // SIDAdvertiser makes a gateway tenant SID reachable cluster-wide by
@@ -98,6 +108,15 @@ type gwState struct {
 	install *GatewayRequest // nil until provisioned
 }
 
+// tenantReturnRoute identifies one per-tenant return route: a tenant prefix
+// routed from an upstream VRF into the cluster VRF. Refcount key across the
+// policies of a tenant.
+type tenantReturnRoute struct {
+	prefix        string
+	upstreamTable uint32
+	clusterTable  uint32
+}
+
 // GatewayManager provisions the endpoint-side data path for EgressPolicies
 // whose resolved endpoint is THIS node. It is fed the same cluster-wide
 // EgressPolicy events as the headend Manager; it acts only on policies whose
@@ -121,9 +140,16 @@ type GatewayManager struct {
 	pendingSID []func()
 
 	// returnCIDR / returnTable configure the shared return aggregate (see
-	// SetClusterReturn); an empty returnCIDR disables it.
+	// SetClusterReturn); an empty returnCIDR disables it. returnTable is also
+	// the target of the per-tenant return routes.
 	returnCIDR  string
 	returnTable uint32
+	// returnRoutes tracks, per policy UID, the per-tenant return routes
+	// installed on its behalf; returnRefs refcounts each route across the
+	// policies of a tenant so the VPP route is added on 0->1 and removed on
+	// 1->0 (a sibling policy's removal must not rip a shared route).
+	returnRoutes map[string]map[tenantReturnRoute]struct{}
+	returnRefs   map[tenantReturnRoute]int
 	// sidModes is the per-upstream SID encoding (see SetUpstreamSIDModes); an
 	// upstream absent from the map defaults to classic End.DT6.
 	sidModes map[string]UpstreamSIDSpec
@@ -137,10 +163,12 @@ func (m *GatewayManager) SetSIDAdvertiser(a SIDAdvertiser) {
 	m.sids = a
 }
 
-// SetClusterReturn configures the shared return aggregate: the cluster pod CIDR is
-// bounced from the upstream VRF into the cluster VRF (table) so return traffic
-// (dst = pod IP) re-enters the cluster SRv6 fabric. Optional; unset means the
-// return path is provided by other means. Call before the watcher starts.
+// SetClusterReturn configures the return-path target. clusterVRF is the table
+// return traffic is bounced into — by the legacy shared aggregate (podCIDR ->
+// clusterVRF in every upstream VRF; empty podCIDR disables it) AND by the
+// per-tenant return routes derived from status.returnPrefixes, which use
+// clusterVRF as their target regardless of podCIDR. Call before the watcher
+// starts.
 func (m *GatewayManager) SetClusterReturn(podCIDR string, clusterVRF uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -170,6 +198,8 @@ func NewGatewayManager(log *logrus.Entry, vpp VPPGateway, nodeName string,
 		upstreamTables: upstreamTables,
 		policies:       make(map[string]*gwState),
 		vrfs:           newVRFAllocator(vrfBase),
+		returnRoutes:   make(map[string]map[tenantReturnRoute]struct{}),
+		returnRefs:     make(map[tenantReturnRoute]int),
 	}
 }
 
@@ -214,6 +244,14 @@ func (m *GatewayManager) ReconcileAll() {
 	for uid, st := range m.policies {
 		m.reconcileLocked(uid, st)
 	}
+	// Retry return-route deletes that failed during a teardown whose policy is
+	// already forgotten — a stale per-tenant return route is a sovereignty leak
+	// and must be retried until the delete succeeds.
+	for uid := range m.returnRoutes {
+		if _, ok := m.policies[uid]; !ok {
+			m.reconcileReturnLocked(uid, nil)
+		}
+	}
 }
 
 // flushPendingSID runs the SID advertise/withdraw closures collected under mu,
@@ -235,12 +273,20 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 	want, req := m.desired(st.policy)
 
 	// No longer wanted (endpoint moved, policy not ready, …): tear down.
+	// Return routes may exist even when st.install is nil (InstallGateway
+	// failed after the return reconcile) — prune them too (fail-closed).
 	if !want {
-		if st.install != nil {
+		if st.install != nil || len(m.returnRoutes[uid]) > 0 {
 			m.teardownLocked(uid, st)
 		}
 		return
 	}
+
+	// Per-tenant return fence: converge the (prefix × candidate-upstream-VRF)
+	// route set on every pass — prefix/candidate drift must prune stale routes
+	// even when the localsid install below is unchanged. Deferred so it runs
+	// after a drift-triggered teardown (which prunes) has been re-installed.
+	defer func() { m.reconcileReturnLocked(uid, m.desiredReturnRoutes(st.policy)) }()
 
 	// Allocate (or recover) the per-tenant VRF BEFORE the drift check so the
 	// request key includes the (stable, UID-keyed) table id; otherwise a freshly
@@ -284,6 +330,10 @@ func (m *GatewayManager) reconcileLocked(uid string, st *gwState) {
 }
 
 func (m *GatewayManager) teardownLocked(uid string, st *gwState) {
+	// Per-tenant return routes contribute nothing once the policy is gone or
+	// NotReady: prune them (refcounted — a route shared with a sibling policy
+	// of the same tenant survives).
+	m.reconcileReturnLocked(uid, nil)
 	if st.install != nil {
 		// Deferred off the lock: WithdrawSID broadcasts a blocking pub/sub event.
 		if m.sids != nil && st.install.TenantSID != nil {
@@ -331,17 +381,116 @@ func (m *GatewayManager) desired(ep *srv6egressv1.EgressPolicy) (bool, GatewayRe
 		return false, GatewayRequest{}
 	}
 	spec := m.sidModes[ep.Status.Upstream]
+	// Per-tenant return info in status supersedes the legacy shared aggregate
+	// for this policy: the fence is installed per (prefix, candidate upstream
+	// VRF) by reconcileReturnLocked instead.
+	returnCIDR := m.returnCIDR
+	if len(ep.Status.ReturnPrefixes) > 0 {
+		returnCIDR = ""
+	}
 	return true, GatewayRequest{
 		PolicyUID:       string(ep.UID),
 		TenantSID:       sid,
 		UpstreamTable:   upstreamTable,
-		ReturnCIDR:      m.returnCIDR,
+		ReturnCIDR:      returnCIDR,
 		ReturnTable:     m.returnTable,
 		USID:            spec.USID,
 		LocatorBlockLen: spec.LocatorBlockLen,
 		LocatorNodeLen:  spec.LocatorNodeLen,
 		FunctionLen:     spec.FunctionLen,
 		Upstream:        ep.Status.Upstream,
+	}
+}
+
+// desiredReturnRoutes derives the per-tenant return routes a Ready local
+// policy asks of this gateway: each status.returnPrefixes prefix routed from
+// every candidate upstream's VRF (the forward failover surface) into the
+// cluster VRF. Unknown upstreams are warned and skipped, as in desired().
+// Nil when status carries no per-tenant info (legacy shared-aggregate mode).
+func (m *GatewayManager) desiredReturnRoutes(ep *srv6egressv1.EgressPolicy) map[tenantReturnRoute]struct{} {
+	if ep == nil || len(ep.Status.ReturnPrefixes) == 0 {
+		return nil
+	}
+	ups := map[string]struct{}{}
+	if sp := ep.Status.SRPolicy; sp != nil {
+		for _, cp := range sp.CandidatePaths {
+			if cp.Upstream != "" {
+				ups[cp.Upstream] = struct{}{}
+			}
+		}
+	}
+	// Legacy single-form status (no candidatePaths): fall back to the primary.
+	if len(ups) == 0 && ep.Status.Upstream != "" {
+		ups[ep.Status.Upstream] = struct{}{}
+	}
+	out := map[tenantReturnRoute]struct{}{}
+	for up := range ups {
+		table, ok := m.upstreamTables[up]
+		if !ok {
+			m.log.WithField("upstream", up).
+				Warn("no upstream VRF table for candidate upstream; skipping its return route")
+			continue
+		}
+		for _, prefix := range ep.Status.ReturnPrefixes {
+			out[tenantReturnRoute{prefix: prefix, upstreamTable: table, clusterTable: m.returnTable}] = struct{}{}
+		}
+	}
+	return out
+}
+
+// reconcileReturnLocked converges the per-tenant return routes installed on a
+// policy's behalf to the desired set, refcounting each route across policies.
+// A failed add is not recorded (the next reconcile retries); a failed delete
+// keeps the route recorded so the next pass retries — a stale return route is
+// a sovereignty leak and must never be silently dropped from the bookkeeping.
+// m.mu must be held.
+func (m *GatewayManager) reconcileReturnLocked(uid string, desired map[tenantReturnRoute]struct{}) {
+	cur := m.returnRoutes[uid]
+	for rt := range desired {
+		if _, ok := cur[rt]; ok {
+			continue
+		}
+		if m.returnRefs[rt] == 0 {
+			if err := m.vpp.AddTenantReturnRoute(rt.prefix, rt.upstreamTable, rt.clusterTable); err != nil {
+				m.log.WithError(err).WithFields(logrus.Fields{
+					"prefix": rt.prefix, "upstreamTable": rt.upstreamTable,
+				}).Warn("AddTenantReturnRoute failed; will retry")
+				continue
+			}
+			m.log.WithFields(logrus.Fields{
+				"prefix": rt.prefix, "upstreamTable": rt.upstreamTable, "clusterTable": rt.clusterTable,
+			}).Info("installed per-tenant return route")
+		}
+		if cur == nil {
+			cur = map[tenantReturnRoute]struct{}{}
+			m.returnRoutes[uid] = cur
+		}
+		cur[rt] = struct{}{}
+		m.returnRefs[rt]++
+	}
+	for rt := range cur {
+		if _, ok := desired[rt]; ok {
+			continue
+		}
+		if m.returnRefs[rt] == 1 {
+			if err := m.vpp.DelTenantReturnRoute(rt.prefix, rt.upstreamTable, rt.clusterTable); err != nil {
+				m.log.WithError(err).WithFields(logrus.Fields{
+					"prefix": rt.prefix, "upstreamTable": rt.upstreamTable,
+				}).Warn("DelTenantReturnRoute failed; will retry (stale route is a sovereignty leak)")
+				continue
+			}
+			m.log.WithFields(logrus.Fields{
+				"prefix": rt.prefix, "upstreamTable": rt.upstreamTable,
+			}).Info("removed per-tenant return route")
+		}
+		m.returnRefs[rt]--
+		if m.returnRefs[rt] == 0 {
+			delete(m.returnRefs, rt)
+		}
+		delete(cur, rt)
+	}
+	if len(cur) == 0 {
+		delete(m.returnRoutes, uid)
 	}
 }
 

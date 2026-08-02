@@ -182,6 +182,15 @@ spec:
                   type: string
                 upstream:
                   type: string
+                returnPrefixes:
+                  description: |
+                    Pod prefixes (tenant podCIDRs) of the tenant(s) this policy
+                    selects. The gateway routes each prefix from every candidate
+                    upstream VRF into the cluster VRF (per-tenant return fence).
+                    Empty => legacy shared-aggregate return.
+                  type: array
+                  items:
+                    type: string
                 srPolicy:
                   type: object
                   properties:
