@@ -37,6 +37,12 @@ const (
 
 	SRv6PolicyAdded   CalicoVppEventType = "SRv6PolicyAdded"
 	SRv6PolicyDeleted CalicoVppEventType = "SRv6PolicyDeleted"
+	// SRv6PolicyInstalled/Uninstalled are dataplane acknowledgements emitted by
+	// the SRv6 connectivity provider after the corresponding VPP operation has
+	// completed.  Consumers that gate traffic steering on BSID liveness must use
+	// these events rather than the BGP-intent events above.
+	SRv6PolicyInstalled   CalicoVppEventType = "SRv6PolicyInstalled"
+	SRv6PolicyUninstalled CalicoVppEventType = "SRv6PolicyUninstalled"
 
 	// ServiceDSRClusterIP{Added,Deleted} carry a *DSRService describing an
 	// SRv6-native / NAT-less (DSR) ClusterIP service. Consumed by the SRv6

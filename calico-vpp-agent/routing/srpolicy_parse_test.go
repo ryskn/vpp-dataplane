@@ -188,3 +188,30 @@ func TestGetSRPolicy_MissingBSID(t *testing.T) {
 		t.Fatal("S-Flag without BSID must be rejected (RFC 9256 §6.2.3)")
 	}
 }
+
+func TestClassifyBGPPath_LocalSRPolicyIsNotDropped(t *testing.T) {
+	localSR := srPath(t, bsid13TLV(t, "cafe::1", false, false), defaultSegList(t))
+	localSR.NeighborIp = "<nil>" // exact value GoBGP emits for local AddPath
+	if got := classifyBGPPath(localSR, true); got != bgpPathInjectSRPolicy {
+		t.Fatalf("local SR Policy action=%v, want inject SR Policy", got)
+	}
+	if got := classifyBGPPath(localSR, false); got != bgpPathIgnore {
+		t.Fatalf("disabled-SRv6 action=%v, want ignore", got)
+	}
+
+	localUnicast := &bgpapi.Path{
+		Family:     &bgpapi.Family{Afi: bgpapi.Family_AFI_IP6, Safi: bgpapi.Family_SAFI_UNICAST},
+		NeighborIp: "<nil>",
+	}
+	if got := classifyBGPPath(localUnicast, true); got != bgpPathIgnore {
+		t.Fatalf("local unicast action=%v, want ignore", got)
+	}
+
+	peerUnicast := &bgpapi.Path{
+		Family:     &bgpapi.Family{Afi: bgpapi.Family_AFI_IP6, Safi: bgpapi.Family_SAFI_UNICAST},
+		NeighborIp: "2001:db8::1",
+	}
+	if got := classifyBGPPath(peerUnicast, true); got != bgpPathInjectRoute {
+		t.Fatalf("peer unicast action=%v, want inject route", got)
+	}
+}

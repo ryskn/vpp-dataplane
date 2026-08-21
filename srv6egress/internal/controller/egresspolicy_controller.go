@@ -21,6 +21,7 @@ import (
 	"net"
 	"slices"
 	"sort"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +36,13 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/srv6egress/internal/config"
 )
 
-const finalizerName = "srv6egress.ryskn.io/finalizer"
+const (
+	finalizerName = "srv6egress.ryskn.io/finalizer"
+
+	// API-injected GoBGP paths live only in memory. Re-assert every healthy
+	// policy so an agent/GoBGP restart self-heals without requiring a CR edit.
+	defaultEgressPolicyReassertInterval = 30 * time.Second
+)
 
 // EgressPolicyReconciler reconciles an EgressPolicy.
 type EgressPolicyReconciler struct {
@@ -90,7 +97,7 @@ func (r *EgressPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	log.Info("reconciled", "name", ep.Name, "color", ep.Spec.Egress.Color,
 		"candidates", len(plan.cc.CandidatePaths), "primary", plan.cc.Primary().Upstream, "endpoint", plan.endpoint)
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: defaultEgressPolicyReassertInterval}, nil
 }
 
 // ensureFinalizer adds the finalizer if missing. It returns done=true when the

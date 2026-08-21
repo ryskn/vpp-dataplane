@@ -1,8 +1,11 @@
 package cni
 
 import (
+	"errors"
 	"fmt"
 	"net"
+
+	govppapi "go.fd.io/govpp/api"
 
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/srv6egress"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
@@ -14,7 +17,7 @@ import (
 // cache, so it can scope each EgressPolicy steering to the matched pod's
 // per-pod VRF (V6VrfID). Only that pod's traffic to DestPrefix is steered into
 // the SR Policy identified by BSID; the SR Policy itself (BSID → segment list)
-// is installed independently by the BGP watcher.
+// is installed independently by the SRv6 connectivity provider from BGP intent.
 
 // InstallSteering implements srv6egress.VPPInterface.
 func (s *Server) InstallSteering(req srv6egress.SteeringRequest) error {
@@ -32,7 +35,14 @@ func (s *Server) RemoveSteering(req srv6egress.SteeringRequest) error {
 	if err != nil {
 		return err
 	}
-	return s.vpp.DelSRv6Steering(steer)
+	if err := s.vpp.DelSRv6Steering(steer); err != nil {
+		var vppErr govppapi.VPPApiError
+		if errors.As(err, &vppErr) && (vppErr == govppapi.NO_SUCH_INNER_FIB || vppErr == govppapi.UNSPECIFIED) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // InstallBlackhole implements srv6egress.VPPInterface. It installs a drop route

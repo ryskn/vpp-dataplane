@@ -442,6 +442,34 @@ func (s *Server) injectSRv6Policy(path *bgpapi.Path) error {
 	return nil
 }
 
+type bgpPathAction uint8
+
+const (
+	bgpPathIgnore bgpPathAction = iota
+	bgpPathInjectRoute
+	bgpPathInjectSRPolicy
+)
+
+// classifyBGPPath keeps locally originated unicast routes out of VPP while
+// allowing SR Policies injected through the local GoBGP API. GoBGP reports
+// those API-injected paths with NeighborIp "<nil>" (or empty), exactly like
+// the agent's own paths, so the address-family check must happen first.
+func classifyBGPPath(path *bgpapi.Path, srv6Enabled bool) bgpPathAction {
+	if path == nil || path.GetFamily() == nil {
+		return bgpPathIgnore
+	}
+	if path.GetFamily().GetSafi() == bgpapi.Family_SAFI_SR_POLICY {
+		if srv6Enabled {
+			return bgpPathInjectSRPolicy
+		}
+		return bgpPathIgnore
+	}
+	if path.GetNeighborIp() == "<nil>" || path.GetNeighborIp() == "" { // Weird GoBGP API behaviour
+		return bgpPathIgnore
+	}
+	return bgpPathInjectRoute
+}
+
 func (s *Server) startBGPMonitoring() (func(), error) {
 	nodeIP4, nodeIP6 := common.GetBGPSpecAddresses(s.nodeBGPSpec)
 	ctx, stopFunc := context.WithCancel(context.Background())
@@ -450,6 +478,10 @@ func (s *Server) startBGPMonitoring() (func(), error) {
 			Table: &bgpapi.WatchEventRequest_Table{
 				Filters: []*bgpapi.WatchEventRequest_Table_Filter{{
 					Type: bgpapi.WatchEventRequest_Table_Filter_BEST,
+					// Replay already-selected paths as well as future changes. This
+					// closes the startup race where a controller/peer announces before
+					// the agent has registered its watcher.
+					Init: true,
 				}},
 			},
 		},
@@ -468,11 +500,16 @@ func (s *Server) startBGPMonitoring() (func(), error) {
 						s.log.Debugf("Ignoring ipv6 path with no node ip6")
 						continue
 					}
-					if path.GetNeighborIp() == "<nil>" || path.GetNeighborIp() == "" { // Weird GoBGP API behaviour
-						s.log.Debugf("Ignoring internal path")
+					action := classifyBGPPath(path, *config.GetCalicoVppFeatureGates().SRv6Enabled)
+					switch action {
+					case bgpPathIgnore:
+						if path.GetFamily().GetSafi() == bgpapi.Family_SAFI_SR_POLICY {
+							s.log.Debugf("Ignoring SR Policy path while SRv6 is disabled")
+						} else {
+							s.log.Debugf("Ignoring internal path")
+						}
 						continue
-					}
-					if *config.GetCalicoVppFeatureGates().SRv6Enabled && path.GetFamily().GetSafi() == bgpapi.Family_SAFI_SR_POLICY {
+					case bgpPathInjectSRPolicy:
 						s.log.Debugf("Path SRv6")
 						err := s.injectSRv6Policy(path)
 						if err != nil {
@@ -480,6 +517,7 @@ func (s *Server) startBGPMonitoring() (func(), error) {
 						}
 						continue
 					}
+					// bgpPathInjectRoute
 					s.log.Infof("Got path update from=%s as=%d family=%s", path.GetSourceId(), path.GetSourceAsn(), path.GetFamily())
 					err := s.injectRoute(path)
 					if err != nil {

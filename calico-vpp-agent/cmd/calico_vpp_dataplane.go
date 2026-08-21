@@ -297,13 +297,13 @@ func main() {
 			egressManager := srv6egress.NewManagerWithResolver(egressLog, cniServer, egressResolver)
 			egressResolver.OnChange = egressManager.ReconcileAll
 
-			// Couple steering liveness to SR Policy install/withdraw. The BGP
-			// watcher fires SRv6Policy{Added,Deleted} as BSIDs come and go; we
-			// track the live set so steering is removed (and OnUnavailable
-			// applied) the moment its BSID disappears, instead of blackholing.
+			// Couple steering liveness to confirmed VPP policy state.  The SRv6
+			// connectivity provider emits Installed/Uninstalled only after its
+			// dataplane operation; raw BGP Added/Deleted merely express intent and
+			// may race or fail before the BSID exists in VPP.
 			egressSRPolicyChan := make(chan common.CalicoVppEvent, common.ChanSize)
 			egressSRPolicyReg := common.RegisterHandler(egressSRPolicyChan, "srv6egress SR policy liveness")
-			egressSRPolicyReg.ExpectEvents(common.SRv6PolicyAdded, common.SRv6PolicyDeleted)
+			egressSRPolicyReg.ExpectEvents(common.SRv6PolicyInstalled, common.SRv6PolicyUninstalled)
 			egressWatcher, err := srv6egress.NewWatcher(egressLog, clusterConfig, egressManager)
 			if err != nil {
 				log.WithError(err).Error("srv6egress: watcher init failed; egress steering disabled")
@@ -355,10 +355,9 @@ func main() {
 						log.WithError(err).Error("srv6egress: resolver start failed; egress steering disabled")
 						return nil
 					}
-					// Feed SR Policy liveness events to the manager: extract the
-					// BSID from the NodeConnectivity carried by the event and mark
-					// it live/absent. Added carries event.New, Deleted carries
-					// event.Old; both wrap a *common.SRv6Tunnel with .Bsid.
+					// Feed confirmed SR Policy dataplane state to the manager:
+					// Installed carries event.New, Uninstalled carries event.Old;
+					// both wrap a *common.SRv6Tunnel with .Bsid.
 					go func() {
 						for {
 							select {
@@ -367,9 +366,9 @@ func main() {
 							case evt := <-egressSRPolicyChan:
 								var cn *common.NodeConnectivity
 								switch evt.Type {
-								case common.SRv6PolicyAdded:
+								case common.SRv6PolicyInstalled:
 									cn, _ = evt.New.(*common.NodeConnectivity)
-								case common.SRv6PolicyDeleted:
+								case common.SRv6PolicyUninstalled:
 									cn, _ = evt.Old.(*common.NodeConnectivity)
 								default:
 									continue
@@ -378,7 +377,7 @@ func main() {
 								if bsid == nil {
 									continue
 								}
-								if evt.Type == common.SRv6PolicyAdded {
+								if evt.Type == common.SRv6PolicyInstalled {
 									egressManager.OnSRPolicyAdded(bsid)
 								} else {
 									egressManager.OnSRPolicyDeleted(bsid)

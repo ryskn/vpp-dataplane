@@ -20,6 +20,7 @@ import (
 // "AddSRv6Steering happened before DelSRv6Policy".
 type fakeSRv6VPP struct {
 	steering []*types.SrSteer
+	policies []*types.SrPolicy
 
 	addModPolicy []*types.SrPolicy
 	delPolicy    []*types.SrPolicy
@@ -43,7 +44,7 @@ type fakeSRv6VPP struct {
 func (f *fakeSRv6VPP) ListSRv6Localsid() ([]*types.SrLocalsid, error) { return nil, nil }
 func (f *fakeSRv6VPP) AddSRv6Localsid(*types.SrLocalsid) error        { return nil }
 func (f *fakeSRv6VPP) DelSRv6Localsid(*types.SrLocalsid) error        { return nil }
-func (f *fakeSRv6VPP) ListSRv6Policies() ([]*types.SrPolicy, error)   { return nil, nil }
+func (f *fakeSRv6VPP) ListSRv6Policies() ([]*types.SrPolicy, error)   { return f.policies, nil }
 func (f *fakeSRv6VPP) SetEncapSource(net.IP) error                    { return nil }
 func (f *fakeSRv6VPP) RouteAdd(r *types.Route) error                  { f.routeAdd = append(f.routeAdd, r); return nil }
 func (f *fakeSRv6VPP) RouteDel(r *types.Route) error                  { f.routeDel = append(f.routeDel, r); return nil }
@@ -51,25 +52,66 @@ func (f *fakeSRv6VPP) RouteDel(r *types.Route) error                  { f.routeD
 func (f *fakeSRv6VPP) AddModSRv6Policy(p *types.SrPolicy) error {
 	f.addModPolicy = append(f.addModPolicy, p)
 	f.callLog = append(f.callLog, "AddModSRv6Policy:"+p.Bsid.String())
-	return f.addModPolicyErr
+	if f.addModPolicyErr != nil {
+		return f.addModPolicyErr
+	}
+	for i := range f.policies {
+		if f.policies[i].Bsid == p.Bsid {
+			f.policies[i] = cloneSRPolicy(p)
+			return nil
+		}
+	}
+	f.policies = append(f.policies, cloneSRPolicy(p))
+	return nil
 }
 func (f *fakeSRv6VPP) DelSRv6Policy(p *types.SrPolicy) error {
 	f.delPolicy = append(f.delPolicy, p)
 	f.callLog = append(f.callLog, "DelSRv6Policy:"+p.Bsid.String())
-	return f.delPolicyErr
+	if f.delPolicyErr != nil {
+		return f.delPolicyErr
+	}
+	remaining := f.policies[:0]
+	for _, policy := range f.policies {
+		if policy.Bsid != p.Bsid {
+			remaining = append(remaining, policy)
+		}
+	}
+	f.policies = remaining
+	return nil
 }
 func (f *fakeSRv6VPP) AddSRv6Steering(s *types.SrSteer) error {
 	f.addSteering = append(f.addSteering, s)
 	f.callLog = append(f.callLog, "AddSRv6Steering:"+s.Bsid.String())
+	for i := range f.steering {
+		if sameSteeringKey(f.steering[i], s) {
+			f.steering[i] = s
+			return nil
+		}
+	}
+	f.steering = append(f.steering, s)
 	return nil
 }
 func (f *fakeSRv6VPP) DelSRv6Steering(s *types.SrSteer) error {
 	f.delSteering = append(f.delSteering, s)
 	f.callLog = append(f.callLog, "DelSRv6Steering:"+s.Bsid.String())
-	return f.delSteeringErr
+	if f.delSteeringErr != nil {
+		return f.delSteeringErr
+	}
+	remaining := f.steering[:0]
+	for _, steering := range f.steering {
+		if !sameSteeringKey(steering, s) {
+			remaining = append(remaining, steering)
+		}
+	}
+	f.steering = remaining
+	return nil
 }
 func (f *fakeSRv6VPP) ListSRv6Steering() ([]*types.SrSteer, error) {
-	return f.steering, f.listSteeringErr
+	return append([]*types.SrSteer(nil), f.steering...), f.listSteeringErr
+}
+
+func sameSteeringKey(a, b *types.SrSteer) bool {
+	return a.TrafficType == b.TrafficType && a.FibTable == b.FibTable && a.SwIfIndex == b.SwIfIndex && a.Prefix == b.Prefix
 }
 
 func (f *fakeSRv6VPP) RouteLookup(dst *net.IPNet, tableID uint32) (*types.Route, error) {
@@ -90,8 +132,10 @@ func newTestProvider(fake *fakeSRv6VPP) *SRv6Provider {
 		vpp:                      fake,
 		nodePrefixes:             make(map[string]*NodeToPrefixes),
 		nodePolices:              make(map[string]*NodeToPolicies),
+		installedPolicies:        make(map[string]installedSRPolicy),
 		dynBsids:                 make(map[string]ip_types.IP6Address),
 		droppedPrefixes:          make(map[string]dropState),
+		policyEvent:              func(common.CalicoVppEvent) {},
 	}
 	// Deterministic fake BSID allocator; tests asserting IPAM interplay override.
 	next := 0
@@ -484,6 +528,157 @@ func TestDelPrefixSteering_NormalPrefixDeletesSteeringAndPrunesCache(t *testing.
 	}
 }
 
+// SR Policy SAFI advertisements are useful beyond ordinary inter-node
+// connectivity.  srv6egress has no node prefix for the policy endpoint; it
+// installs per-pod-VRF steering separately.  The provider must therefore put
+// every <endpoint,color> policy in VPP without waiting for nodePrefixes.
+func TestAddConnectivity_StandalonePoliciesInstalledPerColor(t *testing.T) {
+	dst := net.ParseIP("fd00:1::10")
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+	var events []common.CalicoVppEvent
+	p.policyEvent = func(event common.CalicoVppEvent) { events = append(events, event) }
+
+	for _, tc := range []struct {
+		color uint32
+		bsid  string
+		sid   string
+	}{
+		{color: 100, bsid: "cafe::64", sid: "fcbb:bbbb:4:a1::"},
+		{color: 200, bsid: "cafe::c8", sid: "fcbb:bbbb:4:b1::"},
+	} {
+		sids := [16]ip_types.IP6Address{}
+		sids[0] = mustBsid(t, tc.sid)
+		tunnel := &common.SRv6Tunnel{
+			Dst: dst, Color: tc.color, Distinguisher: 1, Behavior: testDT6Behavior, Preference: 200,
+			Policy: &types.SrPolicy{
+				Bsid:     mustBsid(t, tc.bsid),
+				IsEncap:  true,
+				SidLists: []types.Srv6SidList{{NumSids: 1, Weight: 1, Sids: sids}},
+			},
+		}
+		if err := p.AddConnectivity(&common.NodeConnectivity{NextHop: dst, Custom: tunnel}); err != nil {
+			t.Fatalf("AddConnectivity color=%d: %v", tc.color, err)
+		}
+	}
+
+	if len(p.nodePrefixes) != 0 {
+		t.Fatalf("test unexpectedly created node prefixes: %+v", p.nodePrefixes)
+	}
+	if len(fake.policies) != 2 {
+		t.Fatalf("VPP policies=%d, want both colors installed: %+v", len(fake.policies), fake.policies)
+	}
+	gotBSIDs := map[string]bool{}
+	for _, policy := range fake.policies {
+		gotBSIDs[policy.Bsid.String()] = true
+	}
+	for _, want := range []string{"cafe::64", "cafe::c8"} {
+		if !gotBSIDs[want] {
+			t.Fatalf("VPP policy %s missing; got %v", want, gotBSIDs)
+		}
+	}
+	if len(events) != 2 {
+		t.Fatalf("dataplane events=%d, want one successful install per color: %+v", len(events), events)
+	}
+	for _, event := range events {
+		if event.Type != common.SRv6PolicyInstalled {
+			t.Fatalf("event type=%s, want %s", event.Type, common.SRv6PolicyInstalled)
+		}
+	}
+}
+
+func TestAddConnectivity_PolicyLivenessOnlyAfterSuccessfulVPPInstall(t *testing.T) {
+	dst := net.ParseIP("fd00:1::10")
+	fake := &fakeSRv6VPP{addModPolicyErr: fmt.Errorf("injected VPP failure")}
+	p := newTestProvider(fake)
+	var events []common.CalicoVppEvent
+	p.policyEvent = func(event common.CalicoVppEvent) { events = append(events, event) }
+	tunnel := &common.SRv6Tunnel{
+		Dst: dst, Color: 100, Distinguisher: 1, Preference: 200,
+		Policy: &types.SrPolicy{Bsid: mustBsid(t, "cafe::64"), SidLists: []types.Srv6SidList{{NumSids: 1}}},
+	}
+	if err := p.AddConnectivity(&common.NodeConnectivity{NextHop: dst, Custom: tunnel}); err == nil {
+		t.Fatal("expected VPP install failure")
+	}
+	if len(events) != 0 {
+		t.Fatalf("failed install must not publish liveness, got %+v", events)
+	}
+	if len(p.installedPolicies) != 0 {
+		t.Fatalf("failed install recorded as live: %+v", p.installedPolicies)
+	}
+}
+
+func TestAddConnectivity_UnchangedReassertEmitsHeartbeatWithoutPolicyChurn(t *testing.T) {
+	dst := net.ParseIP("fd00:1::10")
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+	var events []common.CalicoVppEvent
+	p.policyEvent = func(event common.CalicoVppEvent) { events = append(events, event) }
+	tunnel := &common.SRv6Tunnel{
+		Dst: dst, Color: 100, Distinguisher: 1, Preference: 200,
+		Policy: &types.SrPolicy{Bsid: mustBsid(t, "cafe::64"), SidLists: []types.Srv6SidList{{NumSids: 1}}},
+	}
+	for i := 0; i < 2; i++ {
+		if err := p.AddConnectivity(&common.NodeConnectivity{NextHop: dst, Custom: tunnel}); err != nil {
+			t.Fatalf("AddConnectivity pass %d: %v", i+1, err)
+		}
+	}
+	if len(fake.addModPolicy) != 1 {
+		t.Fatalf("unchanged reassert rebuilt VPP policy %d times, want 1", len(fake.addModPolicy))
+	}
+	if len(events) != 2 || events[0].Type != common.SRv6PolicyInstalled || events[1].Type != common.SRv6PolicyInstalled {
+		t.Fatalf("expected two successful install heartbeats, got %+v", events)
+	}
+}
+
+func TestDelSRPolicy_StandaloneCandidateFailoverPublishesDataplaneTransition(t *testing.T) {
+	dst := net.ParseIP("fd00:1::10")
+	bsid := mustBsid(t, "cafe::64")
+	fake := &fakeSRv6VPP{}
+	p := newTestProvider(fake)
+	var events []common.CalicoVppEvent
+	p.policyEvent = func(event common.CalicoVppEvent) { events = append(events, event) }
+
+	makeTunnel := func(distinguisher, preference uint32, sid string) *common.SRv6Tunnel {
+		sids := [16]ip_types.IP6Address{}
+		sids[0] = mustBsid(t, sid)
+		return &common.SRv6Tunnel{
+			Dst: dst, Color: 100, Distinguisher: distinguisher, Preference: preference,
+			Policy: &types.SrPolicy{Bsid: bsid, IsEncap: true, SidLists: []types.Srv6SidList{{NumSids: 1, Weight: 1, Sids: sids}}},
+		}
+	}
+	high := makeTunnel(1, 200, "fcbb:bbbb:4:a1::")
+	low := makeTunnel(2, 100, "fcbb:bbbb:4:a2::")
+	for _, tunnel := range []*common.SRv6Tunnel{high, low} {
+		if err := p.AddConnectivity(&common.NodeConnectivity{NextHop: dst, Custom: tunnel}); err != nil {
+			t.Fatalf("AddConnectivity: %v", err)
+		}
+	}
+
+	if err := p.delSRPolicy(&common.NodeConnectivity{Custom: &common.SRv6Tunnel{
+		Dst: dst, Color: 100, Distinguisher: 1,
+	}}); err != nil {
+		t.Fatalf("delSRPolicy: %v", err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("events=%d, want install, heartbeat, uninstall, install: %+v", len(events), events)
+	}
+	wantTypes := []common.CalicoVppEventType{
+		common.SRv6PolicyInstalled,
+		common.SRv6PolicyInstalled,
+		common.SRv6PolicyUninstalled,
+		common.SRv6PolicyInstalled,
+	}
+	for i := range wantTypes {
+		if events[i].Type != wantTypes[i] {
+			t.Fatalf("event[%d]=%s, want %s (all=%+v)", i, events[i].Type, wantTypes[i], events)
+		}
+	}
+	if len(fake.policies) != 1 || fake.policies[0].SidLists[0].Sids[0] != mustBsid(t, "fcbb:bbbb:4:a2::") {
+		t.Fatalf("surviving candidate not installed: %+v", fake.policies)
+	}
+}
+
 // ---------- DelConnectivity dispatcher ----------
 
 // Re-advertising an SR Policy with the SAME NLRI key (Color, Distinguisher,
@@ -552,8 +747,9 @@ func TestAddConnectivity_BsidChangeOnUpsertCleansUpOldBsid(t *testing.T) {
 	fake := &fakeSRv6VPP{}
 	p := newTestProvider(fake)
 
-	// First advertisement: cached, no VPP install (no nodePrefixes wired up
-	// for the test — we just exercise the cache + cleanup path).
+	// The deliberately incomplete candidates have no SID lists, so they remain
+	// cached but are not installable.  This test isolates the BSID replacement
+	// and deferred cleanup path.
 	if err := p.AddConnectivity(&common.NodeConnectivity{
 		NextHop: dst,
 		Custom: &common.SRv6Tunnel{

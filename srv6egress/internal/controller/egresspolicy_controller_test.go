@@ -189,6 +189,19 @@ func reconcile(t *testing.T, r *EgressPolicyReconciler, name string) error {
 	return err
 }
 
+func TestReconcileSchedulesBGPReassert(t *testing.T) {
+	r := newReconciler(t, egressNode("gw-a"), newPolicy("tenant-a", "uid-a", 100))
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "tenant-a"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != defaultEgressPolicyReassertInterval {
+		t.Fatalf("RequeueAfter=%v, want %v", res.RequeueAfter, defaultEgressPolicyReassertInterval)
+	}
+}
+
 func getReady(t *testing.T, r *EgressPolicyReconciler, name string) metav1.Condition {
 	t.Helper()
 	var ep srv6egressv1.EgressPolicy

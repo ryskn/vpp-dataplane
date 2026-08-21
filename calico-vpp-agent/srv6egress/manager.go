@@ -24,9 +24,10 @@ type Manager struct {
 	mu       sync.Mutex
 	policies map[string]*policyState // key = EgressPolicy.UID
 	// liveBSIDs is the set of SR Policy BSIDs currently installed in the
-	// dataplane (key = bsid.String()), tracked from the BGP watcher's
-	// SRv6PolicyAdded/Deleted events. Steering is only installed for a policy
-	// whose resolved BSID is live; otherwise OnUnavailable applies.
+	// dataplane (key = bsid.String()), tracked from the connectivity provider's
+	// confirmed SRv6PolicyInstalled/Uninstalled events. Steering is only
+	// installed for a policy whose resolved BSID is live; otherwise
+	// OnUnavailable applies.
 	liveBSIDs map[string]struct{}
 }
 
@@ -115,8 +116,8 @@ func (m *Manager) reconcileAllLocked() {
 	}
 }
 
-// OnSRPolicyAdded marks bsid live (the BGP watcher installed the SR Policy in
-// VPP) and re-reconciles, so any policy whose status BSID matches gets steered.
+// OnSRPolicyAdded marks a provider-confirmed VPP BSID live and re-reconciles,
+// so any policy whose status BSID matches gets steered.
 func (m *Manager) OnSRPolicyAdded(bsid net.IP) {
 	if bsid == nil {
 		return
@@ -127,9 +128,9 @@ func (m *Manager) OnSRPolicyAdded(bsid net.IP) {
 	m.reconcileAllLocked()
 }
 
-// OnSRPolicyDeleted marks bsid absent (the BGP watcher withdrew the SR Policy
-// from VPP) and re-reconciles, so any policy relying on it falls back per its
-// OnUnavailable mode instead of blackholing into a now-missing BSID.
+// OnSRPolicyDeleted marks a provider-confirmed VPP BSID absent and
+// re-reconciles, so any policy relying on it falls back per its OnUnavailable
+// mode instead of blackholing into a now-missing BSID.
 func (m *Manager) OnSRPolicyDeleted(bsid net.IP) {
 	if bsid == nil {
 		return

@@ -47,6 +47,15 @@ type NodeToPolicies struct {
 	SRv6Tunnel []common.SRv6Tunnel
 }
 
+// installedSRPolicy is the last successfully reconciled dataplane state for
+// one RFC 9256 SR Policy <endpoint, color>.  Candidate paths are selected
+// inside that policy; different colors on the same endpoint must coexist in
+// VPP under their distinct BSIDs.
+type installedSRPolicy struct {
+	tunnel common.SRv6Tunnel
+	policy *types.SrPolicy
+}
+
 // srv6VppAPI is the subset of *vpplink.VppLink SRv6Provider uses, so tests can
 // substitute a fake.
 type srv6VppAPI interface {
@@ -92,6 +101,11 @@ type SRv6Provider struct {
 	// pendingBsidCleanup holds prior BSIDs not yet freeable (a steering still
 	// resolves through them); drained on later SR-policy events to avoid leaks.
 	pendingBsidCleanup []ip_types.IP6Address
+	// installedPolicies tracks successful VPP installs by <endpoint,color>.
+	// It both suppresses unchanged AddMod churn and lets us publish dataplane
+	// liveness transitions (as opposed to raw BGP intent) to srv6egress.
+	installedPolicies map[string]installedSRPolicy
+	policyEvent       func(common.CalicoVppEvent)
 
 	// dynBsids maps "<endpoint>|<color>" to the BSID dynamically bound to that
 	// SR Policy (RFC 9256 §6.2.1) when candidates arrive without one. The
@@ -124,6 +138,7 @@ func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
 		nodePolices:              make(map[string]*NodeToPolicies),
 		dsrServices:              make(map[string]*dsrServiceState),
 		dsrDesired:               make(map[string]*common.DSRService),
+		installedPolicies:        make(map[string]installedSRPolicy),
 		dynBsids:                 make(map[string]ip_types.IP6Address),
 		droppedPrefixes:          make(map[string]dropState),
 	}
@@ -133,6 +148,7 @@ func NewSRv6Provider(d *ConnectivityProviderData) *SRv6Provider {
 	}
 	p.allocBsid = p.ipamAllocBsid
 	p.releaseBsid = p.ipamReleaseBsid
+	p.policyEvent = common.SendEvent
 
 	p.log.Infof("SRv6Provider NewSRv6Provider")
 	return p
@@ -340,15 +356,159 @@ func containsPrefix(prefixes []ip_types.Prefix, p ip_types.Prefix) bool {
 	return false
 }
 
-// AddConnectivity creates dynamic parts of SRv6 tunnel leading to node that we are adding connectivity to.
-// The static parts are created in RescanState.
-// This method doesn't create the needed parts in one pass, you need to call this function 3 times. Once
-// with basic NodeConnectivity data(from common.ConnectivityAdded event) as is done with other connectivity
-// providers, once with data of the SRv6 tunnel(common.SRv6Tunnel) (from common.SRv6PolicyAdded event)
-// that ends in node that we are adding connectivity to and once for create SRv6 traffic forwarding.
-// The SRv6 tunnel info is propagated from tunnel-ending node using BGP(see bgp_watcher.go and
-// srv6_localsid_watcher.go). After these 3 calls (and the RescanState call)
-// you get fully configured SRv6 tunnel with SR steering, SR policy, SR localsids an SRv6 traffic forwarding.
+func srPolicyGroupKey(nodeip string, color uint32) string {
+	return nodeip + "|" + fmt.Sprint(color)
+}
+
+func cloneSRPolicy(policy *types.SrPolicy) *types.SrPolicy {
+	if policy == nil {
+		return nil
+	}
+	cloned := *policy
+	cloned.SidLists = append([]types.Srv6SidList(nil), policy.SidLists...)
+	return &cloned
+}
+
+func sameSRPolicy(a, b *types.SrPolicy) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Bsid != b.Bsid || a.IsSpray != b.IsSpray || a.IsEncap != b.IsEncap || a.FibTable != b.FibTable || len(a.SidLists) != len(b.SidLists) {
+		return false
+	}
+	for i := range a.SidLists {
+		if a.SidLists[i] != b.SidLists[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneInstalledSRPolicy(tunnel *common.SRv6Tunnel, policy *types.SrPolicy) installedSRPolicy {
+	clonedTunnel := *tunnel
+	clonedTunnel.Policy = cloneSRPolicy(policy)
+	clonedTunnel.Bsid = policy.Bsid.ToIP()
+	clonedTunnel.VerifyMasks = append([]uint32(nil), tunnel.VerifyMasks...)
+	return installedSRPolicy{tunnel: clonedTunnel, policy: clonedTunnel.Policy}
+}
+
+func (p *SRv6Provider) emitPolicyState(eventType common.CalicoVppEventType, state installedSRPolicy) {
+	if p.policyEvent == nil || state.policy == nil {
+		return
+	}
+	tunnel := state.tunnel
+	cn := &common.NodeConnectivity{
+		NextHop: tunnel.Dst,
+		Custom:  &tunnel,
+	}
+	event := common.CalicoVppEvent{Type: eventType}
+	if eventType == common.SRv6PolicyInstalled {
+		event.New = cn
+	} else {
+		event.Old = cn
+	}
+	p.policyEvent(event)
+}
+
+// reconcilePolicyColor installs the selected candidate for one RFC 9256 SR
+// Policy <endpoint,color>, even when the endpoint has no ordinary node prefix.
+// That latter case is the srv6egress headend path: EgressPolicy steering refers
+// directly to the policy's BSID from a per-pod VRF.
+//
+// forceTransition is used after a withdraw that removed steering from the
+// selected BSID.  Publishing Uninstalled then Installed makes consumers rebuild
+// their steering even when failover keeps the same BSID.
+func (p *SRv6Provider) reconcilePolicyColor(nodeip string, color uint32, forceTransition bool) error {
+	if p.installedPolicies == nil {
+		p.installedPolicies = make(map[string]installedSRPolicy)
+	}
+	key := srPolicyGroupKey(nodeip, color)
+	prior, hadPrior := p.installedPolicies[key]
+	selected, desired, err := p.getPolicyColor(nodeip, color)
+	if err != nil {
+		return err
+	}
+
+	actual, err := p.vpp.ListSRv6Policies()
+	if err != nil {
+		return errors.Wrapf(err, "SRv6Provider list policies for endpoint=%s color=%d", nodeip, color)
+	}
+
+	if desired == nil {
+		if !hadPrior {
+			return nil
+		}
+		// A policy that became invalid/absent must not leave steering resolving
+		// through its BSID.  Withdraw handling normally removed these already;
+		// the list makes this path idempotent.
+		steering, listErr := p.vpp.ListSRv6Steering()
+		if listErr != nil {
+			return errors.Wrapf(listErr, "SRv6Provider list steering for endpoint=%s color=%d", nodeip, color)
+		}
+		for _, st := range steering {
+			if st.Bsid != prior.policy.Bsid {
+				continue
+			}
+			if err := p.vpp.DelSRv6Steering(st); err != nil && !isAlreadyGoneOnDelete(err) {
+				return errors.Wrapf(err, "SRv6Provider delete steering for bsid=%s", prior.policy.Bsid.String())
+			}
+		}
+		for _, policy := range actual {
+			if policy.Bsid != prior.policy.Bsid {
+				continue
+			}
+			if err := p.vpp.DelSRv6Policy(prior.policy); err != nil && !isAlreadyGoneOnDelete(err) {
+				return errors.Wrapf(err, "SRv6Provider delete policy bsid=%s", prior.policy.Bsid.String())
+			}
+			break
+		}
+		delete(p.installedPolicies, key)
+		p.emitPolicyState(common.SRv6PolicyUninstalled, prior)
+		return nil
+	}
+
+	actualMatches := false
+	actualHasBSID := false
+	for _, policy := range actual {
+		if policy.Bsid != desired.Bsid {
+			continue
+		}
+		actualHasBSID = true
+		actualMatches = sameSRPolicy(policy, desired)
+		break
+	}
+	// Once this provider has recorded the exact desired policy, BSID presence is
+	// enough for an unchanged re-assert.  VPP dumps may normalize otherwise
+	// equivalent list fields; treating that cosmetic difference as drift would
+	// delete/re-add a live policy every 30 seconds.
+	if hadPrior && sameSRPolicy(prior.policy, desired) && actualHasBSID {
+		actualMatches = true
+	}
+	if !actualMatches {
+		if err := p.vpp.AddModSRv6Policy(desired); err != nil {
+			return errors.Wrapf(err, "SRv6Provider install policy endpoint=%s color=%d bsid=%s", nodeip, color, desired.Bsid.String())
+		}
+	}
+
+	next := cloneInstalledSRPolicy(selected, desired)
+	if hadPrior && (forceTransition || !sameSRPolicy(prior.policy, desired) || !actualMatches) {
+		p.emitPolicyState(common.SRv6PolicyUninstalled, prior)
+	}
+	p.installedPolicies[key] = next
+	// Emit a success heartbeat even for an unchanged BGP re-assertion.  The
+	// srv6egress subscriber is registered asynchronously during startup and may
+	// have missed the first install; the controller's periodic re-assert heals it.
+	p.emitPolicyState(common.SRv6PolicyInstalled, next)
+	return nil
+}
+
+// AddConnectivity reconciles the dynamic SRv6 state learned from ordinary
+// ConnectivityAdded events and BGP SRv6PolicyAdded events.  A complete legacy
+// inter-node tunnel is assembled incrementally as its node prefixes and policy
+// arrive.  The policy itself is independently installed as soon as its BGP
+// candidate is usable, allowing consumers such as srv6egress to supply their
+// own steering without an ordinary node prefix.  Static localsids and the
+// encapsulation source are created in RescanState.
 func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 	p.log.Infof("SRv6Provider AddConnectivity %s", cn.String())
 
@@ -357,6 +517,8 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 	// by drainPendingBsidCleanup at function end, after the steering re-point.
 	var orphanedBsid ip_types.IP6Address
 	var orphanedBsidValid bool
+	var policyColor uint32
+	var policyUpdate bool
 
 	// processing normal NodeConnectivity data only IPv6 destination
 	if vpplink.IsIP6(cn.NextHop) && !p.isSRv6TunnelInfoFromBGP(cn) {
@@ -416,6 +578,8 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 			return fmt.Errorf("cn.Custom is not a (*common.SRv6Tunnel) %v", cn.Custom)
 		}
 		nodeip = policyData.Dst.String()
+		policyColor = policyData.Color
+		policyUpdate = true
 		if p.nodePolices[policyData.Dst.String()] == nil {
 			p.nodePolices[policyData.Dst.String()] = &NodeToPolicies{
 				Node:       policyData.Dst,
@@ -459,6 +623,15 @@ func (p *SRv6Provider) AddConnectivity(cn *common.NodeConnectivity) error {
 	// We got all needed data (normal common.NodeConnectivity and SRv6 tunnel info from tunnel-end node transported by BGP)
 	// we can create dynamic parts of SRv6 tunnel (SR steering and SR policy)
 	p.installNode(nodeip)
+	if policyUpdate {
+		// SR Policies are first-class dataplane objects keyed by
+		// <endpoint,color>.  Install them even when no ordinary node prefix exists;
+		// srv6egress adds its own per-pod-VRF steering to their BSIDs.
+		if err := p.reconcilePolicyColor(nodeip, policyColor, false); err != nil {
+			p.drainPendingBsidCleanup(orphanedBsid, orphanedBsidValid)
+			return err
+		}
+	}
 
 	p.drainPendingBsidCleanup(orphanedBsid, orphanedBsidValid)
 
@@ -520,6 +693,23 @@ func (p *SRv6Provider) revalidatePolicies() {
 	sort.Slice(items, func(i, j int) bool { return items[i].prio < items[j].prio })
 	for _, it := range items {
 		p.installNode(it.nodeip)
+		entry := p.nodePolices[it.nodeip]
+		colorsSeen := make(map[uint32]struct{}, len(entry.SRv6Tunnel))
+		colors := make([]uint32, 0, len(entry.SRv6Tunnel))
+		for i := range entry.SRv6Tunnel {
+			color := entry.SRv6Tunnel[i].Color
+			if _, seen := colorsSeen[color]; seen {
+				continue
+			}
+			colorsSeen[color] = struct{}{}
+			colors = append(colors, color)
+		}
+		sort.Slice(colors, func(i, j int) bool { return colors[i] < colors[j] })
+		for _, color := range colors {
+			if err := p.reconcilePolicyColor(it.nodeip, color, false); err != nil {
+				p.log.Errorf("SRv6Provider revalidate endpoint=%s color=%d: %v", it.nodeip, color, err)
+			}
+		}
 	}
 }
 
@@ -668,13 +858,26 @@ func (p *SRv6Provider) delSRPolicy(cn *common.NodeConnectivity) error {
 	// candidate of its SR Policy <endpoint, color> is gone.
 	p.releaseUnusedDynBsids(nodeip, policyData.Color, remaining)
 
-	// AddConnectivity only installs the selected candidate per behavior;
-	// other survivors are cached but absent from VPP. Track which we
-	// install on demand here so multiple orphaned prefixes targeting the same
-	// surviving BSID don't churn the install.
+	// Generic node-prefix steering uses the selected candidate per behavior.
+	// Track which survivor we install on demand here so multiple orphaned
+	// prefixes targeting the same BSID do not churn that install.  The
+	// endpoint+color reconciliation below then confirms/publishes final policy
+	// state for standalone consumers too.
 	installed := make(map[ip_types.IP6Address]struct{})
 	for _, st := range orphaned {
 		p.resteerOrphan(nodeip, st, installed, dropRequested)
+	}
+	forceTransition := false
+	if prior, ok := p.installedPolicies[srPolicyGroupKey(nodeip, policyData.Color)]; ok && prior.policy != nil {
+		for _, bsid := range matched {
+			if bsid == prior.policy.Bsid {
+				forceTransition = true
+				break
+			}
+		}
+	}
+	if err := p.reconcilePolicyColor(nodeip, policyData.Color, forceTransition); err != nil {
+		return errors.Wrapf(err, "SRv6Provider reconcile withdrawn policy endpoint=%s color=%d", nodeip, policyData.Color)
 	}
 	return nil
 }
@@ -867,6 +1070,45 @@ func (p *SRv6Provider) getPolicyNode(nodeip string, behavior types.SrBehavior) (
 			bestPolicy.Bsid.String(), best.Preference, best.Distinguisher)
 	}
 	return bestPolicy, nil
+}
+
+// getPolicyColor selects the active candidate inside one SR Policy
+// <endpoint,color>.  Unlike getPolicyNode (the legacy node-connectivity lookup
+// by terminal behavior), this preserves independent policies of the same
+// behavior on one endpoint -- exactly the shape used by srv6egress colors.
+func (p *SRv6Provider) getPolicyColor(nodeip string, color uint32) (*common.SRv6Tunnel, *types.SrPolicy, error) {
+	p.log.Debugf("SRv6Provider getPolicyColor node=%s color=%d", nodeip, color)
+	entry := p.nodePolices[nodeip]
+	if entry == nil {
+		return nil, nil, nil
+	}
+
+	reach := map[string]bool{}
+	var best *common.SRv6Tunnel
+	var bestPolicy *types.SrPolicy
+	for i := range entry.SRv6Tunnel {
+		tunnel := &entry.SRv6Tunnel[i]
+		if tunnel.Color != color || tunnel.Policy == nil {
+			continue
+		}
+		if !p.ensureBsid(nodeip, tunnel) {
+			continue
+		}
+		policy := p.usablePolicy(nodeip, tunnel, reach)
+		if policy == nil {
+			continue
+		}
+		if best == nil || preferredCandidate(tunnel, best) {
+			best, bestPolicy = tunnel, policy
+		}
+	}
+	if bestPolicy == nil {
+		p.log.Debugf("SRv6Provider getPolicyColor: no valid candidate for node=%s color=%d", nodeip, color)
+		return nil, nil, nil
+	}
+	p.log.Debugf("SRv6Provider getPolicyColor: selected bsid=%s color=%d preference=%d discriminator=%d",
+		bestPolicy.Bsid.String(), color, best.Preference, best.Distinguisher)
+	return best, bestPolicy, nil
 }
 
 // preferredCandidate reports whether a beats b per RFC 9256 §2.9: higher

@@ -1,10 +1,13 @@
 package bgp
 
 import (
+	"context"
 	"net"
 	"testing"
+	"time"
 
 	api "github.com/osrg/gobgp/v3/api"
+	bgpserver "github.com/osrg/gobgp/v3/pkg/server"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -231,5 +234,81 @@ func TestSRPolicyEndpointIP_RejectsNonIPv6(t *testing.T) {
 	}
 	if _, err := d.endpointIP(PolicyKey{EndpointAddr: "fd00:1::14"}); err != nil {
 		t.Fatalf("valid IPv6 endpoint rejected: %v", err)
+	}
+}
+
+// A controller connected to the agent's local GoBGP uses AddPath rather than
+// an eBGP session. Keep an integration check around that exact boundary: the
+// path must enter the global RIB and BEST-path watchers must receive it.
+func TestSRPolicyPath_LocalAddPathIsWatchable(t *testing.T) {
+	s := bgpserver.NewBgpServer()
+	go s.Serve()
+	if err := s.StartBgp(context.Background(), &api.StartBgpRequest{Global: &api.Global{
+		Asn:        65001,
+		RouterId:   "10.0.0.1",
+		ListenPort: -1,
+	}}); err != nil {
+		t.Fatalf("StartBgp: %v", err)
+	}
+	defer s.StopBgp(context.Background(), &api.StopBgpRequest{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gotPath := make(chan *api.Path, 1)
+	if err := s.WatchEvent(ctx, &api.WatchEventRequest{
+		Table: &api.WatchEventRequest_Table{
+			Filters: []*api.WatchEventRequest_Table_Filter{{
+				Type: api.WatchEventRequest_Table_Filter_BEST,
+			}},
+		},
+	}, func(resp *api.WatchEventResponse) {
+		for _, path := range resp.GetTable().GetPaths() {
+			if path.GetFamily().GetSafi() == api.Family_SAFI_SR_POLICY {
+				select {
+				case gotPath <- path:
+				default:
+				}
+			}
+		}
+	}); err != nil {
+		t.Fatalf("WatchEvent: %v", err)
+	}
+
+	p, err := testSRDist().srPolicyPath(
+		100, 1, 200,
+		net.ParseIP("fd00:1::10").To16(),
+		testBSID,
+		[]string{"fcff:0:0:e0:a::"},
+	)
+	if err != nil {
+		t.Fatalf("srPolicyPath: %v", err)
+	}
+	if _, err := s.AddPath(context.Background(), &api.AddPathRequest{
+		TableType: api.TableType_GLOBAL,
+		Path:      p,
+	}); err != nil {
+		t.Fatalf("AddPath: %v", err)
+	}
+
+	var destinations int
+	if err := s.ListPath(context.Background(), &api.ListPathRequest{
+		TableType: api.TableType_GLOBAL,
+		Family:    srPolicyFamily,
+	}, func(d *api.Destination) {
+		destinations++
+	}); err != nil {
+		t.Fatalf("ListPath: %v", err)
+	}
+	if destinations != 1 {
+		t.Fatalf("SR Policy destinations=%d, want 1", destinations)
+	}
+
+	select {
+	case got := <-gotPath:
+		if got.GetNeighborIp() != "<nil>" {
+			t.Fatalf("local AddPath NeighborIp=%q, want <nil>", got.GetNeighborIp())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BEST-path watcher did not receive locally added SR Policy")
 	}
 }
