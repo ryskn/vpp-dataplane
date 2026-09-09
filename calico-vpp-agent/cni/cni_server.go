@@ -106,6 +106,25 @@ type Server struct {
 	createVppInterfaceFn func(podSpec *model.LocalPodSpec, doHostSideConf bool) (uint32, error)
 	// delVppInterfaceFn overrides the teardown step, for the same reason.
 	delVppInterfaceFn func(podSpec *model.LocalPodSpec)
+	// realizePodInterfacesFn overrides the part of AddVppInterface that needs a
+	// live VPP: the per-pod VRFs, the interfaces and their routing. It exists
+	// so that the publication barrier around it — where the binding ADD sits
+	// relative to the cleanup stack and to the success return — can be run and
+	// observed without VPP (Issue #135 pre-merge item 3). Production leaves it
+	// nil and realizePodInterfaces is used.
+	realizePodInterfacesFn func(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack, doHostSideConf bool) (uint32, bool, error)
+	// vrfsExistInVppFn overrides the observation of whether the per-pod VRFs
+	// are already in VPP, for the same reason.
+	vrfsExistInVppFn func(podSpec *model.LocalPodSpec) bool
+}
+
+// vrfsExistInVpp reports whether the per-pod VRFs of this pod spec are already
+// in VPP (see v4v6VrfsExistInVPP).
+func (s *Server) vrfsExistInVpp(podSpec *model.LocalPodSpec) bool {
+	if s.vrfsExistInVppFn != nil {
+		return s.vrfsExistInVppFn(podSpec)
+	}
+	return s.v4v6VrfsExistInVPP(podSpec)
 }
 
 // createVppInterface creates the Pod-facing VPP interface and publishes its

@@ -96,10 +96,19 @@ func (stack *CleanupStack) Push(f interface{}, args ...interface{}) {
 	})
 }
 
-func (v *VppLink) NewCleanupStack() *CleanupStack {
+// NewCleanupStack returns an empty cleanup stack.
+//
+// It needs no VPP connection: a cleanup stack only remembers the calls its
+// user pushed onto it. Having it as a package function is what lets code that
+// owns a stack be exercised without one.
+func NewCleanupStack() *CleanupStack {
 	return &CleanupStack{
 		calls: make([]CleanupCall, 0),
 	}
+}
+
+func (v *VppLink) NewCleanupStack() *CleanupStack {
+	return NewCleanupStack()
 }
 
 func (v *VppLink) Retry(sleepBtwRetries time.Duration, retries int, f interface{}, args ...interface{}) (err error) {

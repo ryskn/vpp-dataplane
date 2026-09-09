@@ -130,6 +130,12 @@ func (s *Server) removeConflictingContainers(newAddresses []net.IP, networkName 
 
 // AddVppInterface performs the networking for the given config and IPAM result
 func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf bool) (tunTapSwIfIndex uint32, err error) {
+	// Declared here because the error path below is reached with goto, which
+	// cannot jump over a declaration.
+	var stack *vpplink.CleanupStack
+	var earlySwIfIndex uint32
+	var done bool
+
 	err = ns.IsNSorErr(podSpec.NetnsName)
 	if err != nil {
 		return vpplink.InvalidID, PodNSNotFoundErr{podSpec.NetnsName}
@@ -146,7 +152,7 @@ func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf boo
 
 	// Check if the VRFs already exist in VPP,
 	// if yes we postulate the pod is already well setup
-	if s.v4v6VrfsExistInVPP(podSpec) {
+	if s.vrfsExistInVpp(podSpec) {
 		s.log.Infof("VRF already exists in VPP podSpec=%s", podSpec.Key())
 		if s.ifBinding != nil {
 			// The VRFs surviving is not evidence that the interface did.
@@ -194,14 +200,72 @@ func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf boo
 	// As we did not find the VRF in VPP, we shouldn't find
 	// ourselves in s.podInterfaceMap
 	s.removeConflictingContainers(podSpec.ContainerIPs, podSpec.NetworkName)
-	var swIfIndex uint32
-	var isL3 bool
-	stack := s.vpp.NewCleanupStack()
-	var vni uint32
+	stack = vpplink.NewCleanupStack()
 	err = s.checkAvailableBuffers(podSpec)
 	if err != nil {
 		goto err
 	}
+
+	// Everything that needs a live VPP happens here, under the cleanup stack
+	// this function owns.
+	earlySwIfIndex, done, err = s.realizePodDataplane(podSpec, stack, doHostSideConf)
+	if err != nil {
+		goto err
+	}
+	if done {
+		// A memif in a secondary network is reported without a binding: the
+		// lifecycle profile rejects that combination at the request, and the
+		// Calico backend publishes no bindings at all. Keeping the early
+		// return here preserves what that path did before.
+		return earlySwIfIndex, nil
+	}
+
+	// Publish the CNI attachment identity against the interface handle that
+	// was just created, and do it here, while the cleanup stack is still in
+	// scope: a failed publication has to roll the interface back and make the
+	// CNI ADD fail (00 §2.12.6, completion criteria 1 and 3 of §2.12.9). This
+	// is the last step of AddVppInterface, so the caller cannot return success
+	// to the CNI before the binding ADD was acknowledged.
+	err = s.publishIfAttachment(podSpec, stack)
+	if err != nil {
+		s.log.Errorf("failed to publish the CNI attachment binding: %s", err)
+		goto err
+	}
+	return podSpec.TunTapSwIfIndex, err
+
+err:
+	s.log.Errorf("Error, try a cleanup %+v", err)
+	stack.Execute()
+	return vpplink.InvalidID, errors.Wrapf(err, "Error creating interface")
+
+}
+
+// realizePodDataplane creates the Pod's dataplane, using the seam when a test
+// installed one (see realizePodInterfacesFn).
+func (s *Server) realizePodDataplane(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack, doHostSideConf bool) (uint32, bool, error) {
+	if s.realizePodInterfacesFn != nil {
+		return s.realizePodInterfacesFn(podSpec, stack, doHostSideConf)
+	}
+	return s.realizePodInterfaces(podSpec, stack, doHostSideConf)
+}
+
+// realizePodInterfaces creates the per-pod VRFs, the interfaces themselves and
+// their routing: it is the whole of the ADD that needs a live VPP.
+//
+// It is a separate step from AddVppInterface so that the publication barrier —
+// where the binding ADD sits relative to the cleanup stack and to the success
+// return — is expressed in code that can be run without VPP, and therefore
+// tested rather than only inspected (Issue #135 pre-merge item 3).
+//
+// Everything it creates is pushed onto the caller's cleanup stack, so a failure
+// after it returns still rolls the interface back.
+//
+// done reports the one case that finishes the ADD early: a memif in a secondary
+// network, which is reported by its own sw_if_index and publishes no binding.
+func (s *Server) realizePodInterfaces(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack, doHostSideConf bool) (earlySwIfIndex uint32, done bool, err error) {
+	var swIfIndex uint32
+	var isL3 bool
+	var vni uint32
 
 	s.log.Infof("pod(add) VRF")
 	err = s.CreatePodVRF(podSpec, stack)
@@ -310,7 +374,7 @@ func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf boo
 		New:  podSpec,
 	})
 	if podSpec.NetworkName != "" && podSpec.EnableMemif {
-		return podSpec.MemifSwIfIndex, err
+		return podSpec.MemifSwIfIndex, true, nil
 	}
 
 	s.log.Infof("pod(add) activate strict RPF on interface")
@@ -320,24 +384,13 @@ func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf boo
 		goto err
 	}
 
-	// Publish the CNI attachment identity against the interface handle that
-	// was just created, and do it here, while the cleanup stack is still in
-	// scope: a failed publication has to roll the interface back and make the
-	// CNI ADD fail (00 §2.12.6, completion criteria 1 and 3 of §2.12.9). This
-	// is the last step of AddVppInterface, so the caller cannot return success
-	// to the CNI before the binding ADD was acknowledged.
-	err = s.publishIfAttachment(podSpec, stack)
-	if err != nil {
-		s.log.Errorf("failed to publish the CNI attachment binding: %s", err)
-		goto err
-	}
-	return podSpec.TunTapSwIfIndex, err
+	return vpplink.InvalidID, false, nil
 
 err:
-	s.log.Errorf("Error, try a cleanup %+v", err)
-	stack.Execute()
-	return vpplink.InvalidID, errors.Wrapf(err, "Error creating interface")
-
+	// The caller owns the cleanup stack and runs it: a failure here and a
+	// failure of the binding publication that follows must roll the same
+	// things back, in the same place.
+	return vpplink.InvalidID, false, err
 }
 
 // CleanUpVPPNamespace deletes the devices in the network namespace.

@@ -16,10 +16,20 @@
 package cni
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+
+	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/cni/model"
+	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
 )
 
 // The publication barrier of 00 §2.12.6 is a property of where the binding is
@@ -145,4 +155,173 @@ func TestBindingIsNeverPublishedAsynchronously(t *testing.T) {
 		})
 		return true
 	})
+}
+
+// --- the barrier at run time ------------------------------------------------
+//
+// The tests above read the source. The ones below run AddVppInterface.
+//
+// What needs a live VPP is the dataplane realization — the per-pod VRFs, the
+// interfaces and their routing — and that is the one step the seam
+// realizePodInterfacesFn replaces. Everything the barrier is about stays real:
+// the cleanup stack AddVppInterface owns, the binding publication against the
+// fake plugin, the error path that runs the stack, and the values the function
+// returns. So a barrier that is moved, made asynchronous, or left without its
+// rollback is observed here, not merely read.
+
+// barrierTestServer builds a lifecycle server whose dataplane realization is
+// faked. rollbacks counts how many times the interface the fake "created" was
+// rolled back, i.e. how many times the cleanup stack was executed.
+func barrierTestServer(t *testing.T, writer *fakeIfBindingWriter) (s *Server, rollbacks *int) {
+	t.Helper()
+	s = testLifecycleServer(writer)
+	s.availableBuffers = 1 << 30
+	s.stateFilename = filepath.Join(t.TempDir(), "cni-server-state")
+	// Nothing of this pod is in VPP yet, so the ADD takes the creation path
+	// rather than the idempotent replay path.
+	s.vrfsExistInVppFn = func(*model.LocalPodSpec) bool { return false }
+
+	rolledBack := 0
+	rollbacks = &rolledBack
+	s.realizePodInterfacesFn = func(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack, doHostSideConf bool) (uint32, bool, error) {
+		podSpec.TunTapSwIfIndex = barrierTestSwIfIndex
+		// This is what the real drivers push: undoing the interface they just
+		// created. Counting it is how the test sees the rollback happen.
+		stack.Push(func(uint32) error { rolledBack++; return nil }, uint32(barrierTestSwIfIndex))
+		return vpplink.InvalidID, false, nil
+	}
+	return s, rollbacks
+}
+
+const (
+	barrierTestSwIfIndex     = uint32(7)
+	barrierTestIncarnation   = uint32(3)
+	barrierTestAttachmentID  = "container:eth0"
+	barrierTestInterfaceName = "eth0"
+)
+
+// hostNetnsPath is a network namespace that exists for the duration of the
+// test: AddVppInterface refuses to do anything for a netns that is gone, and
+// the barrier is downstream of that check.
+const hostNetnsPath = "/proc/self/ns/net"
+
+func barrierTestPodSpec() *model.LocalPodSpec {
+	isL3 := true
+	podSpec := &model.LocalPodSpec{
+		InterfaceName: barrierTestInterfaceName,
+		NetnsName:     hostNetnsPath,
+		AttachmentID:  barrierTestAttachmentID,
+		ContainerIPs:  []net.IP{net.ParseIP("fd00::1")},
+		PodAnnotations: model.PodAnnotations{
+			IfSpec:        lifecycleIfSpec(isL3),
+			PBLMemifSpec:  lifecycleIfSpec(isL3),
+			DefaultIfType: model.VppIfTypeTunTap,
+		},
+		LocalPodSpecStatus: *model.NewLocalPodSpecStatus(),
+	}
+	return podSpec
+}
+
+// A refused binding ADD is a failed CNI ADD, and the interface that was created
+// for it does not survive: completion criteria 1 and 3 of 00 §2.12.9.
+func TestAddVppInterfaceFailsAndRollsBackWhenTheBindingIsRefused(t *testing.T) {
+	writer := newFakeIfBindingWriter()
+	writer.incarnations[barrierTestSwIfIndex] = barrierTestIncarnation
+	writer.addErr = errors.New("plugin refused the binding")
+	s, rollbacks := barrierTestServer(t, writer)
+	podSpec := barrierTestPodSpec()
+
+	swIfIndex, err := s.AddVppInterface(podSpec, false /* doHostSideConf */)
+
+	if err == nil {
+		t.Fatalf("AddVppInterface reported success although the binding ADD was refused")
+	}
+	if swIfIndex != vpplink.InvalidID {
+		t.Fatalf("AddVppInterface returned interface %d after a refused binding, want InvalidID", swIfIndex)
+	}
+	if *rollbacks != 1 {
+		t.Fatalf("the interface was rolled back %d times after the refused binding, want exactly 1", *rollbacks)
+	}
+	if podSpec.PublishedIfAttachment != nil {
+		t.Fatalf("a refused binding was recorded as published: %s", podSpec.PublishedIfAttachment)
+	}
+	if len(writer.bindings) != 0 {
+		t.Fatalf("a refused binding was left in the plugin's table: %v", writer.bindings)
+	}
+	// The rollback must not withdraw a binding that was never written.
+	for _, call := range writer.calls {
+		if strings.HasPrefix(call, "del(") {
+			t.Fatalf("the rollback withdrew a binding that was never published: %v", writer.calls)
+		}
+	}
+}
+
+// The same run, with the plugin accepting: the interface is reported only after
+// the ADD was acknowledged, and nothing is rolled back.
+func TestAddVppInterfaceReportsTheInterfaceOnlyAfterTheBindingIsAcknowledged(t *testing.T) {
+	writer := newFakeIfBindingWriter()
+	writer.incarnations[barrierTestSwIfIndex] = barrierTestIncarnation
+	s, rollbacks := barrierTestServer(t, writer)
+	podSpec := barrierTestPodSpec()
+
+	swIfIndex, err := s.AddVppInterface(podSpec, false /* doHostSideConf */)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if swIfIndex != barrierTestSwIfIndex {
+		t.Fatalf("AddVppInterface returned interface %d, want %d", swIfIndex, barrierTestSwIfIndex)
+	}
+	if *rollbacks != 0 {
+		t.Fatalf("a successful ADD rolled the interface back %d times", *rollbacks)
+	}
+	if podSpec.PublishedIfAttachment == nil {
+		t.Fatalf("AddVppInterface reported the interface without publishing a binding")
+	}
+	// The binding must already be in the plugin's table when AddVppInterface
+	// returns: an ADD acknowledged later would be the asynchronous write the
+	// contract forbids.
+	want := "add(" + barrierTestAttachmentID + ",7,3)"
+	if len(writer.calls) == 0 || writer.calls[len(writer.calls)-1] != want {
+		t.Fatalf("the last plugin call at the moment of the reply was %v, want %s ending it", writer.calls, want)
+	}
+	if _, ok := writer.bindings[barrierTestAttachmentID]; !ok {
+		t.Fatalf("the binding was not published by the time AddVppInterface returned: %v", writer.bindings)
+	}
+}
+
+// The barrier is what the RPC reply means, so a refused binding must not
+// produce a CreatePodInterface reply. This runs the real AddVppInterface
+// underneath: the gRPC layer is not allowed to turn a rolled back interface
+// into a successful CNI ADD.
+func TestCreatePodInterfaceReturnsNoReplyWhenTheBindingIsRefused(t *testing.T) {
+	writer := newFakeIfBindingWriter()
+	writer.incarnations[barrierTestSwIfIndex] = barrierTestIncarnation
+	writer.addErr = errors.New("plugin refused the binding")
+	s, rollbacks := barrierTestServer(t, writer)
+
+	request := validCreateRequest()
+	request.Netns = hostNetnsPath
+	request.AttachmentId = barrierTestAttachmentID
+
+	reply, err := (&lifecycleService{server: s}).CreatePodInterface(context.Background(), request)
+
+	if err == nil {
+		t.Fatalf("CreatePodInterface replied although the binding ADD was refused: %v", reply)
+	}
+	if reply != nil {
+		t.Fatalf("CreatePodInterface returned a reply together with an error: %v", reply)
+	}
+	if code := statusCode(t, err); code != codes.Internal {
+		t.Fatalf("CreatePodInterface failed with %s, want Internal", code)
+	}
+	if *rollbacks != 1 {
+		t.Fatalf("the interface was rolled back %d times, want exactly 1", *rollbacks)
+	}
+	if len(s.podInterfaceMap) != 0 {
+		t.Fatalf("a failed ADD left the attachment in the pod interface map: %v", s.podInterfaceMap)
+	}
+	if len(writer.bindings) != 0 {
+		t.Fatalf("a failed ADD left a binding published: %v", writer.bindings)
+	}
 }
