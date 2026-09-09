@@ -16,6 +16,7 @@
 package podinterface
 
 import (
+	"io"
 	"strings"
 	"testing"
 
@@ -106,5 +107,98 @@ func TestComputePodMtuWithoutFelixConfig(t *testing.T) {
 	}
 	if got := driver.computePodMtu(0, nil, false, false); got <= 0 {
 		t.Fatalf("an unspecified MTU produced %d", got)
+	}
+}
+
+// --- Pod-side configuration policy per profile ------------------------------
+//
+// The two profiles share the code that performs each step and not the policy
+// that orders them (Issue #135 pre-merge item 4). These tests pin both
+// policies, so that a change to one is visible as a change to that one.
+
+func stepNames(steps []namespaceSideStep) []string {
+	names := make([]string, 0, len(steps))
+	for _, step := range steps {
+		names = append(names, string(step))
+	}
+	return names
+}
+
+func requireSteps(t *testing.T, got []namespaceSideStep, want ...string) {
+	t.Helper()
+	names := stepNames(got)
+	if len(names) != len(want) {
+		t.Fatalf("steps are %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("steps are %v, want %v", names, want)
+		}
+	}
+}
+
+// The lifecycle profile follows the fixed ADD order of Issue #135 ruling 8:
+// suppression before any address exists, addresses before the routes that point
+// at them, and the MTU last.
+func TestLifecycleProfileConfiguresThePodSideInTheFixedAddOrder(t *testing.T) {
+	requireSteps(t, namespaceSideSteps(LifecycleProfile, true /* hasv6 */, true /* isL3 */),
+		"enable-ipv6", "suppress-ipv6-autoconf", "addresses", "routes", "mtu", "container-sysctls")
+}
+
+// An L2 pod interface keeps its link-local address: neighbour discovery needs
+// it, so the suppression step does not apply there.
+func TestLifecycleProfileDoesNotSuppressAddressGenerationOnAnL2Interface(t *testing.T) {
+	requireSteps(t, namespaceSideSteps(LifecycleProfile, true /* hasv6 */, false /* isL3 */),
+		"enable-ipv6", "addresses", "routes", "mtu", "container-sysctls")
+}
+
+// Without IPv6 there is nothing to enable and nothing to suppress.
+func TestLifecycleProfileWithoutIPv6(t *testing.T) {
+	requireSteps(t, namespaceSideSteps(LifecycleProfile, false /* hasv6 */, true /* isL3 */),
+		"addresses", "routes", "mtu", "container-sysctls")
+}
+
+// The Calico CNI backend keeps exactly the Pod-side configuration it applied
+// before this contract existed: routes before addresses, no suppression of the
+// kernel's IPv6 autoconfiguration, and no MTU step of its own. Tightening it is
+// a change to Calico and belongs to a change made for Calico's reasons.
+func TestCalicoProfileKeepsItsExistingPodSideConfiguration(t *testing.T) {
+	requireSteps(t, namespaceSideSteps(CalicoProfile, true /* hasv6 */, true /* isL3 */),
+		"enable-ipv6", "routes", "addresses", "container-sysctls")
+	requireSteps(t, namespaceSideSteps(CalicoProfile, true /* hasv6 */, false /* isL3 */),
+		"enable-ipv6", "routes", "addresses", "container-sysctls")
+	requireSteps(t, namespaceSideSteps(CalicoProfile, false /* hasv6 */, true /* isL3 */),
+		"routes", "addresses", "container-sysctls")
+}
+
+// The suppression is a lifecycle-profile step, and it is not reachable from the
+// Calico profile under any pod spec: that is the whole point of separating the
+// policies rather than the code.
+func TestSuppressionIsUnreachableFromTheCalicoProfile(t *testing.T) {
+	for _, hasv6 := range []bool{true, false} {
+		for _, isL3 := range []bool{true, false} {
+			for _, step := range namespaceSideSteps(CalicoProfile, hasv6, isL3) {
+				if step == stepSuppressIPv6Autoconf || step == stepMtu {
+					t.Fatalf("the Calico profile runs %q (hasv6=%t isL3=%t)", step, hasv6, isL3)
+				}
+			}
+		}
+	}
+}
+
+// The profile is what the entry point chose, and nothing else. A driver built
+// for Calico stays a Calico driver whatever pod spec it is handed.
+func TestTheProfileComesFromTheConstructor(t *testing.T) {
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+	entry := logrus.NewEntry(log)
+
+	calico := NewTunTapPodInterfaceDriver(nil, entry, common.NoSNATPolicy{}, CalicoProfile)
+	if calico.profile != CalicoProfile {
+		t.Fatalf("the Calico driver has profile %s", calico.profile)
+	}
+	lifecycle := NewTunTapPodInterfaceDriver(nil, entry, common.NoSNATPolicy{}, LifecycleProfile)
+	if lifecycle.profile != LifecycleProfile {
+		t.Fatalf("the lifecycle driver has profile %s", lifecycle.profile)
 	}
 }

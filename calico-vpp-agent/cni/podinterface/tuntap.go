@@ -35,18 +35,53 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
 )
 
+// PodInterfaceProfile selects which Pod-side configuration policy a pod
+// interface driver applies.
+//
+// It is chosen explicitly when the server is built, by the entry point that
+// knows which product it is running (Issue #135 pre-merge item 4). It is never
+// inferred from the interface name, the pod spec or anything else observable at
+// run time: two profiles that differ in what they configure inside the Pod must
+// differ by a decision someone made, not by a guess.
+type PodInterfaceProfile int
+
+const (
+	// CalicoProfile is the Calico CNI backend. Its Pod-side configuration is
+	// the one Calico has always applied, and it stays that way: the strict
+	// ordering below is a property of the SRv6 endpoint context contract, not
+	// a bug fix that Calico deployments are owed. Tightening it there is a
+	// separate change with its own reasons.
+	CalicoProfile PodInterfaceProfile = iota
+	// LifecycleProfile is the Pod interface lifecycle service, whose Pod-side
+	// configuration follows the fixed ADD order of D-50 and Issue #135
+	// ruling 8.
+	LifecycleProfile
+)
+
+func (p PodInterfaceProfile) String() string {
+	if p == LifecycleProfile {
+		return "lifecycle"
+	}
+	return "calico"
+}
+
 type TunTapPodInterfaceDriver struct {
 	PodInterfaceDriverData
+	// profile decides the Pod-side configuration policy: which steps run and
+	// in which order. The code that performs each step is shared between the
+	// profiles; the policy is not.
+	profile             PodInterfaceProfile
 	felixConfig         *felixConfig.Config
 	ipipEncapRefCounts  int /* how many ippools with IPIP */
 	vxlanEncapRefCounts int /* how many ippools with VXLAN */
 }
 
-func NewTunTapPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *TunTapPodInterfaceDriver {
+func NewTunTapPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy, profile PodInterfaceProfile) *TunTapPodInterfaceDriver {
 	i := &TunTapPodInterfaceDriver{
 		PodInterfaceDriverData: PodInterfaceDriverData{
 			snatPolicy: requireSNATPolicy(snatPolicy, "tun"),
 		},
+		profile: profile,
 	}
 	i.vpp = vpp
 	i.log = log
@@ -343,15 +378,131 @@ func (i *TunTapPodInterfaceDriver) suppressIPv6Autoconfiguration(podSpec *model.
 	return nil
 }
 
-// configureNamespaceSideTun configures the Pod side of the tun in the order the
-// ADD sequence fixes (Issue #135 ruling 8):
+// namespaceSideStep names one step of the Pod-side configuration of a tun.
+type namespaceSideStep string
+
+const (
+	// stepEnableIPv6 clears disable_ipv6 on the Pod netns, so that the netns
+	// accepts IPv6 addresses at all.
+	stepEnableIPv6 namespaceSideStep = "enable-ipv6"
+	// stepSuppressIPv6Autoconf turns off the kernel's own IPv6 address
+	// configuration on the interface (accept_ra, addr_gen_mode).
+	stepSuppressIPv6Autoconf namespaceSideStep = "suppress-ipv6-autoconf"
+	// stepAddresses adds the addresses the CNI allocated.
+	stepAddresses namespaceSideStep = "addresses"
+	// stepRoutes adds the device routes.
+	stepRoutes namespaceSideStep = "routes"
+	// stepMtu sets the MTU on the Pod-side link.
+	stepMtu namespaceSideStep = "mtu"
+	// stepContainerSysctls applies the forwarding sysctls of the Pod netns.
+	stepContainerSysctls namespaceSideStep = "container-sysctls"
+)
+
+// namespaceSideSteps is the Pod-side configuration policy of a profile: which
+// steps run, and in which order.
+//
+// The two profiles differ, and are kept apart on purpose (Issue #135 pre-merge
+// item 4). Shared code is not shared policy: both profiles execute the same
+// step implementations, but the Calico CNI backend keeps the order and the set
+// of steps it has always had, because changing what a Calico deployment
+// configures inside a Pod is a change to that product and needs its own
+// reasons.
+//
+// The lifecycle profile follows the fixed ADD order of Issue #135 ruling 8:
 //
 //	IPv6 autoconfiguration suppression -> addresses -> device routes -> MTU
 //
 // The suppression comes first so that no kernel-generated address exists on the
 // interface even briefly, and the addresses come before the routes so that a
 // route towards the interface is never installed while it still has no source
-// address.
+// address. The MTU is set again at the end, where the fixed order puts it; the
+// tun was already created with it, so the call is idempotent.
+func namespaceSideSteps(profile PodInterfaceProfile, hasv6 bool, isL3 bool) []namespaceSideStep {
+	steps := make([]namespaceSideStep, 0, 6)
+	if hasv6 {
+		steps = append(steps, stepEnableIPv6)
+	}
+	if profile == LifecycleProfile {
+		if hasv6 && isL3 {
+			// L3 only: an L2 pod interface needs its link-local address for
+			// neighbour discovery, so suppressing address generation there
+			// would break it.
+			steps = append(steps, stepSuppressIPv6Autoconf)
+		}
+		steps = append(steps, stepAddresses, stepRoutes, stepMtu)
+	} else {
+		// The Calico order: routes first, then addresses, and no MTU step of
+		// its own.
+		steps = append(steps, stepRoutes, stepAddresses)
+	}
+	return append(steps, stepContainerSysctls)
+}
+
+// enableIPv6 makes sure IPv6 is enabled in the container/pod network namespace.
+func enableIPv6() error {
+	if err := WriteProcSys("/proc/sys/net/ipv6/conf/all/disable_ipv6", "0"); err != nil {
+		return fmt.Errorf("failed to set net.ipv6.conf.all.disable_ipv6=0: %s", err)
+	}
+	if err := WriteProcSys("/proc/sys/net/ipv6/conf/default/disable_ipv6", "0"); err != nil {
+		return fmt.Errorf("failed to set net.ipv6.conf.default.disable_ipv6=0: %s", err)
+	}
+	if err := WriteProcSys("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "0"); err != nil {
+		return fmt.Errorf("failed to set net.ipv6.conf.lo.disable_ipv6=0: %s", err)
+	}
+	return nil
+}
+
+// addPodAddresses adds the addresses the CNI allocated to the Pod side of the
+// tun. A failure fails the ADD: an interface with a missing address is not a
+// usable interface.
+func (i *TunTapPodInterfaceDriver) addPodAddresses(contTun netlink.Link, podSpec *model.LocalPodSpec, swIfIndex uint32) error {
+	for _, containerIP := range podSpec.GetContainerIPs() {
+		i.log.Infof("pod(add) tun address swIfIndex=%d linux-ifIndex=%d address=%s", swIfIndex, contTun.Attrs().Index, containerIP.String())
+		err := netlink.AddrAdd(contTun, &netlink.Addr{IPNet: containerIP})
+		if err != nil {
+			return errors.Wrapf(err, "failed to add IP addr to %s: %v", contTun.Attrs().Name, err)
+		}
+	}
+	return nil
+}
+
+// addPodRoutes installs the device routes of the pod spec out of the tun.
+//
+// A route that cannot be added is logged and not returned, which is what this
+// code has always done ("in ipv6 '::' already exists"); both profiles keep that
+// behaviour.
+func (i *TunTapPodInterfaceDriver) addPodRoutes(contTun netlink.Link, podSpec *model.LocalPodSpec, swIfIndex uint32, hasv4 bool, hasv6 bool) {
+	for _, route := range podSpec.Routes {
+		isV6 := route.IP.To4() == nil
+		if (isV6 && !hasv6) || (!isV6 && !hasv4) {
+			i.log.Infof("pod(add) Skipping tun swIfIndex=%d route=%s", swIfIndex, route.String())
+			continue
+		}
+		i.log.Infof("pod(add) tun route swIfIndex=%d linux-ifIndex=%d route=%s", swIfIndex, contTun.Attrs().Index, route.String())
+		err := netlink.RouteAdd(&netlink.Route{
+			LinkIndex: contTun.Attrs().Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       &route,
+		})
+		if err != nil {
+			// TODO : in ipv6 '::' already exists
+			i.log.Errorf("Error adding tun[%d] route for %s", swIfIndex, route.String())
+		}
+	}
+}
+
+// setPodMtu sets the MTU on the Pod side of the tun.
+func (i *TunTapPodInterfaceDriver) setPodMtu(contTun netlink.Link, podSpec *model.LocalPodSpec) error {
+	podMtu := i.computePodMtu(podSpec.Mtu, i.felixConfig, i.ipipEncapRefCounts > 0, i.vxlanEncapRefCounts > 0)
+	if err := netlink.LinkSetMTU(contTun, podMtu); err != nil {
+		return errors.Wrapf(err, "failed to set mtu %d on %s", podMtu, contTun.Attrs().Name)
+	}
+	return nil
+}
+
+// configureNamespaceSideTun configures the Pod side of the tun, running the
+// steps this driver's profile prescribes in the order it prescribes them (see
+// namespaceSideSteps).
 func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, podSpec *model.LocalPodSpec) func(hostNS ns.NetNS) error {
 	return func(hostNS ns.NetNS) error {
 		contTun, err := netlink.LinkByName(podSpec.InterfaceName)
@@ -359,66 +510,31 @@ func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, p
 			return errors.Wrapf(err, "failed to lookup %q: %v", podSpec.InterfaceName, err)
 		}
 		hasv4, hasv6 := podSpec.Hasv46()
+		isL3 := podSpec.IfSpec.IsL3 != nil && *podSpec.IfSpec.IsL3
 
-		// Do the per-IP version set-up.  Add gateway routes etc.
-		if hasv6 {
-			i.log.Infof("pod(add) tun in NS has v6 swIfIndex=%d", swIfIndex)
-			// Make sure ipv6 is enabled in the container/pod network namespace.
-			if err = WriteProcSys("/proc/sys/net/ipv6/conf/all/disable_ipv6", "0"); err != nil {
-				return fmt.Errorf("failed to set net.ipv6.conf.all.disable_ipv6=0: %s", err)
-			}
-			if err = WriteProcSys("/proc/sys/net/ipv6/conf/default/disable_ipv6", "0"); err != nil {
-				return fmt.Errorf("failed to set net.ipv6.conf.default.disable_ipv6=0: %s", err)
-			}
-			if err = WriteProcSys("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "0"); err != nil {
-				return fmt.Errorf("failed to set net.ipv6.conf.lo.disable_ipv6=0: %s", err)
-			}
-			if podSpec.IfSpec.IsL3 != nil && *podSpec.IfSpec.IsL3 {
-				if err = i.suppressIPv6Autoconfiguration(podSpec); err != nil {
-					return err
+		for _, step := range namespaceSideSteps(i.profile, hasv6, isL3) {
+			switch step {
+			case stepEnableIPv6:
+				i.log.Infof("pod(add) tun in NS has v6 swIfIndex=%d", swIfIndex)
+				err = enableIPv6()
+			case stepSuppressIPv6Autoconf:
+				err = i.suppressIPv6Autoconfiguration(podSpec)
+			case stepAddresses:
+				err = i.addPodAddresses(contTun, podSpec, swIfIndex)
+			case stepRoutes:
+				i.addPodRoutes(contTun, podSpec, swIfIndex, hasv4, hasv6)
+				err = nil
+			case stepMtu:
+				err = i.setPodMtu(contTun, podSpec)
+			case stepContainerSysctls:
+				if err = i.configureContainerSysctls(podSpec); err != nil {
+					err = errors.Wrapf(err, "error configuring sysctls for the container netns, error: %s", err)
 				}
 			}
-		}
-
-		// Add the IPs to the container side of the tun before the routes.
-		for _, containerIP := range podSpec.GetContainerIPs() {
-			i.log.Infof("pod(add) tun address swIfIndex=%d linux-ifIndex=%d address=%s", swIfIndex, contTun.Attrs().Index, containerIP.String())
-			err = netlink.AddrAdd(contTun, &netlink.Addr{IPNet: containerIP})
 			if err != nil {
-				return errors.Wrapf(err, "failed to add IP addr to %s: %v", contTun.Attrs().Name, err)
+				return err
 			}
 		}
-
-		for _, route := range podSpec.Routes {
-			isV6 := route.IP.To4() == nil
-			if (isV6 && !hasv6) || (!isV6 && !hasv4) {
-				i.log.Infof("pod(add) Skipping tun swIfIndex=%d route=%s", swIfIndex, route.String())
-				continue
-			}
-			i.log.Infof("pod(add) tun route swIfIndex=%d linux-ifIndex=%d route=%s", swIfIndex, contTun.Attrs().Index, route.String())
-			err = netlink.RouteAdd(&netlink.Route{
-				LinkIndex: contTun.Attrs().Index,
-				Scope:     netlink.SCOPE_UNIVERSE,
-				Dst:       &route,
-			})
-			if err != nil {
-				// TODO : in ipv6 '::' already exists
-				i.log.Errorf("Error adding tun[%d] route for %s", swIfIndex, route.String())
-			}
-		}
-
-		// The MTU was already requested when the tun was created; setting it
-		// again is idempotent and puts the step where the fixed ADD order puts
-		// it, after the device routes.
-		podMtu := i.computePodMtu(podSpec.Mtu, i.felixConfig, i.ipipEncapRefCounts > 0, i.vxlanEncapRefCounts > 0)
-		if err = netlink.LinkSetMTU(contTun, podMtu); err != nil {
-			return errors.Wrapf(err, "failed to set mtu %d on %s", podMtu, contTun.Attrs().Name)
-		}
-
-		if err = i.configureContainerSysctls(podSpec); err != nil {
-			return errors.Wrapf(err, "error configuring sysctls for the container netns, error: %s", err)
-		}
-
 		return nil
 	}
 }

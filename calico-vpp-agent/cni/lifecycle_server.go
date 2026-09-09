@@ -74,7 +74,7 @@ func NewLifecycleServer(vpp *vpplink.VppLink, ifBinding IfBindingWriter, log *lo
 		dsrVIPs:         make(map[string]*dsrVIPState),
 		dsrDesired:      make(map[string]*common.DSRService),
 
-		tuntapDriver:   podinterface.NewTunTapPodInterfaceDriver(vpp, log, snatPolicy),
+		tuntapDriver:   podinterface.NewTunTapPodInterfaceDriver(vpp, log, snatPolicy, podinterface.LifecycleProfile),
 		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, snatPolicy),
 		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, snatPolicy),
 		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, snatPolicy),
