@@ -1,0 +1,8 @@
+# Canonical source of vpplink/generated/private_plugins/cilium_srv6.
+#
+# Written by scripts/sync-cilium-srv6.sh.  Do not edit by hand and do not edit
+# the snapshot: scripts/check-cilium-srv6-sync.sh fails the build when the
+# snapshot and this commit's tree differ by a single byte.
+CILIUM_SRV6_SOURCE_REPO=https://github.com/ryskn/cilium-private.git
+CILIUM_SRV6_SOURCE_PATH=vpp/plugins/cilium_srv6
+CILIUM_SRV6_SOURCE_COMMIT=b37d8847c03f253d2b551ff0c02b030a981808e2

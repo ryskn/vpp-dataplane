@@ -1,0 +1,158 @@
+---
+name: Cilium SRv6 Endpoint Context
+maintainer: Cilium Authors
+features:
+  - Permanent ingress guard node (cilium-srv6-guard) on every IPv6 unicast
+    ingress path, dropping SID Block destined packets received from
+    untrusted or quarantined interfaces
+  - Interface trust map keyed on (sw_if_index, if_incarnation)
+  - Dead-man switch that quarantines every interface except the ones
+    currently classified TRUSTED_FABRIC when the agent keepalive lapses,
+    so that existing deliveries from the SR domain keep working while new
+    Context install is refused
+  - Quarantine minimum hold time and route withdraw delay
+  - EndpointContextTable, a bihash over a start-up reserved fixed pool of
+    ACTIVE Context entries, updated under the worker barrier with versioned
+    immutable handles and a grace period before a pool index is reused
+  - Bounded ContextTombstoneTable in a separate pool, with a per-owner soft
+    quota, fair eviction and retention GC, so that invalidated Context IDs
+    keep a distinct drop reason without consuming ACTIVE capacity
+  - End.Cilium bound to the advertised Service SID Block:uN_B:uC::/64 as a
+    single FIB entry per node, independent of the number of Pods
+  - "cilium-end-cilium: SR domain source address check, Context resolution,
+    bounded outer / SRH / inner header parsing that requires Segments Left
+    to be zero before decapsulating, and inner destination equality against
+    the Context's endpoint address"
+  - "cilium-ep-deliver: versioned handle re-check, a hook for the node-local
+    connection tracker, and transmission through the Context's forwarding
+    object without a lookup of the inner destination"
+  - Fail-closed ladder that removes the local SID and suspends delivery
+    while guard coverage is incomplete
+  - "cilium-srv6-classify: source endpoint and identity resolution keyed on
+    (sw_if_index, if_incarnation), source address anti-spoof, and a bounded
+    inner extension header / fragment walk that derives the L4 discriminator
+    (TCP/UDP destination port, ICMPv6 type/code)"
+  - "L3-only Pod attachment (D-50): forwarding traffic received on a
+    Pod-facing interface is an L3 IPv6 packet whose source is the address
+    bound to that interface. An IPv6 link control packet is counted as
+    DROP_LINK_LOCAL_CONTROL, kept apart from the DROP_SRC_IP_MISMATCH spoof
+    counter"
+  - "Fragment handling without per-datagram offset state: a first fragment's
+    verdict is recorded in a bounded FragmentVerdictCache bound to identity,
+    endpoint incarnation, three dependency revisions and versioned path
+    handle, and gated on the same PolicyLeaseTable lease; a non-first
+    fragment arriving before its first one, and a re-received first
+    fragment, are dropped. The record is written either by the dataplane,
+    when the program table already held the decision, or by the agent
+    through srv6_fragment_verdict_add for a first fragment that had to be
+    compiled on the slow path; both go through one writer, so a record is
+    bound and bounded the same way whichever produced it. An ALLOW arriving
+    through srv6_fragment_verdict_add is the fourth policy_lease_touch path:
+    the handler refreshes the exact-revision lease of the source identity and
+    publishes the record only once that lease is usable, so a record is never
+    visible without the lease its non-first fragments are checked against"
+  - "cilium-srv6-ct: conntrack stage that lets an authorised reply bypass the
+    program table, sends an unverified or expired reply to a dedicated
+    re-authorisation punt queue, and classifies everything else as forward"
+  - "cilium-srv6-program: ProgramCache lookup on (src identity, destination,
+    protocol, L4 discriminator) with dependency-scoped revision comparison
+    (policy revision split per source identity), PolicyLeaseTable lease
+    enforcement, separate ALLOW and negative budgets, and hierarchical owner
+    to identity fair eviction"
+  - "PolicyLeaseTable: one slot per identity holding the published policy
+    revision together with the lease granted for it, so that renewing every
+    lease on the node is one message proportional to the number of
+    identities rather than a walk of a million entries, and so that the
+    conntrack table has a renewal path at all"
+  - Immutable versioned PathCache with the mutable learned PMTU held in a
+    separate table keyed by path id, so that a learned MTU survives a
+    republish without ever rewriting an immutable entry
+  - "PathCache staging transaction (D-61): srv6_path_txn_begin / put /
+    commit / abort build the next complete PathCache off to the side and
+    install it under one worker barrier, so that a worker only ever observes
+    the previous complete snapshot or the next one. PathCache (index,
+    generation) handles are allocated by the plugin alone, and a handle
+    reserved during staging is not exposed to the ProgramCache or the
+    conntrack table before the commit succeeds; any failure before commit
+    leaves the previously committed snapshot active"
+  - "cilium-srv6-encap: flow entropy from a node-local secret seed, outer IPv6
+    encapsulation with an optional pre-validated SRH, and an inner MTU check
+    against min(base MTU, learned MTU) with a hook for ICMPv6 PTB generation"
+  - "cilium-srv6-punt: bounded slow path queues (compile, reply
+    re-authorisation, fragment) with hierarchical owner to identity quotas, a
+    one-shot reinject token bound to the receiving interface lifetime, and a
+    pluggable IF-3 transport"
+  - "Path MTU discovery in both directions: a throttled ICMPv6 Packet Too Big
+    towards the source Pod when the inner packet exceeds min(base MTU,
+    learned MTU), quoting at most 1232 bytes, and cilium-srv6-ptb, which
+    learns a path's MTU from transit originated Packet Too Big messages"
+  - Recent transmission state kept per (path, flow, size class) rather than
+    per packet, with per-path and per-owner fair quotas, so that a high rate
+    flow or another tenant's burst cannot evict the record a legitimate
+    Packet Too Big has to be correlated against
+  - A received Packet Too Big is only believed when it arrived on a trusted
+    fabric interface, its source is in the SR domain node set, it quotes a
+    packet this node sent, and its quoted destination address is a C-SID
+    shift state, SRH segment or Service SID that the recorded path really
+    presents; the reported MTU must lie in [1280, recorded outer size), and a
+    path whose inner MTU would fall below 1280 is marked unusable and fails
+    closed. Learned values decay back to the configured MTU after ten minutes
+  - "Node-local connection tracker keyed on (source, destination, protocol,
+    ports, direction): the destination's delivery path creates entries
+    before anything is authorised, so they carry no policy revision, and a
+    reply only bypasses the program table once the agent has re-authorised
+    the forward direction and the entry still matches the live endpoint
+    incarnation, the published revision of the peer identity, the lease
+    that identity holds for that revision, and the TCP state"
+  - Conntrack capacity bound with a per-local-endpoint and per-owner soft
+    quota, fair eviction, and a separate short-lived budget for the entries
+    created before authorisation, so that unauthorised state cannot displace
+    authorised flows; an endpoint delete stops its entries from matching
+    immediately and purges them in bounded steps
+  - CNI attachment binding table (D-68) that the component creating a Pod's
+    VPP interface publishes into, mapping one variable-length attachment
+    identity to exactly one live (sw_if_index, if_incarnation) and one
+    interface lifetime to at most one attachment. A publication is never an
+    implicit replacement, a withdrawal matches all three components exactly
+    so that a stale one cannot remove the current binding, and the interface
+    delete callback removes a binding with the interface it names, so a
+    reused sw_if_index never resolves the previous Pod's attachment
+  - "Plugin instance identity (D-72): a 128-bit value drawn once when the
+    plugin initialises and reported by srv6_instance_get. It is constant for
+    the lifetime of the plugin instance, including across IF-2 transport
+    reconnects, and differs in every new instance, so that the agent can
+    separate a re-established transport from a VPP that restarted underneath
+    it without inferring lifecycle from observed table contents"
+  - Error counters classified by drop reason, dumped per (graph node,
+    counter) and summed over every worker thread, so that the agent can
+    aggregate by the reason an operator sees without losing the node
+    breakdown; the records whose reason is NOT_A_DROP carry the punt,
+    compile, conntrack and PTB classification statistics
+
+description: "Infrastructure guard / ACL, destination Context tables, the
+              End.Cilium destination dataplane and the headend graph for the
+              SRv6 Endpoint Context design. In a deployment without a payload encryption layer the
+              guard is the only defence against injection of packets
+              destined to the SRv6 locator block, so the node is installed
+              from plugin init on every ingress path and keeps enforcing
+              when the control plane agent is absent. The Context tables
+              resolve a Context ID carried in the destination address to a
+              local forwarding object, with ACTIVE capacity reserved
+              separately from the tombstone store so that endpoint churn
+              cannot exhaust delivery capacity. End.Cilium turns that
+              resolution into delivery: it verifies the outer source against
+              the SR domain node set, parses and decapsulates the outer
+              headers within explicit bounds, checks the inner destination
+              against the Context's endpoint address, and transmits to the
+              Pod interface without consulting any cluster-global state. On
+              the sending side the headend graph resolves a Pod's identity
+              from the interface it arrived on rather than from the packet,
+              authorises the flow against a lazily compiled program table
+              whose entries carry the revisions they were compiled against
+              and the identity whose lease keeps them usable, and
+              encapsulates it towards the destination
+              Service SID. Every miss is a bounded, per-tenant fair punt to
+              the agent, and every failure to authorise drops the packet
+              rather than forwarding it."
+state: development
+properties: [API, CLI, MULTITHREAD]

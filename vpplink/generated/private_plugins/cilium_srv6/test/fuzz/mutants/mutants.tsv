@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Cilium Authors
+#
+# Negative control matrix: target <TAB> mutant <TAB> description.
+#
+# Run by `./build.sh mutants`. Every row must make the target's `--generate`
+# run fail with an AddressSanitizer report, a UBSan runtime error or a
+# post-condition failure. A row that stops being detected means the harness
+# has stopped checking that property, which is a finding in the harness — not
+# a reason to delete the row.
+#
+# Each target carries two rows: one memory-safety mutation, which proves the
+# exact-size allocation and ASan are wired up, and one semantic mutation,
+# which proves the post-conditions are doing work of their own. Without the
+# second kind, a harness that only allocated correctly would look healthy.
+#
+# Frequency (Issue #67): on harness addition, on infra change, and nightly.
+fuzz_guard_parser	bound_from_declared_decl	guard: the parse bound follows the declared payload length instead of the readable area
+fuzz_guard_parser	guard_fragment_failure_class	guard: D-54 inspectability failures collapse back into DROP_MALFORMED
+fuzz_end_cilium_parser	bound_from_declared	end.cilium: the parse bound follows the declared payload length instead of the readable area
+fuzz_end_cilium_parser	parse_accept_segments_left	end.cilium: D-28 is dropped and an SRH with segments left is decapsulated
+fuzz_headend_classify	bound_from_declared	classify: the parse bound follows the declared payload length instead of the readable area
+fuzz_headend_classify	hparse_nonfirst_discriminator	classify: D-43 is dropped and a non-first fragment gets a fabricated L4 discriminator
+fuzz_pmtud_parser	bound_from_declared	pmtud: the parse bound follows the declared payload length instead of the readable area
+fuzz_pmtud_parser	pmtud_mtu_underflow	pmtud: D-21 is dropped and the MTU subtraction wraps before the u16 store

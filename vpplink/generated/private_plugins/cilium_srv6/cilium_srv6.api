@@ -1,0 +1,2548 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Cilium Authors
+ *
+ * SRv6 Endpoint Context v1 — infrastructure guard / ACL (C8-a).
+ *
+ * SRv6 Endpoint Context v1 — EndpointContextTable / tombstone store (C8-c).
+ *
+ * SRv6 Endpoint Context v1 — End.Cilium / endpoint delivery (C8-b).
+ *
+ * SRv6 Endpoint Context v1 — node-local conntrack (C10).
+ *
+ * Design references:
+ *   design/detail/03-destination-dataplane.md §1 (graph), §1.1 (guard trust
+ *     map, match, quarantine hysteresis, dead-man switch, fail-closed
+ *     ladder), §2 (Context table and tombstone store), §3 (End.Cilium),
+ *     §4 (D-12 synchronisation), §6 (endpoint delivery), §7 (IF-2 message
+ *     list)
+ *   design/detail/02-headend-dataplane.md §5 (slow path), §7 (conntrack),
+ *     §8 (IF-2)
+ *   design/detail/01-packet-format.md §3.1 (fragment rules, D-18/D-20/D-43)
+ *   design/detail/00-overview.md §2 (D-9, D-10, D-12, D-15, D-19, D-24,
+ *     D-25, D-30, D-31, D-32, D-35, D-38, D-42, D-44, D-45, D-46, D-49),
+ *     §4.1 (message validation), §6
+ *   design/detail/04-context-allocator.md §5 (ack ordering, grace period)
+ *   design/detail/06-observability.md §2 (drop reason names), §3 (metrics)
+ */
+
+option version = "1.8.0";
+
+import "vnet/interface_types.api";
+import "vnet/ip/ip_types.api";
+
+/** \brief Interface trust classification (03 §1.1, D-31).
+
+    QUARANTINED is deliberately value 0 so that zero-initialised plugin
+    state, and any interface the agent has not classified yet, is
+    fail-safe (03 §1.1 "fail-safe" rule).
+*/
+enum srv6_acl_trust : u8
+{
+  SRV6_ACL_TRUST_API_QUARANTINED = 0,
+  SRV6_ACL_TRUST_API_UNTRUSTED = 1,
+  SRV6_ACL_TRUST_API_TRUSTED_FABRIC = 2,
+};
+
+/** \brief Set the trust classification of one interface (IF-2, 03 §7).
+
+    Idempotent. The key is (sw_if_index, if_incarnation) per D-31: a write
+    that carries a stale incarnation is rejected so that an sw_if_index
+    reused by a new interface cannot inherit the old classification.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_SW_IF_INDEX - unknown / freed sw_if_index
+      INVALID_VALUE       - unknown trust value
+      INVALID_VALUE_2     - if_incarnation does not match the live interface
+      INVALID_INTERFACE   - TRUSTED_FABRIC requested for an interface
+                            whose device class is not physical/bond/uplink
+                            (03 §1.1 / D-31 invariant)
+      BUSY                - leaving QUARANTINED before the minimum hold
+                            time elapsed (D-44 hysteresis)
+
+    @param sw_if_index - interface to classify
+    @param if_incarnation - incarnation as reported by srv6_acl_dump
+    @param trust - requested classification
+*/
+autoendian autoreply define srv6_acl_interface_set
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  vl_api_srv6_acl_trust_t trust;
+};
+
+/** \brief Dump the trust classification and guard installation state
+           of every interface (IF-2, 03 §7; source data for
+           `cilium-dbg srv6 acl-status`, 06 §4.2).
+
+    @param sw_if_index - one interface, or ~0 for all
+*/
+autoendian define srv6_acl_dump
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+};
+
+/** \brief Per-interface guard state, plus the node-global guard state
+           needed by the metrics in 06 §3.
+
+    @param sw_if_index - interface
+    @param if_incarnation - current incarnation (D-31 key component)
+    @param trust - current classification
+    @param guard_installed - cilium-srv6-guard is on this interface's
+           ingress feature arc. An injection path is guard-covered only
+           when this is true for the interface it arrives on (D-58).
+    @param trusted_fabric_promotable - false for every interface whose
+           device class is not physical/bond/uplink (tap family, memif,
+           af-packet, vhost-user), which can never become TRUSTED_FABRIC
+           (03 §1.1 / D-31)
+    @param quarantine_hold_remaining_ms - time left before this interface
+           may leave QUARANTINED (D-44 minimum hold, 0 if not quarantined)
+    @param withdraw_delay_remaining_ms - time left before the agent should
+           withdraw this node's endpoint/locator routes on account of this
+           interface's quarantine (D-44 withdraw delay, 0 when elapsed or
+           not quarantined)
+    @param guard_ready - every live interface is guard-covered. This is
+           the guard-covered half of the D-58 READY invariant ("every SID
+           injection path reachable by an untrusted principal is either
+           guard-covered or administratively unreachable"); the other half
+           (VPP Host Stack / VCL / API attachment kept off untrusted
+           workloads) is a deployment property the plugin cannot observe.
+           Until this is true the agent keeps SRv6 readiness false
+           (03 §1.1)
+    @param deadman_active - agent keepalive lapsed and the plugin
+           quarantined every interface by itself (D-35)
+    @param context_install_blocked - new Context install is refused
+           (D-35; also while guard coverage is incomplete)
+    @param n_quarantined_interfaces - gauge for acl_quarantined_interfaces
+    @param deadman_activations - counter for guard_deadman_activations_total
+*/
+autoendian define srv6_acl_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  vl_api_srv6_acl_trust_t trust;
+  bool guard_installed;
+  bool trusted_fabric_promotable;
+  u32 quarantine_hold_remaining_ms;
+  u32 withdraw_delay_remaining_ms;
+  bool guard_ready;
+  bool deadman_active;
+  bool context_install_blocked;
+  u32 n_quarantined_interfaces;
+  u64 deadman_activations;
+};
+
+/** \brief Dead-man switch keepalive (IF-2, 03 §7, D-35).
+
+    The agent sends this periodically. If it stops arriving for longer
+    than the configured timeout (default 30 s) the plugin quarantines
+    every interface by itself and refuses new Context install. Existing
+    ACTIVE delivery is intentionally left running so that delaying the
+    agent cannot be used as an availability attack.
+
+    A keepalive arriving from a different API client than the previous
+    one is treated as an agent restart (D-27): every interface is
+    re-quarantined and must be re-classified.
+*/
+autoendian autoreply define srv6_agent_keepalive
+{
+  u32 client_index;
+  u32 context;
+};
+
+/*
+ * ------------------------------------------------------------------
+ * EndpointContextTable and tombstone store (C8-c, 03 §2 / §4 / §7)
+ * ------------------------------------------------------------------
+ */
+
+/** \brief State of one Context record (03 §2, §4).
+
+    INVALID is value 0 so that zero-initialised state is never treated as
+    deliverable, matching the fail-safe convention of srv6_acl_trust.
+*/
+enum srv6_context_state : u8
+{
+  /* Invalidated; removed from the ActiveContextTable, D-12 grace period
+     not yet complete, so the pool index is still reserved (03 §4). */
+  SRV6_CONTEXT_STATE_API_INVALID = 0,
+  /* Delivering. */
+  SRV6_CONTEXT_STATE_API_ACTIVE = 1,
+  /* Delivery temporarily disabled while the guard is fail-closed
+     (03 §1.1). Drops as DROP_SRV6_NOT_READY; not a tombstone. */
+  SRV6_CONTEXT_STATE_API_SUSPENDED = 2,
+  /* Record in the ContextTombstoneTable (D-25). Not an ACTIVE pool entry;
+     it makes a stale packet drop as DROP_INVALID_CONTEXT rather than
+     DROP_UNKNOWN_CONTEXT. */
+  SRV6_CONTEXT_STATE_API_TOMBSTONE = 3,
+};
+
+/** \brief Install a Context entry as ACTIVE (IF-2, 03 §7).
+
+    The reply is a synchronous ack of the completed install: 04 §5 requires
+    the caller to hold back the BGP advertisement until it arrives, and 05 §5
+    depends on that ordering.
+
+    The entry is immutable while ACTIVE (D-12). Re-adding an identical entry
+    is idempotent and mutates nothing; re-adding a different entry under a
+    Context ID that is already installed is refused, because the non-reuse
+    invariant of 04 §1 says that cannot legitimately happen.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_VALUE         - context_id 0 (reserved, 04 §1)
+      INVALID_VALUE_2       - endpoint_ip is the unspecified address
+      INVALID_SW_IF_INDEX   - unknown sw_if_index
+      FEATURE_DISABLED      - new Context install is blocked because guard
+                              coverage is incomplete or the dead-man switch
+                              is active (D-35, 03 §1.1)
+      ENTRY_ALREADY_EXISTS  - context_id installed with different contents
+      VALUE_EXIST           - context_id was already invalidated on this node
+                              (tombstone present, or grace period still
+                              running). 04 §1 issues a Context ID once per
+                              locator namespace, so re-adding one is never
+                              legitimate and would make a single ID both
+                              ACTIVE and tombstoned (04 §4).
+      LIMIT_EXCEEDED        - ERR_ACTIVE_CAPACITY (03 §2 / D-25). The ACTIVE
+                              pool is reserved and not shared with
+                              tombstones; the budget counts pool indices
+                              that exist, which includes entries still
+                              inside their grace period (M-6). The caller
+                              must not proceed to the BGP advertisement.
+      INIT_FAILED           - Context tables not built yet
+      UNSPECIFIED           - the delivery graph arc from cilium-ep-deliver
+                              to the entry's forwarding object could not be
+                              resolved (03 §6 step 4)
+
+    @param context_id - wire Context ID (04 §1). This is the value the
+           dataplane reads out of DA bit 64..95 and uses as the
+           ActiveContextTable key directly: 04 §1 applies the keyed
+           permutation once, at allocation time, and states that it does not
+           appear on the hot path.
+    @param endpoint_ip - expected inner destination address (03 §3)
+    @param sw_if_index - Pod interface the delivery DPO is built on
+    @param owner_quota_class - owner(namespace) quota class of the endpoint
+           (D-42). Stored in the entry so that the tombstone written at
+           invalidate time can be charged to the right owner (03 §2). 0 is
+           the "unclassified" class: a caller that does not supply one still
+           works, but every endpoint then shares a single tombstone quota
+           class and the D-42 fairness between namespaces is lost.
+*/
+autoendian autoreply define srv6_context_add
+{
+  u32 client_index;
+  u32 context;
+  u32 context_id;
+  vl_api_ip6_address_t endpoint_ip;
+  vl_api_interface_index_t sw_if_index;
+  u32 owner_quota_class;
+};
+
+/** \brief Invalidate a Context entry (IF-2, 03 §7, D-25).
+
+    Removes the entry from the ActiveContextTable under the worker barrier
+    and records it in the ContextTombstoneTable. Synchronous ack.
+
+    03 §2 gives the invalidate and the release of the ACTIVE slot priority
+    over recording the tombstone: if the bounded tombstone store cannot take
+    the record, the invalidate still succeeds and `tombstone_recorded` is
+    false. Such a Context ID stays fail-closed, but a later stale packet
+    drops as DROP_UNKNOWN_CONTEXT instead of DROP_INVALID_CONTEXT.
+
+      INVALID_VALUE  - context_id 0
+      NO_SUCH_ENTRY  - context_id is not in the ActiveContextTable
+      INIT_FAILED    - Context tables not built yet
+
+    @param context_id - Context ID to invalidate
+*/
+autoendian define srv6_context_invalidate
+{
+  u32 client_index;
+  u32 context;
+  u32 context_id;
+};
+
+/** \brief Result of srv6_context_invalidate.
+
+    @param retval - 0 on success
+    @param tombstone_recorded - the ContextTombstoneTable took the record.
+           False means the store was full or the owner was over its soft
+           quota; count it as context_tombstone_record_failures_total
+           (06 §3).
+    @param grace_period_ms - time after which the ACTIVE pool index of this
+           Context is reclaimed (D-12). The ACTIVE capacity accounting only
+           frees the slot then (M-6, 03 §2 / 04 §5), so a caller sizing its
+           own accounting should wait for the grace completion rather than
+           for this ack.
+*/
+autoendian define srv6_context_invalidate_reply
+{
+  u32 context;
+  i32 retval;
+  bool tombstone_recorded;
+  u32 grace_period_ms;
+};
+
+/** \brief Reclaim tombstones past the retention target (IF-2, 03 §7).
+
+    04 §5 calls this hourly. The work is bounded so that one message cannot
+    hold the worker barrier for an unbounded time; `more` tells the caller to
+    call again.
+
+    @param retention_seconds - reclaim records older than this, or 0 for the
+           plugin's configured retention target (03 §2, default 24 h). The
+           caller-supplied value is clamped to the plugin's retention so that
+           an agent cannot shorten the window in which a stale packet is
+           still classified as DROP_INVALID_CONTEXT rather than
+           DROP_UNKNOWN_CONTEXT (04 §4 defence line 2).
+    @param max_entries - bound on the number of records reclaimed by this
+           call, or 0 / ~0 for the plugin default
+*/
+autoendian define srv6_context_gc
+{
+  u32 client_index;
+  u32 context;
+  f64 retention_seconds;
+  u32 max_entries;
+};
+
+/** \brief Result of srv6_context_gc.
+
+    @param retval - 0 on success
+    @param n_reclaimed - records reclaimed by this call
+           (context_tombstone_evictions_total is separate: that counts
+           records dropped under pressure, this counts retention expiry)
+    @param n_remaining - records still in the ContextTombstoneTable
+    @param more - the bound was reached and expired records remain
+*/
+autoendian define srv6_context_gc_reply
+{
+  u32 context;
+  i32 retval;
+  u32 n_reclaimed;
+  u32 n_remaining;
+  bool more;
+};
+
+/** \brief Dump Context records (IF-2, 03 §7; source data for the mapping
+           query of 06 §4.1).
+
+    Covers the ACTIVE pool (ACTIVE / SUSPENDED / INVALID-in-grace-period) and
+    the ContextTombstoneTable, which stays queryable for the retention period
+    (06 §4.1). Tombstone records are emitted oldest first.
+
+    @param context_id - one Context ID, or ~0 for all
+*/
+autoendian define srv6_context_dump
+{
+  u32 client_index;
+  u32 context;
+  u32 context_id;
+};
+
+/** \brief One Context record.
+
+    @param context_id - Context ID
+    @param state - see srv6_context_state
+    @param entry_generation - version of the immutable handle (D-12). The
+           dataplane re-checks {pool_index, context_id, entry_generation} in
+           cilium-ep-deliver; a mismatch is DROP_CONTEXT_RECYCLED. 0 for a
+           tombstone record.
+    @param endpoint_ip - expected inner destination address. Unspecified for
+           a tombstone record: 03 §2 defines the tombstone as
+           {context_id, owner_quota_class, invalidated_at} only.
+    @param sw_if_index - Pod interface, ~0 for a tombstone record
+    @param dpo_index - delivery forwarding object, ~0 for a tombstone record
+    @param owner_quota_class - owner(namespace) quota class (D-42)
+    @param allocated_at - VPP clock at install, 0 for a tombstone record
+    @param invalidated_at - VPP clock at invalidate, 0 while ACTIVE or
+           SUSPENDED
+    @param grace_remaining_ms - time left before the ACTIVE pool index is
+           reclaimed; non-zero only for state INVALID
+    @param packets - packets delivered through this entry
+    @param bytes - bytes delivered through this entry
+*/
+autoendian define srv6_context_details
+{
+  u32 context;
+  u32 context_id;
+  vl_api_srv6_context_state_t state;
+  u32 entry_generation;
+  vl_api_ip6_address_t endpoint_ip;
+  vl_api_interface_index_t sw_if_index;
+  u32 dpo_index;
+  u32 owner_quota_class;
+  f64 allocated_at;
+  f64 invalidated_at;
+  u32 grace_remaining_ms;
+  u64 packets;
+  u64 bytes;
+};
+
+/** \brief Node-global Context capacity and pressure (source data for the
+           context_* gauges and counters of 06 §3 and for
+           `cilium-dbg srv6 capacity`, 06 §4.2).
+
+    DEVIATION from 03 §7: the IF-2 table does not list this message, but
+    06 §3 requires context_active_capacity / context_active_reserved /
+    context_tombstone_capacity and the corresponding counters, and a dump
+    cannot carry them (an empty table emits no details, and repeating them
+    per record would multiply them by up to 320K entries). It is read-only
+    and changes no state.
+*/
+autoendian define srv6_context_capacity_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief Result of srv6_context_capacity_get.
+
+    @param retval - 0 on success
+    @param active_capacity - context_active_capacity (03 §2, default 64K)
+    @param n_active - Context entries in state ACTIVE
+    @param n_suspended - Context entries in state SUSPENDED
+    @param n_active_reserved - context_active_reserved: entries whose D-12
+           grace period has not completed. Their pool index is not reusable,
+           so they still consume ACTIVE capacity (M-6).
+    @param tombstone_capacity - context_tombstone_capacity (default 256K)
+    @param n_tombstones - records in the ContextTombstoneTable
+    @param tombstone_retention_seconds - retention target (default 24 h)
+    @param tombstone_soft_quota - current per-owner soft quota (D-42)
+    @param capacity_rejections - context_capacity_rejections_total:
+           srv6_context_add refused with ERR_ACTIVE_CAPACITY
+    @param install_blocked - srv6_context_add refused because new Context
+           install was blocked (D-35 / incomplete guard coverage)
+    @param tombstone_evictions - context_tombstone_evictions_total
+    @param tombstone_record_failures - context_tombstone_record_failures_total
+    @param tombstone_gc_reclaimed - records reclaimed on retention expiry
+    @param grace_completions - D-12 grace periods completed since start
+    @param grace_next_seq - sequence number the next grace completion will
+           carry (see srv6_context_grace_dump)
+    @param grace_oldest_seq - oldest sequence number still readable from the
+           grace-completion log
+*/
+autoendian define srv6_context_capacity_get_reply
+{
+  u32 context;
+  i32 retval;
+  u32 active_capacity;
+  u32 n_active;
+  u32 n_suspended;
+  u32 n_active_reserved;
+  u32 tombstone_capacity;
+  u32 n_tombstones;
+  f64 tombstone_retention_seconds;
+  u32 tombstone_soft_quota;
+  u64 capacity_rejections;
+  u64 install_blocked;
+  u64 tombstone_evictions;
+  u64 tombstone_record_failures;
+  u64 tombstone_gc_reclaimed;
+  u64 grace_completions;
+  u64 grace_next_seq;
+  u64 grace_oldest_seq;
+};
+
+/** \brief Read completed D-12 grace periods.
+
+    DEVIATION from 03 §7: the IF-2 table has no message that tells the agent
+    a grace period completed, yet 03 §2 / 04 §5 make the ACTIVE capacity
+    accounting depend on that event ("the slot is released at grace period
+    completion, not at the invalidate ack") and the C2 allocator
+    (pkg/srv6ec/contextalloc) exposes NotifyGraceComplete(ContextID) as the
+    receiving end. This read-only dump is the minimum that closes the gap:
+    the plugin keeps a bounded ring of recent completions and holds no
+    per-reader state, the agent keeps its own cursor.
+
+    If `since_seq` is below the oldest sequence still in the ring the agent
+    has missed completions (it polled too slowly) and must reconcile with
+    srv6_context_dump instead; srv6_context_capacity_get reports both the
+    oldest and the next sequence number.
+
+    @param since_seq - return completions with seq >= this value; 0 for
+           everything still in the ring
+*/
+autoendian define srv6_context_grace_dump
+{
+  u32 client_index;
+  u32 context;
+  u64 since_seq;
+};
+
+/** \brief One completed grace period: the ACTIVE pool index of this Context
+           has been reclaimed and its ACTIVE capacity slot is free (M-6).
+
+    @param seq - monotonically increasing sequence number
+    @param context_id - Context ID whose slot was released
+    @param released_at - VPP clock at release
+*/
+autoendian define srv6_context_grace_details
+{
+  u32 context;
+  u64 seq;
+  u32 context_id;
+  f64 released_at;
+};
+
+/*
+ * ------------------------------------------------------------------
+ * End.Cilium local SID and endpoint delivery (C8-b, 03 §1 / §3 / §6 / §7)
+ * ------------------------------------------------------------------
+ */
+
+/** \brief Set (or remove) the End.Cilium local SID (IF-2, 03 §7, D-10).
+
+    Binds End.Cilium to the Service SID `Block:uN_B:uC::/64` — the
+    advertised Service SID itself, without an extra NEXT-C-SID shift of
+    `uN_B` — and installs it as one FIB entry. The entry is per node and
+    does not scale with the number of Pods: the Context is read from
+    DA bit 64..95 by the dataplane (01 §2.3), not from a per-Pod route.
+
+    `Block` comes from the plugin's SRV6_BLOCK configuration (00 §6) and is
+    not carried in this message, so that the agent cannot install a local
+    SID outside the block the guard protects.
+
+    The transit `uN` behaviour itself is not installed here: 03 §1 uses the
+    in-tree SRv6 plugin's uN local SID for that. `un_node` is supplied so
+    that the End.Cilium prefix can be built and the 00 §6 address plan
+    invariants can be enforced.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_VALUE        - un_node outside GIB_RANGE (00 §6 / D-46)
+      INVALID_VALUE_2      - uc outside LIB_RANGE (00 §6 / D-46)
+      INVALID_VALUE_3      - SRV6_BLOCK is unset or longer than 32 bits, so
+                             the 01 §2.3 layout does not hold
+      FEATURE_DISABLED     - guard coverage is incomplete or the dead-man
+                             switch is active. 03 §1.1: "guard を外した状態
+                             で local SID を install してはならない"
+      ENTRY_ALREADY_EXISTS - a different locator is already installed
+      NO_SUCH_FIB          - table_id could not be resolved
+      NO_SUCH_ENTRY        - is_add false with nothing installed
+      INIT_FAILED          - plugin not initialised
+
+    @param table_id - IPv6 FIB table the local SID is installed in
+    @param un_node - uN_B, the node's locator function value (GIB_RANGE)
+    @param uc - uC_Cilium, the End.Cilium function value (LIB_RANGE)
+    @param is_add - install (true) or remove (false)
+*/
+autoendian autoreply define srv6_uc_locator_set
+{
+  u32 client_index;
+  u32 context;
+  u32 table_id;
+  u16 un_node;
+  u16 uc;
+  bool is_add;
+};
+
+/** \brief Add or remove one prefix of the SR domain node address set
+           (IF-2, D-32, 03 §3).
+
+    DEVIATION from 03 §7: the IF-2 message table has no entry for this set,
+    but 03 §3 makes `outer.src ∈ SR_DOMAIN_NODE_SET` the first check of
+    cilium-end-cilium and D-32 makes it the second defence layer against
+    direct injection from a shared underlay. Without a way to configure the
+    set the check can only ever fail, so the set is expressed here as a
+    bounded list of prefixes covering the SR domain's node and transit
+    addresses. A /128 entry expresses a single node address.
+
+    The set is empty until the agent configures it, which is the
+    fail-closed state: every packet reaching the local SID then drops as
+    DROP_UNTRUSTED_SOURCE.
+
+    Idempotent in both directions.
+
+      INVALID_VALUE   - prefix length above 128
+      LIMIT_EXCEEDED  - the bounded set is full (16 prefixes)
+      NO_SUCH_ENTRY   - removing a prefix that is not in the set
+      INIT_FAILED     - plugin not initialised
+
+    @param prefix - prefix to add to or remove from the set
+    @param is_add - add (true) or remove (false)
+*/
+autoendian autoreply define srv6_sr_domain_prefix_add_del
+{
+  u32 client_index;
+  u32 context;
+  vl_api_ip6_prefix_t prefix;
+  bool is_add;
+};
+
+/** \brief Dump the SR domain node address set (D-32, 03 §3). */
+autoendian define srv6_sr_domain_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief One prefix of the SR domain node address set.
+
+    @param prefix - the configured prefix, with the host bits masked off
+*/
+autoendian define srv6_sr_domain_details
+{
+  u32 context;
+  vl_api_ip6_prefix_t prefix;
+};
+
+/** \brief Read the End.Cilium local SID and delivery readiness state.
+
+    DEVIATION from 03 §7: not in the IF-2 message table, but 06 §3 requires
+    the `acl_delivery_suspends_total` counter and the agent has to know
+    whether the 03 §1.1 fail-closed ladder is engaged before it re-advertises
+    routes ("復旧時は guard coverage 確認後に local SID、SUSPENDED entry、
+    route の順で再有効化する"). Read-only; changes no state.
+*/
+autoendian define srv6_endcilium_status_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief Result of srv6_endcilium_status_get.
+
+    @param retval - 0 on success
+    @param locator_set - srv6_uc_locator_set has been applied
+    @param localsid_installed - the Block:uN_B:uC::/64 FIB entry exists.
+           False while locator_set is true means the fail-closed ladder
+           removed it (03 §1.1).
+    @param delivery_suspended - guard coverage was lost, the local SID was
+           removed and every ACTIVE Context was moved to SUSPENDED
+           (03 §1.1). Packets that still arrive drop as DROP_SRV6_NOT_READY.
+    @param table_id - IPv6 FIB table of the local SID
+    @param un_node - uN_B of the installed locator
+    @param uc - uC_Cilium of the installed locator
+    @param localsid - Block:uN_B:uC::
+    @param localsid_prefix_len - always 64 (D-10)
+    @param n_sr_domain_prefixes - size of the SR domain node address set
+    @param delivery_suspends - acl_delivery_suspends_total (06 §3)
+    @param localsid_installs - number of local SID installs since start
+*/
+autoendian define srv6_endcilium_status_get_reply
+{
+  u32 context;
+  i32 retval;
+  bool locator_set;
+  bool localsid_installed;
+  bool delivery_suspended;
+  u32 table_id;
+  u16 un_node;
+  u16 uc;
+  vl_api_ip6_address_t localsid;
+  u8 localsid_prefix_len;
+  u32 n_sr_domain_prefixes;
+  u64 delivery_suspends;
+  u64 localsid_installs;
+};
+
+/*
+ * ------------------------------------------------------------------
+ * Headend tables (C7, 02 §2 / §4 / §8)
+ * ------------------------------------------------------------------
+ */
+
+/** \brief One (src identity, policy revision) pair of srv6_revision_publish.
+
+    D-30 splits the policy revision by src identity so that a NetworkPolicy
+    change only stales the entries of the identities it affects. A revision
+    of ~0 is reserved as the "no slot" sentinel and is rejected.
+*/
+typedef srv6_policy_revision
+{
+  u32 identity;
+  u64 revision;
+};
+
+/** \brief Verdict stored in a ProgramCache entry (02 §4.1).
+
+    DENY is value 0 so that zero-initialised state is never forwarding state,
+    the same fail-safe convention srv6_acl_trust and srv6_context_state use.
+*/
+enum srv6_program_verdict : u8
+{
+  SRV6_PROGRAM_VERDICT_API_DENY = 0,
+  SRV6_PROGRAM_VERDICT_API_ALLOW = 1,
+};
+
+/** \brief Install or remove one LocalEndpointTable entry (IF-2, 02 §8).
+
+    Idempotent. The key is (sw_if_index, if_incarnation) per D-31: an
+    sw_if_index is reused after an interface is deleted, so a write carrying
+    the incarnation of a lifetime that has already ended is refused rather
+    than allowed to give a new Pod the previous Pod's identity.
+
+    Installing an entry also enables cilium-srv6-classify on that interface;
+    removing it disables it again. An interface with no entry is therefore
+    not part of the headend graph at all, which is why 02 §1 starts the chain
+    at a Pod interface.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_SW_IF_INDEX - unknown sw_if_index, or one the guard does not
+                            know about yet
+      INVALID_VALUE       - ip is the unspecified address
+      INVALID_VALUE_2     - if_incarnation does not match the live interface
+                            (D-31)
+      INVALID_VALUE_3     - ip is link-local; 02 §3 assumes one global
+                            unicast address per endpoint
+      NO_SUCH_ENTRY       - delete of an entry that is not installed
+      UNSPECIFIED         - the classify feature could not be enabled, so the
+                            endpoint would not be classified at all
+
+    @param sw_if_index - the Pod interface
+    @param if_incarnation - incarnation as reported by srv6_acl_dump (D-31)
+    @param identity - the src identity every packet from this interface is
+           classified with (02 §3: identity comes from the interface, never
+           from the packet's source address)
+    @param ip - the endpoint's address. A packet whose source address differs
+           drops as DROP_SRC_IP_MISMATCH.
+    @param local_context_id - endpoint incarnation, compared against the
+           conntrack entry's local_context_id in 02 §7.2
+    @param owner_quota_class - owner(namespace) quota class (D-42), used by
+           the ProgramCache, fragment cache and punt quotas
+*/
+autoendian autoreply define srv6_local_ep_add_del
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  u32 identity;
+  vl_api_ip6_address_t ip;
+  u32 local_context_id;
+  u32 owner_quota_class;
+  bool is_add;
+};
+
+/** \brief Dump the LocalEndpointTable (02 §2). */
+autoendian define srv6_local_ep_dump
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index; /* one interface, or ~0 for all */
+};
+
+/** \brief One LocalEndpointTable entry.
+
+    @param policy_revision - the revision currently published for this
+           entry's identity (D-30). ~0 means the identity has no revision
+           slot, in which case every flow of this endpoint punts.
+*/
+autoendian define srv6_local_ep_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  u32 identity;
+  vl_api_ip6_address_t ip;
+  u32 local_context_id;
+  u32 owner_quota_class;
+  u64 policy_revision;
+};
+
+/** \brief Install or remove one immutable PathCache entry (IF-2, 02 §8).
+
+    This is the legacy / low-level PathCache message (D-61). It installs or
+    removes one entry at a time, so a caller that applies a whole table with
+    it exposes the workers to intermediate tables that were never a desired
+    state. C3 therefore MUST NOT publish with it: the publication surface is
+    srv6_path_txn_begin / _put / _commit / _abort below, which installs a
+    complete table under one worker barrier. srv6_path_add_del stays for
+    single-entry operation (tests, CLI-driven experiments, and any caller
+    that is not publishing a table) and is refused while a staging
+    transaction is open, so the two can never interleave.
+
+    The index and the generation are assigned by the plugin, not by the
+    caller: the pool belongs to the dataplane and D-12 makes the generation
+    the plugin's own record of how often a slot has been reused. An add
+    returns both in the reply and the caller quotes them in
+    srv6_program_add_del; a delete presents them back.
+
+    An entry is never modified in place (D-12). An update is an add of a new
+    entry, a revision publish, and a delete of the old one, whose index is
+    only reusable after the grace period.
+
+    The mutable PMTU value is deliberately not part of this message (D-21):
+    it lives in the PathMtuTable keyed by path_id, is carried across
+    generations of the same path_id, and is reported in srv6_path_details.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_VALUE   - da_template is the unspecified address
+      INVALID_VALUE_2 - srh_len out of range, or the SRH template fails the
+                        01 §2.5 / §3.2 checks (length multiple of 8,
+                        Hdr Ext Len consistent, Routing Type 4, Next Header
+                        41, Last Entry inside the header, Segments Left not
+                        past Last Entry)
+      INVALID_VALUE_3 - n_shift_states out of range
+      INVALID_VALUE_4 - base_mtu below the IPv6 minimum of 1280; such a path
+                        would be an MTU black hole (02 §9)
+      LIMIT_EXCEEDED  - PathCache or PathMtuTable full
+      NO_SUCH_ENTRY   - delete of an index/generation that is not published
+      INSTANCE_IN_USE - a PathCache staging transaction is open (D-61)
+
+    @param path_id - Color + locator owner + segment fingerprint. Two entries
+           with the same path_id share one PathMtuTable slot, which is what
+           makes a learned MTU survive a republish (02 §4.4).
+    @param da_template - the initial outer destination (01 §2.1 / §2.2)
+    @param service_sid - the final Service SID (01 §2.3)
+    @param base_mtu - effective inner MTU from the path configuration; never
+           rewritten (D-21)
+    @param srh_len - SRH length in bytes, 0 for the SRH-less case
+    @param srh - the SRH exactly as it goes on the wire, validated once here
+           so that the encap node can copy it without inspecting it
+    @param n_shift_states - number of expected shift states
+    @param shift_states - 02 §4.4 expected_shift_states, the PTB correlation
+           input consumed by the PMTUD work
+    @param path_index - on delete, the entry to remove
+    @param generation - on delete, the generation that entry must still have
+*/
+autoendian define srv6_path_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  u32 path_index;
+  u32 generation;
+  u64 path_id;
+  vl_api_ip6_address_t da_template;
+  vl_api_ip6_address_t service_sid;
+  u16 base_mtu;
+  u8 srh_len;
+  u8 srh[136];
+  u8 n_shift_states;
+  vl_api_ip6_address_t shift_states[8];
+};
+
+/** \brief Result of srv6_path_add_del.
+
+    @param path_index - index of the installed entry (add only)
+    @param generation - generation of the installed entry (add only)
+*/
+autoendian define srv6_path_add_del_reply
+{
+  u32 context;
+  i32 retval;
+  u32 path_index;
+  u32 generation;
+};
+
+/** \brief Dump the PathCache (06 §4.2 `cilium-dbg srv6 paths`). */
+autoendian define srv6_path_dump
+{
+  u32 client_index;
+  u32 context;
+  u32 path_index; /* one entry, or ~0 for all */
+};
+
+/** \brief One PathCache entry and its PathMtuTable state.
+
+    @param base_mtu - the immutable value from the install (D-21)
+    @param learned_mtu - PathMtuTable[path_id].effective_mtu, 0 if nothing
+           has been learned
+    @param effective_mtu - min(base_mtu, learned_mtu), i.e. what the encap
+           node compares the inner length against (02 §9)
+*/
+autoendian define srv6_path_details
+{
+  u32 context;
+  u32 path_index;
+  u32 generation;
+  u64 path_id;
+  vl_api_ip6_address_t da_template;
+  vl_api_ip6_address_t service_sid;
+  u16 base_mtu;
+  u16 learned_mtu;
+  u16 effective_mtu;
+  u8 srh_len;
+  u8 n_shift_states;
+};
+
+/** \brief Open a PathCache staging transaction (IF-2, 02 §8, D-61).
+
+    The publication surface of C3. The three messages that follow build a
+    complete desired PathCache off to the side and install it under one
+    worker barrier, so that a worker only ever observes the previous complete
+    snapshot or the next one:
+
+      srv6_path_txn_begin   open the staging table
+      srv6_path_txn_put     stage one entry, reply carries its handle
+      srv6_path_txn_commit  validate, then install the whole table
+      srv6_path_txn_abort   drop the staging table
+
+    Norms (design/detail/00 §2.8, Issue #99):
+
+      PathHandle authority: PathCache (index, generation) handles are
+      allocated exclusively by the VPP plugin. Control-plane components MUST
+      NOT synthesize or predict PathHandles.
+
+      Atomic publication: staging operations MUST NOT alter the
+      worker-visible PathCache. A successful commit installs the complete
+      snapshot under one worker barrier transaction. Handles reserved during
+      staging MUST NOT be exposed to ProgramCache or conntrack before
+      successful commit.
+
+      failure semantics: publish is all-or-nothing. Any failure before
+      successful commit leaves the previously committed PathCache snapshot
+      active.
+
+    txn_id is assigned by the agent and is an operation identity, not a
+    sequence number: like punt_id and transitionRequestID, the plugin never
+    infers that two operations are the same one from the fact that two values
+    match. It only recognises the transaction it is currently holding open,
+    and the one it committed last so that a lost commit reply can be retried.
+    A txn_id must not be reused after it committed.
+
+    Only one transaction is open at a time, and it belongs to the whole
+    plugin rather than to an API client: the staging table is the next
+    complete PathCache, so a second concurrent one would have no meaning.
+
+    Rejections (all fail-closed, no state change):
+      INIT_FAILED     - the headend is not initialised
+      INVALID_VALUE   - txn_id is 0, which is the reserved "no transaction"
+      INSTANCE_IN_USE - a different transaction is already open; abort it
+                        first
+      VALUE_EXIST     - txn_id is the transaction that committed last, so a
+                        commit retry could no longer be told apart from a
+                        new transaction
+
+    Re-sending begin for the transaction that is already open succeeds and
+    keeps its staging table, so a lost reply costs nothing.
+
+    @param txn_id - the agent's operation identity for this publication
+*/
+autoendian autoreply define srv6_path_txn_begin
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+};
+
+/** \brief Stage one PathCache entry (IF-2, 02 §8, D-61).
+
+    The path specification is exactly the one srv6_path_add_del carries and
+    is validated identically, at staging time, so that a commit cannot fail
+    on the content of an entry the caller was already told was accepted.
+
+    The reply carries the handle the entry will have once the transaction
+    commits. It is reserved, not published: until the commit succeeds the
+    handle resolves to nothing, and the caller MUST NOT put it into a
+    ProgramCache entry, a conntrack promotion or a FragmentVerdictCache
+    record. Its only legitimate use before the commit is the caller's own
+    client_path_id -> handle correlation.
+
+    Handle assignment follows the D-12 reuse rules and nothing else:
+
+      - an entry whose specification is identical to a currently published
+        entry keeps that entry's index and generation, so a republication
+        that did not change a path does not invalidate the ProgramCache
+        entries that point at it;
+      - any other entry gets a slot that is free right now, with the slot's
+        generation incremented, so it can never collide with a handle issued
+        for a previous occupant;
+      - an index whose entry leaves the table at commit is retired, not
+        reused: it becomes free again only after the D-12 grace period, and
+        its next occupant carries a different generation. Until then a stale
+        handle fails to resolve and the packet is punted or dropped with
+        DROP_ENCAP_STALE_PATH rather than being sent down a different path.
+
+    client_path_id is the caller's operation identity for one staged entry,
+    scoped to this transaction. Re-sending a put with the same txn_id, the
+    same client_path_id and the same specification returns the same handle,
+    which is what makes a lost reply retryable. The plugin does not infer
+    anything else from the value.
+
+    Rejections (all fail-closed, no state change):
+      INIT_FAILED     - the headend is not initialised
+      NO_SUCH_ENTRY   - no transaction is open, or txn_id names a different
+                        transaction than the open one
+      VALUE_EXIST     - client_path_id is already staged with a different
+                        specification, or the specification duplicates
+                        another entry already staged in this transaction
+      INVALID_VALUE   - da_template is the unspecified address
+      INVALID_VALUE_2 - srh_len out of range, or the SRH template fails the
+                        01 §2.5 / §3.2 checks
+      INVALID_VALUE_3 - n_shift_states out of range
+      INVALID_VALUE_4 - base_mtu below the IPv6 minimum of 1280
+      LIMIT_EXCEEDED  - PathCache or PathMtuTable full. The staged table and
+                        the published one coexist until the commit, so the
+                        bound covers both.
+
+    @param txn_id - the open transaction
+    @param client_path_id - the caller's identity for this staged entry
+    @param path_id - Color + locator owner + segment fingerprint (D-21)
+    @param da_template - the initial outer destination (01 §2.1 / §2.2)
+    @param service_sid - the final Service SID (01 §2.3)
+    @param base_mtu - effective inner MTU from the path configuration
+    @param srh_len - SRH length in bytes, 0 for the SRH-less case
+    @param srh - the SRH exactly as it goes on the wire
+    @param n_shift_states - number of expected shift states
+    @param shift_states - 02 §4.4 expected_shift_states
+*/
+autoendian define srv6_path_txn_put
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+  u64 client_path_id;
+  u64 path_id;
+  vl_api_ip6_address_t da_template;
+  vl_api_ip6_address_t service_sid;
+  u16 base_mtu;
+  u8 srh_len;
+  u8 srh[136];
+  u8 n_shift_states;
+  vl_api_ip6_address_t shift_states[8];
+};
+
+/** \brief Result of srv6_path_txn_put.
+
+    @param path_index - the reserved PathCache index, valid once the
+           transaction commits
+    @param generation - the reserved generation of that index
+*/
+autoendian define srv6_path_txn_put_reply
+{
+  u32 context;
+  i32 retval;
+  u32 path_index;
+  u32 generation;
+};
+
+/** \brief Install a staged PathCache table (IF-2, 02 §8, D-61).
+
+    The staging table is validated as a whole, and only then, inside one
+    worker barrier section, does the plugin publish every staged entry and
+    retire every published entry the staging table does not contain. A worker
+    observes the previous complete table before the barrier and the new
+    complete table after it; there is no instant at which a partially applied
+    table is reachable.
+
+    Retired indices enter the D-12 grace queue exactly as srv6_path_add_del's
+    delete does. The barrier alone does not remove the old handles that
+    ProgramCache entries and conntrack records already quote, which is why
+    the commit never hands a retired index to a different path: those handles
+    stop resolving, and after the reclaim the slot's generation has moved on.
+
+    An empty staging table is a legitimate publication: it retires the whole
+    PathCache, which is what a node with no resolvable remote endpoint
+    publishes.
+
+    Committing closes the transaction. Re-sending commit for the transaction
+    that committed last succeeds without changing anything, so a lost reply
+    does not force the caller to rebuild the table; the handles its puts
+    returned stay valid because the committed snapshot is the same one.
+
+    Rejections (all fail-closed; the previously committed snapshot stays
+    active and the staging table is left open so it can be retried or
+    aborted):
+      INIT_FAILED     - the headend is not initialised
+      NO_SUCH_ENTRY   - no transaction is open and txn_id is not the one that
+                        committed last, or txn_id names a different
+                        transaction than the open one
+      INVALID_VALUE   - a staged entry that was to keep an already published
+                        handle no longer matches that entry, i.e. the
+                        published table changed under the transaction
+
+    @param txn_id - the transaction to install
+*/
+autoendian autoreply define srv6_path_txn_commit
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+};
+
+/** \brief Discard a staged PathCache table (IF-2, 02 §8, D-61).
+
+    Releases every handle the transaction reserved and leaves the published
+    PathCache exactly as it was. A released reservation does not give its
+    generation back: the next reservation of that index takes a further
+    generation, so a handle that was returned by a put and then aborted can
+    never be issued again for anything.
+
+    Rejections:
+      INIT_FAILED     - the headend is not initialised
+      NO_SUCH_ENTRY   - no transaction is open, or txn_id names a different
+                        transaction than the open one
+
+    @param txn_id - the transaction to discard
+*/
+autoendian autoreply define srv6_path_txn_abort
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+};
+
+/** \brief Install or remove one ProgramCache entry (IF-2, 02 §8).
+
+    Idempotent: re-installing the same key overwrites the entry.
+
+    The three dependency revisions are compared against the ones this node
+    currently publishes before anything is written, which is the plugin side
+    of 02 §4.3's "VPP install 直前に再比較する。一つでも変化したら結果を
+    install せず再試行する". An identity that has never appeared in an
+    srv6_revision_publish has no revision slot, and its slot reads as the ~0
+    sentinel, so the first install for a new identity must be preceded by a
+    publish.
+
+    Capacity is governed by 02 §5.3 / D-26 / D-42: ALLOW and negative (DENY)
+    entries have separate budgets so that scan traffic cannot evict
+    established flows, and eviction inside a budget prefers entries whose
+    owner and identity are over their soft quota.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_VALUE   - dst is the unspecified address
+      INVALID_VALUE_2 - unknown verdict
+      INVALID_VALUE_3 - one of the three revisions is not the one currently
+                        published (stale compile, 02 §4.3)
+      NO_SUCH_ENTRY   - ALLOW whose path handle does not resolve, or a delete
+                        of a key that is not installed
+      LIMIT_EXCEEDED  - the budget is full and fair eviction found nothing to
+                        evict (counted in program_cache_quota_drops_total)
+
+    @param src_identity - key: source identity
+    @param dst - key: destination address
+    @param proto - key: upper layer protocol
+    @param l4_discriminator - key: TCP/UDP destination port, ICMPv6
+           (type << 8) | code, 0 otherwise (D-41)
+    @param verdict - ALLOW or DENY
+    @param policy_revision - revision of policy_revision[src_identity] (D-30)
+    @param endpoint_revision - dst identity / RemoteEndpoint dependency
+    @param path_revision - PathCache dependency
+    @param path_cache_index - versioned handle, ALLOW only
+    @param path_generation - versioned handle, ALLOW only
+    @param owner_quota_class - owner(namespace) quota class (D-42)
+
+    D-51: there is no lease field. The lease belongs to the dependency
+    identity, not to the entry (00 §2.1), and an accepted ALLOW install grants
+    `src_identity` a lease for `policy_revision` on the spot (02 §5.4), which
+    is what keeps a freshly compiled entry usable until the next
+    srv6_lease_extend. The steady-state lease length is the one that message
+    carries; the install-time grant uses the plugin's `allow-lease-ms`.
+*/
+autoendian autoreply define srv6_program_add_del
+{
+  u32 client_index;
+  u32 context;
+  u32 src_identity;
+  vl_api_ip6_address_t dst;
+  u8 proto;
+  u16 l4_discriminator;
+  vl_api_srv6_program_verdict_t verdict;
+  u64 policy_revision;
+  u64 endpoint_revision;
+  u64 path_revision;
+  u32 path_cache_index;
+  u32 path_generation;
+  u32 owner_quota_class;
+  bool is_add;
+};
+
+/** \brief Dump the ProgramCache (06 §4.2 `cilium-dbg srv6 program-cache`).
+
+    @param src_identity - one identity, or ~0 for all
+    @param cursor - pool index to start at; the reply stream is bounded by
+           max_entries so that a 1M entry pool can be paged
+    @param max_entries - 0 for "no bound"
+*/
+autoendian define srv6_program_dump
+{
+  u32 client_index;
+  u32 context;
+  u32 src_identity;
+  u32 cursor;
+  u32 max_entries;
+};
+
+/** \brief One ProgramCache entry.
+
+    @param lease_remaining_ms - milliseconds left on the PolicyLeaseTable
+           lease of this entry's dependency pair (src_identity,
+           policy_revision), which is what 02 §4.2 checks (D-51). 0 for DENY,
+           for an identity with no lease, for a lease granted against another
+           revision, and for an expired one.
+    @param stale - the entry's dependency revisions no longer match what the
+           node publishes, so the next packet punts (02 §4.2)
+*/
+autoendian define srv6_program_details
+{
+  u32 context;
+  u32 program_index;
+  u32 src_identity;
+  vl_api_ip6_address_t dst;
+  u8 proto;
+  u16 l4_discriminator;
+  vl_api_srv6_program_verdict_t verdict;
+  u64 policy_revision;
+  u64 endpoint_revision;
+  u64 path_revision;
+  u32 path_cache_index;
+  u32 path_generation;
+  u32 lease_remaining_ms;
+  u32 owner_quota_class;
+  bool stale;
+  u64 packets;
+  u64 bytes;
+};
+
+/** \brief Publish the dependency revision table (IF-2, 02 §8, D-30).
+
+    Every per-identity policy revision and both global revisions are applied
+    inside one worker barrier section, so a packet never observes a partially
+    applied publish (02 §4.3). Revisions are monotonic: a publish that would
+    move one backwards is refused, because that would let a revoked ALLOW
+    become valid again.
+
+    Publishing a revision for an identity that has no slot creates one. The
+    slot is retained afterwards so that the next srv6_program_add_del for
+    that identity has something to compare against.
+
+    Rejections:
+      INVALID_VALUE   - policy count without an array
+      INVALID_VALUE_2 - a revision moves backwards
+      INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
+      LIMIT_EXCEEDED  - the per-identity revision table is full; the
+                        identities that could not be given a slot punt
+
+    @param endpoint_revision - new global endpoint/RemoteEndpoint revision
+    @param path_revision - new global PathCache revision
+    @param n_policy - number of per-identity revisions that follow
+    @param policy - the per-identity revisions
+*/
+autoendian autoreply define srv6_revision_publish
+{
+  u32 client_index;
+  u32 context;
+  u64 endpoint_revision;
+  u64 path_revision;
+  u32 n_policy;
+  vl_api_srv6_policy_revision_t policy[n_policy];
+};
+
+/** \brief Renew the PolicyLeaseTable (IF-2, 02 §8, D-51).
+
+    The message updates the PolicyLeaseTable and nothing else: for every
+    (identity, revision) pair whose revision is still the one this node
+    publishes, the lease is granted for that revision with the supplied
+    length. It is O(n_policy) — no ProgramCache, conntrack or fragment entry
+    is read or written — which is the reason the lease was moved off the
+    entry (00 §2.1, 02 §5.4):
+
+      - refreshing from the hot path is one punt per entry per lease period,
+        i.e. 1M entries / 30 s = 33k punt/s against a 4096-deep queue;
+      - refreshing per entry from here is a walk of the whole pool plus a
+        write to every matching slot, on every push;
+      - and neither reached the conntrack table at all, so every long-lived
+        flow re-authorised once per lease period.
+
+    The set of identities the agent sends is the union of the source
+    identities of its installed ALLOW entries and the remote identities of the
+    conntrack entries it has verified; the second half is what gives the reply
+    direction a renewal path.
+
+    An identity with no slot has no dependent state on this node and is
+    counted in n_skipped rather than given one, so a push cannot grow the
+    table. A pair whose revision has already moved is skipped too: its entries
+    fail the revision comparison of 02 §4.2 anyway.
+
+    Stopping the push is the enforcement mechanism of D-49: when the policy
+    watcher is disconnected, has an event gap or is outside its revision lag
+    SLO, the agent stops calling this (and stops installing), so every
+    decision that depends on the identity — forward and reply alike — fails
+    closed once the deadline passes.
+
+    No worker barrier is taken: the only writes are two aligned 8 byte fields
+    per slot that the hot path only reads.
+
+    Rejections:
+      INIT_FAILED     - tables not built yet
+      INVALID_VALUE   - a policy count without an array
+      INVALID_VALUE_2 - a revision equals the reserved ~0 sentinel
+
+    @param lease_ms - lease length; 0 means the plugin's `allow-lease-ms`
+    @param n_policy - number of (identity, revision) pairs that follow
+    @param policy - the pairs to renew
+*/
+autoendian define srv6_lease_extend
+{
+  u32 client_index;
+  u32 context;
+  u32 lease_ms;
+  u32 n_policy;
+  vl_api_srv6_policy_revision_t policy[n_policy];
+};
+
+/** \brief Result of srv6_lease_extend.
+
+    @param n_updated - identities whose lease was renewed
+    @param n_skipped - pairs left alone: no slot on this node, or a revision
+           that has already moved
+*/
+autoendian define srv6_lease_extend_reply
+{
+  u32 context;
+  i32 retval;
+  u32 n_updated;
+  u32 n_skipped;
+};
+
+/** \brief Install one FragmentVerdictCache entry (IF-2, 02 §8, 01 §3.1).
+
+    01 §3.1 evaluates a first fragment only when it carries a complete L4
+    header and stores the resulting verdict under
+    (src, dst, fragment-id, next-header); every later fragment of that
+    datagram is forwarded on that record and on nothing broader (D-43). When
+    the ProgramCache already holds the decision the dataplane writes the
+    record itself, without a punt (02 §2). This message is the other producer:
+    the verdict the agent compiled for a first fragment that punted.
+
+    The record is bound to exactly what D-20 binds it to — source identity,
+    endpoint incarnation, the three dependency revisions, the ALLOW lease and
+    the versioned path handle — so that the fragment path cannot be the one
+    route that keeps using a revoked ALLOW. Three of those are not taken from
+    the message:
+
+      endpoint incarnation  `local_context_id` is read from the
+                            LocalEndpointTable entry that (sw_if_index,
+                            if_incarnation) resolves to, never from the
+                            caller, exactly as srv6_ct_verify does. The same
+                            lookup supplies the D-42 quota class.
+      the lease             D-51 keeps it in the PolicyLeaseTable slot of
+                            `src_identity`, so there is no lease field. This
+                            message is the *fourth* `policy_lease_touch`
+                            trigger of 02 §5.4 (Issue #83): an accepted ALLOW
+                            refreshes the lease of `src_identity` for exactly
+                            `policy_revision`, and the record is published
+                            only once that exact-revision lease is usable, so
+                            the caller never receives a success for an ALLOW
+                            record the hot path would refuse for want of a
+                            lease. A DENY refreshes nothing — it is fail-safe
+                            and consults no lease.
+      the quota class       from the LocalEndpointTable entry (D-42).
+
+    `fragment_id` is the IPv6 Fragment header Identification as a number, in
+    host byte order; the plugin converts it to the network order the cache
+    key is built from. `next_header` is the Fragment header's Next Header —
+    the key component, not the upper-layer protocol of the datagram: RFC 8200
+    puts per-fragment extension headers after the Fragment header, so the two
+    are not always the same value.
+
+    Idempotent, as 02 §8 requires of every IF-2 message: a second write of the
+    same key and the same punt_id replaces the record. That is not in tension
+    with D-43's "a re-received first fragment drops" — D-43 is a rule about
+    packets arriving on an interface, enforced in cilium-srv6-classify, while
+    this is a control-plane write of a decision the agent already compiled.
+
+    `punt_id` (#90) is the identity of the punt this verdict answers, echoed
+    from the punt metadata. It arms the record's one-shot reinjection
+    capability: the reinjected first fragment of that punt, and only it, is
+    admitted past D-43 once. The three install cases are:
+
+      no live record          installed, capability unspent
+      live record, same
+        punt_id               idempotent replay: succeeds, and the capability
+                              state is carried forward unchanged. "An
+                              idempotent FragmentVerdictAdd replay MUST NOT
+                              recreate an already-consumed reinjection
+                              capability."
+      live record, different
+        punt_id               refused with VALUE_EXIST, nothing written and no
+                              lease touched. After the record expires the key
+                              is a new datagram and any punt_id installs it.
+
+    punt_id 0 means "answers no punt": the record is installed with no
+    capability and every reinjection presented against it is dropped as
+    DROP_FRAGMENT_STALE_REINJECT. It is also what the dataplane writer stores
+    for a first fragment it forwarded from a ProgramCache hit.
+
+    Rejections (all fail-closed, no state change):
+      INIT_FAILED         - tables not built yet
+      INVALID_SW_IF_INDEX - no LocalEndpointTable entry for sw_if_index
+      INVALID_VALUE       - src or dst unspecified; src is not the address of
+                            that endpoint (02 §3 makes the interface, not the
+                            packet, the authority on who sent it);
+                            policy_revision is the reserved ~0 sentinel;
+                            unknown verdict
+      INVALID_VALUE_2     - if_incarnation is not the live one (D-31)
+      INVALID_VALUE_3     - src_identity is not that endpoint's current
+                            identity
+      INVALID_VALUE_4     - one of the three revisions is not the one this
+                            node currently publishes (stale compile, 02 §4.3),
+                            or an ALLOW whose `policy_lease_touch` for
+                            {src_identity, policy_revision} was refused or did
+                            not yield a usable exact-revision lease (D-51,
+                            step 3/4 of the handler). Both mean the node
+                            cannot vouch for that pair right now, so the agent
+                            recompiles rather than retries; no record is
+                            published either way
+      NO_SUCH_ENTRY       - ALLOW whose versioned path handle does not resolve
+      LIMIT_EXCEEDED      - the D-42 owner/identity quota is reached, or the
+                            cache is full and nothing could be evicted
+      VALUE_EXIST         - a live record for this key answers a different
+                            punt operation (#90); its datagram has already
+                            been decided, so nothing is written
+
+    @param src - key: inner source address
+    @param dst - key: inner destination address
+    @param fragment_id - key: Fragment header Identification, host byte order
+    @param next_header - key: Fragment header Next Header (01 §3.1)
+    @param sw_if_index - the interface the punted fragment arrived on
+    @param if_incarnation - its incarnation (D-31)
+    @param src_identity - the identity the decision was made for; it must
+           still be the identity of that endpoint
+    @param verdict - ALLOW or DENY. A DENY record is what makes the later
+           fragments of a denied datagram drop as DROP_POLICY_DENIED instead
+           of punting one by one.
+    @param policy_revision - revision of policy_revision[src_identity] (D-30)
+    @param endpoint_revision - dst identity / RemoteEndpoint dependency
+    @param path_revision - PathCache dependency
+    @param path_cache_index - versioned handle, ALLOW only
+    @param path_generation - versioned handle, ALLOW only
+    @param timeout_ms - lifetime of the record. 0 means the plugin's
+           configured fragment timeout, and any larger value is clamped to it:
+           01 §3.1 bounds the fragment cache by entry count *and* by timeout
+           (60 s), so the caller may shorten the lifetime but never extend it.
+           The reinjection capability has no separate lifetime: it expires with
+           the record.
+    @param punt_id - the punt operation this verdict answers (#90), echoed
+           from the IF-3 punt metadata. 0 means it answers no punt, and the
+           record is then installed with no reinjection capability.
+*/
+autoendian autoreply define srv6_fragment_verdict_add
+{
+  u32 client_index;
+  u32 context;
+  vl_api_ip6_address_t src;
+  vl_api_ip6_address_t dst;
+  u32 fragment_id;
+  u8 next_header;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  u32 src_identity;
+  vl_api_srv6_program_verdict_t verdict;
+  u64 policy_revision;
+  u64 endpoint_revision;
+  u64 path_revision;
+  u32 path_cache_index;
+  u32 path_generation;
+  u32 timeout_ms;
+  u64 punt_id;
+};
+
+/** \brief Set the outer header parameters of the headend (01 §1).
+
+    DEVIATION from the 02 §8 message table: the table has no message for
+    these, but 01 §1 fixes the outer source address to "headend node の node
+    address", the Hop Limit and the DSCP copy to node settings, and 01 §5
+    names `srv6_inner_mtu`. Without them the encap node has no source address
+    to put on the wire, so the values have to reach the plugin somehow. Until
+    this message has been accepted, cilium-srv6-encap drops with
+    DROP_SRV6_NOT_READY.
+
+    Rejections:
+      INVALID_VALUE   - node_address unspecified or link-local (01 §7
+                        requires it to be routable from the Pod)
+      INVALID_VALUE_2 - inner_mtu below the IPv6 minimum of 1280
+      INVALID_VALUE_3 - hop_limit 0
+      NO_SUCH_FIB     - outer_table_id does not exist
+
+    @param node_address - outer source address (01 §1)
+    @param outer_table_id - IPv6 FIB the encapsulated packet is looked up in
+    @param inner_mtu - `srv6_inner_mtu` (01 §5); 0 means the 1460 default
+    @param hop_limit - outer Hop Limit; 01 §1 default 64
+    @param copy_dscp - copy the inner DSCP into the outer Traffic Class
+           (01 §1, "設定で無効化可能")
+*/
+autoendian autoreply define srv6_headend_config_set
+{
+  u32 client_index;
+  u32 context;
+  vl_api_ip6_address_t node_address;
+  u32 outer_table_id;
+  u16 inner_mtu;
+  u8 hop_limit;
+  bool copy_dscp;
+};
+
+/** \brief Read the headend gauges and counters (06 §3).
+
+    This is the headend half of the `srv6_counters_dump` row of 02 §8: the
+    per-node drop reasons are already VPP error counters (06 §2), so what is
+    left is the table occupancy and slow path state the metrics of 06 §3 need
+    (program_cache_entries, program_cache_quota_drops_total,
+    program_cache_fair_evictions_total, slowpath_queue_depth,
+    slowpath_drops_total, path_cache_entries, revision).
+*/
+autoendian define srv6_headend_status_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief Result of srv6_headend_status_get.
+
+    @param configured - srv6_headend_config_set has been accepted; until then
+           cilium-srv6-encap drops
+    @param n_programs_allow - ALLOW budget occupancy
+    @param n_programs_negative - negative (DENY) budget occupancy (D-26)
+    @param punt_outstanding - slowpath_queue_depth per queue, indexed by
+           0 = compile, 1 = reply re-authorisation, 2 = fragment
+    @param punt_drops - slowpath_drops_total per queue, all refusal reasons
+           summed (the split is in the plugin log and CLI)
+    @param punt_no_transport - punts refused because no IF-3 transport is
+           registered; a non-zero value means the slow path is not wired up
+    @param conntrack_registered - a C10 conntrack lookup hook is registered;
+           while it is not, every packet takes 02 §7.2 branch 3
+*/
+autoendian define srv6_headend_status_get_reply
+{
+  u32 context;
+  i32 retval;
+  bool configured;
+  vl_api_ip6_address_t node_address;
+  u32 outer_table_id;
+  u16 inner_mtu;
+  u8 hop_limit;
+  bool copy_dscp;
+  u32 program_capacity;
+  u32 program_negative_capacity;
+  u32 n_programs_allow;
+  u32 n_programs_negative;
+  u32 path_capacity;
+  u32 n_paths;
+  u32 frag_capacity;
+  u32 n_frags;
+  u32 n_local_endpoints;
+  u64 endpoint_revision;
+  u64 path_revision;
+  u64 program_installs;
+  u64 program_deletes;
+  u64 program_quota_drops;
+  u64 program_fair_evictions;
+  u64 program_stale_installs;
+  u64 lease_extends;
+  u64 revision_publishes;
+  u64 frag_evictions;
+  u64 frag_quota_drops;
+  u64 frag_gc;
+  u32 punt_outstanding[3];
+  u64 punt_punted[3];
+  u64 punt_drops[3];
+  u64 punt_no_transport;
+  u64 punt_reinjected;
+  u64 punt_reinject_rejected;
+  bool conntrack_registered;
+  bool punt_transport_registered;
+};
+
+/** \brief Conntrack entry state (02 §7.1, C10).
+
+    INVALID is value 0 so that a zero-filled record is never usable, the same
+    fail-safe convention srv6_context_state follows.
+*/
+enum srv6_ct_state : u8
+{
+  SRV6_CT_STATE_API_INVALID = 0,
+  /* created by the destination's delivery path before anything was
+     authorised (D-19); the first reply re-authorises */
+  SRV6_CT_STATE_API_UNVERIFIED = 1,
+  SRV6_CT_STATE_API_SYN_SEEN = 2,
+  SRV6_CT_STATE_API_VERIFIED_ESTABLISHED = 3,
+  SRV6_CT_STATE_API_FIN_WAIT = 4,
+  SRV6_CT_STATE_API_CLOSED = 5,
+};
+
+/** \brief Promote a conntrack entry to VERIFIED_ESTABLISHED (IF-2, 02 §7.2).
+
+    The reply re-authorisation of D-19: the destination created the entry
+    with state UNVERIFIED and no policy revision, because the wire carries
+    neither the source identity nor the revision the sending headend
+    authorised under (D-45). The first reply is punted on the dedicated
+    re-authorisation queue (D-38), the agent resolves the peer identity from
+    IPCache and evaluates the *forward* direction under the current policy,
+    and only an ALLOW reaches this message.
+
+    The 5-tuple is the reply packet's, i.e. exactly the one that was punted;
+    the entry it identifies is the reply-direction one.
+
+    Everything is validated before any state changes and the transition
+    happens inside one worker barrier section (D-12).
+
+    DEVIATION from 02 §8, reported rather than resolved by guessing:
+
+      (a) 02 §8 lists no IF-2 message for this write at all, although
+          02 §7.2 requires the agent to write policy_revision and the state.
+          The message is named srv6_ct_verify here.
+      (b) `remote_identity` is not in the 02 §7.1 entry, which names only
+          local_endpoint_identity. It is required because D-30 scopes the
+          policy revision to the source identity of the authorised
+          direction, which for a reply is the peer: without it the dataplane
+          cannot know which revision to compare the stored one against.
+          02 §2 describes the value as carrying "identities" (plural), so
+          the shape is at least consistent with the table list.
+      (c) `path_cache_index` / `path_generation` are not in the 02 §7.1
+          entry either, but 02 §7.2 branch 1 bypasses the ProgramCache, and
+          the ProgramCache entry is what would otherwise supply the path the
+          reply is encapsulated on. The agent resolves the handle during the
+          re-authorisation (it already resolves one in 02 §5.1 step 5) and
+          writes it here; the hot path returns it and the caller re-resolves
+          it, so a handle that has been retired degrades to another
+          re-authorisation punt instead of forwarding on a guessed path.
+
+    The revision of `remote_identity` must have been published with
+    srv6_revision_publish before this call: a promotion carrying a revision
+    that is not the currently published one is refused, exactly as
+    srv6_program_add_del refuses a stale compile (02 §4.3).
+
+    Rejections (all fail-closed, no state change):
+      INIT_FAILED         - tables not built yet
+      INVALID_VALUE       - src or dst is the unspecified address,
+                            policy_revision is the reserved ~0 sentinel
+                            (which is what "not authorised" means in an
+                            entry, so it can never be an authorisation), or
+                            src is not the address of the endpoint on
+                            sw_if_index
+      INVALID_SW_IF_INDEX - no local endpoint on sw_if_index
+      INVALID_VALUE_2     - if_incarnation does not match the live interface
+                            (D-31: the punt was issued for a Pod that is
+                            already gone)
+      INVALID_VALUE_3     - local_identity is no longer the endpoint's
+      INVALID_VALUE_4     - policy_revision is not the currently published
+                            revision of remote_identity (stale)
+      NO_SUCH_ENTRY       - no reply entry for the tuple (it expired or was
+                            evicted; the peer's retransmission recreates it),
+                            the entry is CLOSED, the entry belongs to a
+                            previous incarnation of the endpoint (D-15: it is
+                            not rebound to the current Pod), or the path
+                            handle does not resolve
+      LIMIT_EXCEEDED      - no per-identity revision slot, or the authorised
+                            budget is full and fair eviction found nothing
+
+    @param src - reply direction source, i.e. the local endpoint
+    @param dst - reply direction destination, i.e. the peer
+    @param proto - upper layer protocol
+    @param sport - reply direction source port
+    @param dport - reply direction destination port
+    @param sw_if_index - the local endpoint's interface, from the punt
+    @param if_incarnation - its incarnation, from the punt (D-31)
+    @param local_identity - the local endpoint's identity, from the punt
+           metadata and never from the packet
+    @param remote_identity - the peer identity the re-authorisation resolved
+           from IPCache; the revision below is scoped to it (D-30)
+    @param policy_revision - the revision the decision was made under
+    @param path_cache_index - versioned path handle for the bypass
+    @param path_generation - versioned path handle for the bypass
+
+    D-51: there is no lease field. The lease belongs to `remote_identity`, not
+    to the entry, and an accepted promotion grants that identity a lease for
+    `policy_revision` on the spot (02 §5.4) so that the very next reply can
+    take the bypass. From then on the lease is renewed by srv6_lease_extend,
+    which is what removes the once-per-lease-period re-authorisation punt of
+    every long-lived flow. Stopping the renewal still closes the reply
+    direction, which is what D-49 requires.
+*/
+autoendian autoreply define srv6_ct_verify
+{
+  u32 client_index;
+  u32 context;
+  vl_api_ip6_address_t src;
+  vl_api_ip6_address_t dst;
+  u8 proto;
+  u16 sport;
+  u16 dport;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  u32 local_identity;
+  u32 remote_identity;
+  u64 policy_revision;
+  u32 path_cache_index;
+  u32 path_generation;
+};
+
+/** \brief Invalidate the conntrack entries of one endpoint (IF-2, 02 §8).
+
+    D-15: an endpoint delete must not leave state behind that a Pod which
+    later reuses the address could inherit.
+
+    Enforcement does not depend on this message. A conntrack entry stores the
+    endpoint incarnation it was created for and 02 §7.2 compares it against
+    the *live* LocalEndpointTable on every packet, so an entry of a deleted
+    incarnation stops satisfying the allow conditions the moment the endpoint
+    is removed, whether or not it has been reclaimed. What this message does
+    is return the memory, and it is also driven internally by
+    srv6_local_ep_add_del(is_add=0), interface deletion and
+    srv6_context_invalidate.
+
+    Bounded work per call: `max_entries` table slots are examined inside the
+    barrier section, starting at `cursor`; `next_cursor` says where to
+    continue. A caller that does not iterate is still correct, because the
+    plugin's own housekeeping completes the sweep.
+
+    Rejections:
+      INIT_FAILED   - tables not built yet
+      INVALID_VALUE - cursor beyond the table
+
+    @param local_context_id - the endpoint incarnation to purge
+    @param cursor - table slot to start at, 0 for the beginning
+    @param max_entries - slots to examine; 0 means the plugin's default
+*/
+autoendian define srv6_ct_invalidate
+{
+  u32 client_index;
+  u32 context;
+  u32 local_context_id;
+  u32 cursor;
+  u32 max_entries;
+};
+
+/** \brief Result of srv6_ct_invalidate.
+
+    @param n_invalidated - entries removed by this call
+    @param next_cursor - slot to pass as `cursor` next; once it has wrapped
+           past the starting point the pass is complete
+*/
+autoendian define srv6_ct_invalidate_reply
+{
+  u32 context;
+  i32 retval;
+  u32 n_invalidated;
+  u32 next_cursor;
+};
+
+/** \brief Read the conntrack gauges and counters (06 §3).
+
+    Supplies conntrack_entries (by state: unverified/verified) and
+    conntrack_quota_drops_total, plus the dataplane half of the D-19 reply
+    re-authorisation picture; conntrack_reauth_total /
+    conntrack_reauth_denied_total themselves are agent-side (C4) counters.
+*/
+autoendian define srv6_ct_status_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief Result of srv6_ct_status_get.
+
+    @param capacity - table upper bound (02 §7.1, D-38)
+    @param unverified_capacity - separate UNVERIFIED allowance (D-38)
+    @param n_unverified - entries created before authorisation
+    @param n_verified - authorised entries (forward and promoted reply)
+    @param created_unverified - entries created by the delivery path
+    @param created_verified - entries created by the egress path
+    @param verified - successful srv6_ct_verify promotions
+    @param verify_rejected - refused promotions (all fail-closed)
+    @param quota_drops - creations refused because the budget was full and
+           fair eviction found nothing to evict
+    @param evictions - fair evictions
+    @param gc - entries reclaimed by timeout
+    @param invalidated - entries reclaimed by an endpoint delete
+    @param incarnation_mismatch - reply hits whose endpoint incarnation or
+           identity no longer matched, i.e. address reuse caught by D-15
+    @param revision_mismatch - reply hits whose stored policy revision was
+           no longer the published one
+    @param lease_expired - reply hits past their ALLOW lease (D-49)
+    @param proto_state_denied - reply hits on a CLOSED flow
+    @param registered - the hooks are registered, i.e. 02 §7.2 is live
+*/
+autoendian define srv6_ct_status_get_reply
+{
+  u32 context;
+  i32 retval;
+  u32 capacity;
+  u32 unverified_capacity;
+  u32 n_unverified;
+  u32 n_verified;
+  u64 created_unverified;
+  u64 created_verified;
+  u64 verified;
+  u64 verify_rejected;
+  u64 quota_drops;
+  u64 evictions;
+  u64 gc;
+  u64 invalidated;
+  u64 incarnation_mismatch;
+  u64 revision_mismatch;
+  u64 lease_expired;
+  u64 proto_state_denied;
+  f64 timeout_unverified;
+  f64 timeout_tcp_established;
+  f64 timeout_tcp_transient;
+  f64 timeout_udp;
+  f64 timeout_icmp6;
+  bool registered;
+};
+
+/** \brief Dump the ConntrackTable (06 §4.2).
+
+    @param local_context_id - one endpoint incarnation, or ~0 for all
+    @param cursor - table slot to start at; the reply stream is bounded by
+           max_entries so that a 1M entry table can be paged
+    @param max_entries - 0 for "no bound"
+*/
+autoendian define srv6_ct_dump
+{
+  u32 client_index;
+  u32 context;
+  u32 local_context_id;
+  u32 cursor;
+  u32 max_entries;
+};
+
+/** \brief One conntrack entry.
+
+    @param policy_revision - the entry's `verified_revision`: ~0 while the
+           entry is unauthorised, since D-19/D-45 forbid the destination from
+           writing a real one
+    @param lease_remaining_ms - milliseconds left on the PolicyLeaseTable
+           lease of (remote_identity, policy_revision), which is steps 3 and 4
+           of the 02 §7.2 judgement (D-51). 0 when unauthorised, when that
+           identity has no lease, when the lease was granted against another
+           revision, and when it has expired.
+    @param stale - the stored revision is no longer the published revision of
+           remote_identity, so the next reply re-authorises (step 2 of
+           02 §7.2, which is where a policy change is detected — independently
+           of how much lease is left)
+    @param packets - [0] the direction the entry is keyed in, [1] the other
+*/
+autoendian define srv6_ct_details
+{
+  u32 context;
+  u32 entry_index;
+  vl_api_ip6_address_t src;
+  vl_api_ip6_address_t dst;
+  u8 proto;
+  u16 sport;
+  u16 dport;
+  bool is_reply;
+  vl_api_srv6_ct_state_t state;
+  u32 local_context_id;
+  u32 local_endpoint_identity;
+  u32 remote_identity;
+  u64 policy_revision;
+  u32 lease_remaining_ms;
+  u32 path_cache_index;
+  u32 path_generation;
+  u32 owner_quota_class;
+  u8 tcp_flags;
+  bool verified;
+  bool stale;
+  f64 age;
+  u64 packets[2];
+  u64 bytes[2];
+};
+
+/*
+ * ------------------------------------------------------------------
+ * Drop reason inventory and counter read-out (C5, 06 §1 / §2 / §3 / §4.2)
+ * ------------------------------------------------------------------
+ */
+
+/** \brief The 06 §2 drop reason space.
+
+    06 §1 forbids an "unknown drop" counter: every packet the plugin drops
+    has to be attributable to exactly one reason, otherwise the fail-closed
+    argument ("every drop is explainable") cannot be checked. This enum is
+    the closed set that makes the check mechanical — cilium_srv6_counters.c
+    binds every registered error counter of every cilium_srv6 graph node to
+    one value of it, and the plugin refuses to initialise if a counter is
+    left unbound.
+
+    NOT_A_DROP means "this counter does not count a drop" (the `severity
+    info` counters, and the cilium-srv6-ptb counters, which classify an
+    ICMPv6 Packet Too Big and then pass the packet on to ip6-punt
+    regardless).
+
+    NO_REMOTE_ENDPOINT and IDENTITY_UNRESOLVED are 06 §2 reasons the headend
+    *slow path* decides (pkg/srv6ec/compiler.DropReason), not the dataplane.
+    They are part of the enum so that the enum is the whole 06 §2 table and
+    the agent has one reason space to export cilium_srv6_drop_total from;
+    no srv6_counters_details ever carries them.
+
+    DEVIATION from 06 §2: ENCAP_STALE_PATH and ENCAP_NO_HEADROOM are drops
+    the 06 §2 table has no name for. cilium-srv6-encap drops a packet whose
+    versioned path handle stopped resolving between the forwarding decision
+    and the encapsulation (the D-12 race, expected to be 0), and one that has
+    no headroom for the outer header. Both are named here rather than folded
+    into a neighbouring reason, because 06 §1 rules out a catch-all bucket
+    and folding them would make an implementation fault look like a design
+    drop. They are reported for inclusion in the 06 §2 table.
+
+    LINK_LOCAL_CONTROL is the D-50 counter: an IPv6 link control packet
+    received on a Pod-facing interface, which the v1 dataplane does not
+    support. It is deliberately not folded into SRC_IP_MISMATCH — that one
+    is a candidate security violation (a Pod using an address that is not
+    its own), this one is a configuration or protocol event (02 §3).
+
+    UNINSPECTABLE_FRAGMENT is the D-54 fail-closed reason: an offset-zero
+    fragment received on an UNTRUSTED interface whose security-relevant
+    header chain the guard could not completely verify inside that fragment
+    (the chain crosses the fragment boundary, the parse budget is exhausted,
+    or a length is inconsistent). It is deliberately not folded into
+    MALFORMED_INNER: RFC 7112 forbids a conformant sender from producing a
+    truncated offset-zero fragment, so this reason marks a security-relevant
+    malformed packet — a possible evasion attempt, not proof of one — while
+    MALFORMED_INNER also collects ordinary broken packets and would average
+    the signal away.
+
+    FRAGMENT_NOT_PERMITTED is the `untrusted-fragment-drop-all` hardening
+    option (D-54, default off): a Fragment header on an UNTRUSTED interface
+    refused by administrative policy, whatever the fragment kind (atomic,
+    first or non-first). It is a reason of its own rather than a second
+    counter under UNINSPECTABLE_FRAGMENT (#64), because "the guard could not
+    verify the chain" and "the configuration forbids fragments" are
+    different semantics: sharing a reason would let a deployment that
+    enables the option bury the evasion-candidate signal under its own
+    configuration, which the reason label of cilium_srv6_drop_total could
+    not then separate. It is an operational signal, zero while the option
+    is off.
+
+    FRAGMENT_STALE_REINJECT is the Issue #90 reason: a first fragment
+    reinjected over IF-3 that no live one-shot reinjection capability admits,
+    because the FragmentVerdictCache record expired or was evicted, because
+    the echoed punt_id is not the one the record carries, or because the
+    capability had already been spent. It is separated from
+    FRAGMENT_UNRESOLVED because the two say different things to an operator:
+    FRAGMENT_UNRESOLVED is about the packets a datagram is made of (ordering,
+    a first fragment re-received from the network, an expired verdict), while
+    this one says the agent answered a punt whose record this node no longer
+    holds — a control-plane latency, restart or bug signal. Its expected value
+    is ~0, but it is not a defect counter: a record that expires while a
+    compile is in flight produces it benignly.
+*/
+enum srv6_drop_reason : u8
+{
+  SRV6_DROP_REASON_API_NOT_A_DROP = 0,
+  SRV6_DROP_REASON_API_SID_BLOCK_INJECTION = 1,
+  SRV6_DROP_REASON_API_SID_BLOCK_QUARANTINED = 2,
+  SRV6_DROP_REASON_API_UNTRUSTED_SOURCE = 3,
+  SRV6_DROP_REASON_API_UNKNOWN_SOURCE_EP = 4,
+  SRV6_DROP_REASON_API_SRC_IP_MISMATCH = 5,
+  SRV6_DROP_REASON_API_POLICY_DENIED = 6,
+  SRV6_DROP_REASON_API_SLOWPATH_OVERFLOW = 7,
+  SRV6_DROP_REASON_API_NO_REMOTE_ENDPOINT = 8,
+  SRV6_DROP_REASON_API_IDENTITY_UNRESOLVED = 9,
+  SRV6_DROP_REASON_API_FRAGMENT_UNRESOLVED = 10,
+  SRV6_DROP_REASON_API_INNER_MTU_EXCEEDED = 11,
+  SRV6_DROP_REASON_API_UNKNOWN_CONTEXT = 12,
+  SRV6_DROP_REASON_API_INVALID_CONTEXT = 13,
+  SRV6_DROP_REASON_API_CONTEXT_RECYCLED = 14,
+  SRV6_DROP_REASON_API_MALFORMED_OUTER = 15,
+  SRV6_DROP_REASON_API_MALFORMED_INNER = 16,
+  SRV6_DROP_REASON_API_CONTEXT_IP_MISMATCH = 17,
+  SRV6_DROP_REASON_API_SRV6_NOT_READY = 18,
+  SRV6_DROP_REASON_API_ENCAP_STALE_PATH = 19,
+  SRV6_DROP_REASON_API_ENCAP_NO_HEADROOM = 20,
+  SRV6_DROP_REASON_API_LINK_LOCAL_CONTROL = 21,
+  SRV6_DROP_REASON_API_UNINSPECTABLE_FRAGMENT = 22,
+  SRV6_DROP_REASON_API_FRAGMENT_NOT_PERMITTED = 23,
+  SRV6_DROP_REASON_API_FRAGMENT_STALE_REINJECT = 24,
+};
+
+/** \brief Read every cilium_srv6 error counter, classified by drop reason
+           (IF-2, 02 §8 `srv6_counters_dump`).
+
+    Backs cilium_srv6_drop_total{reason,node} (06 §3) and
+    `cilium-dbg srv6 drops` (06 §4.2). One record per (graph node, counter),
+    summed over every worker thread, so that the agent can aggregate by
+    reason without losing the node breakdown an operator needs.
+
+    Counters whose `reason` is NOT_A_DROP are not drops; they carry the punt,
+    compile, conntrack and PTB-classification statistics 06 §3 also needs
+    (program_cache_punts_total, ptb_rejected_total, ...).
+
+    @param reason_filter - emit only records with this reason, or ~0 (255)
+           for all. Filtering on NOT_A_DROP returns exactly the non-drop
+           counters.
+*/
+autoendian define srv6_counters_dump
+{
+  u32 client_index;
+  u32 context;
+  u8 reason_filter;
+};
+
+/** \brief One classified counter.
+
+    @param reason - the 06 §2 reason this counter is bound to, NOT_A_DROP
+           if the counter does not count a drop
+    @param severity - VL_COUNTER_SEVERITY_* as registered in the counters
+           blocks below (0 error, 1 warn, 2 info)
+    @param node_name - graph node the counter belongs to
+    @param counter_name - counter name inside the node
+    @param value - sum over all worker threads, since the last counter clear
+*/
+autoendian define srv6_counters_details
+{
+  u32 context;
+  vl_api_srv6_drop_reason_t reason;
+  u8 severity;
+  string node_name[32];
+  string counter_name[40];
+  u64 value;
+};
+
+/* Drop reason counters (06 §2). The generated symbols are
+   CILIUM_SRV6_GUARD_ERROR_<NAME> / cilium_srv6_guard_error_counters. */
+counters cilium_srv6_guard {
+  sid_block_injection {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SID_BLOCK_INJECTION: SID Block destination, Routing header, or SID Block in the first inner header, received on an UNTRUSTED interface";
+  };
+  sid_block_quarantined {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SID_BLOCK_QUARANTINED: SID Block destination received on a QUARANTINED interface";
+  };
+  malformed_inner {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_MALFORMED_INNER: bounded extension-header parser limit or length inconsistency on an UNTRUSTED interface, on a packet that is not a first fragment (a non-fragmented packet, or an RFC 6946 atomic fragment)";
+  };
+  uninspectable_fragment {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_UNINSPECTABLE_FRAGMENT: offset-zero fragment (offset 0, M 1) on an UNTRUSTED interface whose security-relevant header chain the guard could not completely verify inside that fragment (D-54 fail-closed; RFC 7112 requires the chain to be there)";
+  };
+  fragment_not_permitted {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_FRAGMENT_NOT_PERMITTED: Fragment header on an UNTRUSTED interface while the untrusted-fragment-drop-all hardening option is enabled (D-54, default off), whatever the fragment kind. An operational signal, zero while the option is off; kept apart from DROP_UNINSPECTABLE_FRAGMENT because this one also drops conformant fragments (#64)";
+  };
+  passed {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets allowed to continue along the feature arc";
+  };
+};
+
+/* Drop reason counters of cilium-end-cilium (06 §2, 03 §8). The generated
+   symbols are CILIUM_SRV6_END_CILIUM_ERROR_<NAME> /
+   cilium_srv6_end_cilium_error_counters. */
+counters cilium_srv6_end_cilium {
+  untrusted_source {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_UNTRUSTED_SOURCE: outer source address is not in the SR domain node set (D-32)";
+  };
+  unknown_context {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_UNKNOWN_CONTEXT: Context ID is in neither the ActiveContextTable nor the tombstone store";
+  };
+  invalid_context {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_INVALID_CONTEXT: Context ID hit the tombstone store, i.e. a stale packet for a deleted endpoint";
+  };
+  context_recycled {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_CONTEXT_RECYCLED: the pool entry no longer carries the Context ID the table pointed at (03 §4)";
+  };
+  srv6_not_ready {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SRV6_NOT_READY: the Context entry is not ACTIVE (delivery suspended by the 03 §1.1 fail-closed ladder, or inside its grace period)";
+  };
+  malformed_outer {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_MALFORMED_OUTER: outer length inconsistency, unexpected Next Header, or SRH Routing Type / Hdr Ext Len / Last Entry / Segments Left / TLV bound violation (D-28, 01 §3.2)";
+  };
+  malformed_inner {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_MALFORMED_INNER: inner packet too short, not IPv6, length inconsistent, or extension header chain outside the bounded parser limits (01 §3.1)";
+  };
+  context_ip_mismatch {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_CONTEXT_IP_MISMATCH: inner destination address differs from the Context's endpoint address (04 §4 defence line 4)";
+  };
+  decapsulated {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets decapsulated and handed to cilium-ep-deliver";
+  };
+};
+
+/* Drop reason counters of cilium-ep-deliver (06 §2, 03 §8). The generated
+   symbols are CILIUM_SRV6_EP_DELIVER_ERROR_<NAME> /
+   cilium_srv6_ep_deliver_error_counters. */
+counters cilium_srv6_ep_deliver {
+  context_recycled {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_CONTEXT_RECYCLED: the {pool_index, context_id, entry_generation} handle or the ACTIVE state did not survive the hop from cilium-end-cilium (D-12, 03 §4)";
+  };
+  delivered {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets transmitted to the endpoint through the Context's forwarding object";
+  };
+};
+
+/* Drop reason counters of cilium-srv6-classify (06 §2, 02 §3). The generated
+   symbols are CILIUM_SRV6_CLASSIFY_ERROR_<NAME> /
+   cilium_srv6_classify_error_counters. */
+counters cilium_srv6_classify {
+  unknown_source_ep {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_UNKNOWN_SOURCE_EP: no LocalEndpointTable entry for (rx_sw_if_index, rx_if_incarnation), i.e. interface/endpoint inconsistency (D-31)";
+  };
+  link_local_control {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_LINK_LOCAL_CONTROL: an IPv6 link control packet (link-local source or destination, or a multicast destination) on a Pod-facing interface, which the v1 L3-only attachment of D-50 does not support; kept apart from src_ip_mismatch, which is a candidate security violation";
+  };
+  src_ip_mismatch {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SRC_IP_MISMATCH: the packet's source address is not the local endpoint's address (source address spoof by the Pod)";
+  };
+  malformed_inner {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_MALFORMED_INNER: short packet, not IPv6, length inconsistency, duplicate Fragment header, unknown Routing Type, extension header chain outside the 01 §3.1 limits, or a first fragment without its complete L4 header";
+  };
+  fragment_unresolved {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_FRAGMENT_UNRESOLVED: non-first fragment before the first one, a first fragment re-received from network ingress (D-43, as clarified by #90), or a FragmentVerdictCache record that expired, was evicted or lost one of its D-20 bindings (identity, endpoint incarnation, revisions, lease, path handle)";
+  };
+  fragment_stale_reinject {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_FRAGMENT_STALE_REINJECT: a reinjected first fragment (IF-3) that no live one-shot reinjection capability admits — the FragmentVerdictCache record expired or was evicted, the echoed punt_id is not the one the record was installed with, or the capability had already been spent (#90). It is dropped and not re-punted, because a re-punt would be answered with the same reinjection. Kept apart from fragment_unresolved because it is a stale control-plane response, not a packet anomaly";
+  };
+  policy_denied {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_POLICY_DENIED: a non-first fragment matching a cached DENY verdict (01 §3.1)";
+  };
+  classified {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets classified and handed to cilium-srv6-ct";
+  };
+  fragment_bypass {
+    severity info;
+    type counter64;
+    units "packets";
+    description "non-first fragments forwarded on the path their first fragment was allowed on, bypassing conntrack and the ProgramCache (01 §3.1)";
+  };
+};
+
+/* Counters of cilium-srv6-ct (02 §7.2, D-47). The stage drops nothing of its
+   own: a reply it cannot authorise becomes a re-authorisation punt. The
+   generated symbols are CILIUM_SRV6_CT_ERROR_<NAME> /
+   cilium_srv6_ct_error_counters. */
+counters cilium_srv6_ct {
+  forward {
+    severity info;
+    type counter64;
+    units "packets";
+    description "conntrack miss or forward direction: evaluated by cilium-srv6-program (02 §7.2 branch 3). This is also every packet while no C10 conntrack is registered.";
+  };
+  reply_bypass {
+    severity info;
+    type counter64;
+    units "packets";
+    description "reply hit meeting every allow condition of 02 §7.2 branch 1: state VERIFIED_ESTABLISHED, matching endpoint context/identity, matching policy revision and a lease that has not expired (D-49). The ProgramCache is bypassed.";
+  };
+  reply_reauth {
+    severity info;
+    type counter64;
+    units "packets";
+    description "reply hit that is UNVERIFIED, revision-mismatched, past its lease, or cannot name a resolvable path: punted on the dedicated re-authorisation queue (02 §7.2 branch 2, D-38)";
+  };
+};
+
+/* Counters of cilium-srv6-program (06 §2, 02 §4.2). The generated symbols are
+   CILIUM_SRV6_PROGRAM_ERROR_<NAME> / cilium_srv6_program_error_counters. */
+counters cilium_srv6_program {
+  policy_denied {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_POLICY_DENIED: ProgramCache hit with verdict DENY (NetworkPolicy denied, or no rule matched)";
+  };
+  malformed_inner {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_MALFORMED_INNER: defensive check, the IPv6 header is no longer readable after cilium-srv6-classify accepted it";
+  };
+  allowed {
+    severity info;
+    type counter64;
+    units "packets";
+    description "ProgramCache hit with verdict ALLOW, dependency revisions matching and the lease still valid";
+  };
+  punt_miss {
+    severity info;
+    type counter64;
+    units "packets";
+    description "ProgramCache miss: lazy compile punt (D-1, 02 §5)";
+  };
+  punt_stale {
+    severity info;
+    type counter64;
+    units "packets";
+    description "dependency revision mismatch: the entry was compiled against a policy (per src identity, D-30), endpoint or path revision the node no longer publishes";
+  };
+  punt_lease_expired {
+    severity info;
+    type counter64;
+    units "packets";
+    description "ALLOW lease expired: the agent stopped bulk-extending it, which is the fail-closed path when the policy watcher is unhealthy (02 §4.3, D-49)";
+  };
+  punt_stale_path {
+    severity info;
+    type counter64;
+    units "packets";
+    description "the entry's versioned path handle no longer resolves; the PathCache entry was retired (D-12)";
+  };
+};
+
+/* Counters of cilium-srv6-encap (06 §2, 02 §6, 02 §9). The generated symbols
+   are CILIUM_SRV6_ENCAP_ERROR_<NAME> / cilium_srv6_encap_error_counters. */
+counters cilium_srv6_encap {
+  inner_mtu_exceeded {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_INNER_MTU_EXCEEDED: the inner packet is longer than min(PathCache.base_mtu, PathMtuTable[path_id].effective_mtu); an ICMPv6 PTB is generated by the PMTUD component when it is registered (02 §9, D-21)";
+  };
+  srv6_not_ready {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SRV6_NOT_READY: the headend has no outer header parameters yet (srv6_headend_config_set has not been accepted), so there is no node address to send from (01 §1)";
+  };
+  stale_path {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the versioned path handle stopped resolving between the forwarding decision and the encapsulation (D-12). Expected to be 0; a non-zero value means a PathCache entry was retired underneath a packet in flight.";
+  };
+  no_headroom {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the buffer has no room in front of the packet for the outer IPv6 header and the SRH. An implementation resource condition, not a design drop reason.";
+  };
+  encapsulated {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets encapsulated and handed to the IPv6 forwarding path";
+  };
+};
+
+/* Counters of cilium-srv6-punt (06 §2, 02 §5.2). The generated symbols are
+   CILIUM_SRV6_PUNT_ERROR_<NAME> / cilium_srv6_punt_error_counters. */
+counters cilium_srv6_punt {
+  slowpath_overflow {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SLOWPATH_OVERFLOW: the bounded punt queue is full, the owner(namespace) or the src identity is over its hierarchical quota (D-42), or no IF-3 transport is registered. The packet is dropped rather than forwarded around the miss (02 §5.2 fail-closed).";
+  };
+  punted {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets handed to the agent's slow path over IF-3 with a one-shot reinject token";
+  };
+};
+
+/* Counters of cilium-srv6-ptb (06 §2, §3, 02 §9). The generated symbols are
+   CILIUM_SRV6_PTB_ERROR_<NAME> / cilium_srv6_ptb_error_counters.
+
+   These are the `reason` labels of the 06 §3 `ptb_rejected_total` metric.
+   None of them is a packet drop: the node observes ICMPv6 Packet Too Big and
+   passes every packet on to ip6-punt, which is where an unclaimed Packet Too
+   Big already went. `severity error` marks the ones that indicate either a
+   forged PTB or a correlation failure that costs MTU learning. */
+counters cilium_srv6_ptb {
+  accepted {
+    severity info;
+    type counter64;
+    units "packets";
+    description "PTB validated against a RecentTx record and the path's C-SID shift states; the path's learned MTU was updated (02 §9)";
+  };
+  path_unusable {
+    severity error;
+    type counter64;
+    units "packets";
+    description "validated PTB whose MTU leaves an inner MTU below 1280. The path is marked unusable and fails closed until the reconciler switches to an alternative or direct path, or until the learned value decays (02 §9)";
+  };
+  not_ready {
+    severity error;
+    type counter64;
+    units "packets";
+    description "PTB received before the headend was configured, so no node address or path state exists to correlate it against";
+  };
+  untrusted_ingress {
+    severity error;
+    type counter64;
+    units "packets";
+    description "D-36 (a): PTB not received on a TRUSTED_FABRIC interface. The node address is routable from the Pods, so a Pod can send a forged PTB to it; such a PTB is never used for MTU learning";
+  };
+  source_not_in_domain {
+    severity error;
+    type counter64;
+    units "packets";
+    description "D-36 (b): the reporting node's source address is not in the SR domain node/transit set. An empty set matches nothing, which is the fail-closed state before the agent configures the domain";
+  };
+  malformed {
+    severity error;
+    type counter64;
+    units "packets";
+    description "length inconsistency, extension headers before the ICMPv6 header, or a quote too short to contain a complete IPv6 header";
+  };
+  quote_not_ours {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the quoted outer source address is not this node, so the report is not about a packet this headend sent";
+  };
+  no_record {
+    severity error;
+    type counter64;
+    units "packets";
+    description "no RecentTx record matches the quoted flow label, size class and outer Next Header (02 §9: unsent or ambiguous quotes are ignored)";
+  };
+  stale_record {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the matching RecentTx record is older than the record timeout (60 s by default)";
+  };
+  size_mismatch {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the quoted outer size is larger than the largest packet recorded for that path, flow and size class";
+  };
+  stale_path {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the versioned PathCache handle recorded at transmission no longer resolves, or no longer refers to the same path id (D-12)";
+  };
+  da_mismatch {
+    severity error;
+    type counter64;
+    units "packets";
+    description "D-16: the quoted destination address is not a C-SID shift state, SRH segment or Service SID this path presents, so the quote cannot come from a transit node on this path";
+  };
+  inner_mismatch {
+    severity error;
+    type counter64;
+    units "packets";
+    description "the quote reached the inner IPv6 header but its addresses are not the flow recorded for that path, flow label and size class";
+  };
+  mtu_out_of_range {
+    severity error;
+    type counter64;
+    units "packets";
+    description "02 §9 requires 1280 <= ptb_mtu < recorded outer size; a value outside that range would either be an illegal IPv6 MTU or would not shrink the recorded packet";
+  };
+};
+
+/*
+ * ------------------------------------------------------------------
+ * CNI attachment binding table (D-68, 02 §2 / §8)
+ * ------------------------------------------------------------------
+ *
+ * The dataplane-side authoritative registry of "which VPP interface is this
+ * Pod attachment behind". The component that creates a Pod's VPP interface
+ * publishes the binding here, and the agent reads it back to resolve a stable
+ * CNI attachment identity into the (sw_if_index, if_incarnation) handle every
+ * local endpoint install is keyed by (D-31).
+ *
+ * The plugin is not an authority over attachment identity: it never derives,
+ * completes or guesses one. It stores what the publisher wrote and refuses
+ * anything ambiguous, which is what keeps the two directions exact:
+ *
+ *   attachment_id              -> exactly one live (sw_if_index, if_incarnation)
+ *   (sw_if_index, incarnation) -> at most one attachment_id
+ */
+
+/** \brief Publish or withdraw one CNI attachment binding (IF-2, 02 §8, D-68).
+
+    The identity is variable length on purpose. A CNI attachment ID is
+    `containerID` optionally followed by ':' and the container-side interface
+    name, and CNI puts no length bound on a container ID; a fixed-width field
+    would truncate the realistic 69-byte identity of a containerd/CRI-O
+    sandbox and collapse the several attachments of one Pod - which differ
+    only in the ':ethN' suffix - into a single identity. This message
+    therefore rejects an over-long identity rather than storing a prefix of
+    it: `attachment_id` must be 1..255 bytes of printable ASCII (0x21..0x7e),
+    which accepts every identity CNI can produce.
+
+    Add is idempotent for the exact same tuple and for nothing else. An
+    attachment already bound to a different handle, or a handle already bound
+    to a different attachment, is refused rather than replaced: an implicit
+    replacement would make the table's answer depend on message order, and it
+    would leave the old handle programmed for the old attachment for as long
+    as the agent takes to notice. A publisher that is moving an attachment
+    withdraws the old binding first, and that withdrawal is what the agent
+    turns into an invalidation of the old programming.
+
+    Add validates that sw_if_index is a live interface and that
+    if_incarnation is its current incarnation (D-31), which refuses a
+    publisher that raced an interface replacement instead of binding the new
+    interface under the ended lifetime.
+
+    Delete matches all three components exactly, so a delete that was in
+    flight across an interface replacement cannot remove the binding of the
+    new incarnation. It does not require the interface to still exist: an
+    interface deletion removes the binding by itself (see below), and
+    requiring a live interface would make the withdrawal depend on the thing
+    whose disappearance motivates it.
+
+    A binding is removed automatically when its interface is deleted. Without
+    that, the table would keep resolving the attachment to an sw_if_index VPP
+    has already handed to another interface, which is a misdelivery and not a
+    stale entry.
+
+    Rejections (all fail-closed, no state change):
+      INVALID_VALUE        - attachment_id is empty, longer than 255 bytes,
+                             or contains a byte outside 0x21..0x7e
+      INVALID_SW_IF_INDEX  - unknown / freed sw_if_index (add only)
+      INVALID_VALUE_2      - if_incarnation does not match the live interface
+                             (add only, D-31)
+      ENTRY_ALREADY_EXISTS - the attachment is bound to a different handle, or
+                             the handle is bound to a different attachment
+      NO_SUCH_ENTRY        - delete of a tuple that is not bound
+      FEATURE_DISABLED     - the binding table is not initialised
+
+    @param sw_if_index - the Pod-facing VPP interface
+    @param if_incarnation - incarnation as reported by srv6_acl_dump (D-31)
+    @param is_add - publish (true) or withdraw (false)
+    @param attachment_id - the CNI attachment identity, verbatim
+*/
+autoendian autoreply define srv6_if_attachment_add_del
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  bool is_add;
+  string attachment_id[];
+};
+
+/** \brief Dump the CNI attachment binding table (IF-2, 02 §8, D-68).
+
+    The agent performs a complete dump after connecting and treats the
+    resolver as not ready until it has succeeded: "the binding inventory has
+    not been read yet" and "this attachment has no interface" are different
+    answers, and only the second one may refuse an endpoint.
+
+    @param sw_if_index - one interface, or ~0 for all
+*/
+autoendian define srv6_if_attachment_dump
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+};
+
+/** \brief One CNI attachment binding.
+
+    @param sw_if_index - the Pod-facing VPP interface
+    @param if_incarnation - the incarnation the binding was published for,
+           which is the live incarnation of sw_if_index: a binding whose
+           interface lifetime ended has been removed
+    @param attachment_id - the CNI attachment identity, verbatim
+*/
+autoendian define srv6_if_attachment_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u32 if_incarnation;
+  string attachment_id[];
+};
+
+/*
+ * ------------------------------------------------------------------
+ * Plugin instance identity (D-72, 00 §2.14, 02 §8)
+ * ------------------------------------------------------------------
+ */
+
+/** \brief Read the identity of this cilium_srv6 plugin instance (IF-2, D-72).
+
+    The agent cannot tell a re-established IF-2 transport from a VPP that
+    restarted underneath it: both present to the dialling side as a socket
+    that connects again. The first case keeps every dataplane table; the
+    second lost all of them. This message is the only evidence that
+    separates them, and it exists because the alternatives were rejected:
+    inferring restart from observed table contents makes observed state the
+    authority for lifecycle (D-72), and rebuilding everything on every
+    reconnect pays the full recovery cost for a transient transport loss.
+
+    Read-only; changes no state.
+*/
+autoendian define srv6_instance_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief The identity of this cilium_srv6 plugin instance.
+
+    @param retval - 0 on success
+    @param plugin_instance_id - a 128-bit value drawn once when the plugin
+           initialises. It is constant for the whole lifetime of the plugin
+           instance, including across IF-2 transport reconnects, and is
+           different in every new instance. Only equality is meaningful: it
+           is not a secret, carries no ordering, and must not be parsed for
+           structure. `same value` means "the dataplane tables this agent
+           observed are the same ones"; `different value` means dataplane
+           state loss and triggers the D-72 recovery sequence.
+
+    A plugin that does not implement this message cannot be operated
+    VPP-restart-safely, so the v1 production profile refuses READY against
+    it (D-58 / D-72) rather than guessing.
+*/
+autoendian define srv6_instance_get_reply
+{
+  u32 context;
+  i32 retval;
+  u8 plugin_instance_id[16];
+};

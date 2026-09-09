@@ -139,3 +139,7 @@ git_apply_private 0007-cnat-per-fib-snat-address.patch
 # VPP Private plugins:
 copy_private_plugin ip_ttl_fixup
 copy_private_plugin pbl
+# Vendored snapshot of cilium/vpp/plugins/cilium_srv6, refreshed by
+# scripts/sync-cilium-srv6.sh and pinned by
+# private_plugins/CILIUM_SRV6_SOURCE_COMMIT (Issue #135 decision 7).
+copy_private_plugin cilium_srv6
