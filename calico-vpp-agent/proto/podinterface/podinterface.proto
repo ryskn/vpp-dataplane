@@ -1,70 +1,139 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Cilium Authors
-
-// PodInterfaceLifecycle is the interface between the CNI plugin that owns Pod
-// attachment identity and IPAM, and the VPP Pod interface lifecycle owner that
-// creates the Pod-facing VPP interface.
-//
-// The split exists because SRv6 Endpoint Context v1 requires the component that
-// creates the interface to publish the CNI attachment identity against the
-// exact InterfaceHandle it just created (design/detail/00-overview.md §2.12.6,
-// D-71). Making the creation request carry the attachment identity is what
-// keeps that requirement satisfiable: neither side has to reconstruct the
-// correspondence afterwards from an interface name or a Linux ifindex, which
-// §2.12.7 forbids.
-//
-// CreatePodInterface returns only after the binding has been published and
-// acknowledged. The caller MUST NOT report the CNI attachment as successful
-// before this reply arrives; the reply is the publication barrier.
-//
-// Failures are gRPC statuses. There is no "successful" field: a reply that
-// exists means the interface was created and its binding published.
+// Copyright Authors of Cilium
 
 syntax = "proto3";
 
 package podinterface.v1;
 
-option go_package = "github.com/cilium/cilium/api/v1/podinterface;podinterface";
+option go_package = "github.com/cilium/cilium/api/v1/podinterface";
 
+// PodInterfaceLifecycle is the contract between Cilium's CNI plugin and an
+// external provider that owns the L3 datapath realization of a Pod attachment.
+//
+// For one Pod attachment, exactly one component owns L3 realization. When this
+// service is selected (CNI network configuration field "cniDatapathProvider"),
+// Cilium creates no competing veth or netkit datapath for that attachment, and
+// the provider is the sole owner of the interface: it creates the device,
+// places it in the Pod network namespace, configures the namespace side of it
+// and destroys it again.
+//
+// Cilium remains the authority for everything else about the attachment: the
+// CNI attachment identity, IPAM, the endpoint object, its security identity,
+// its policy and its lifecycle.
+//
+// Failures are reported as gRPC status codes. There is no success flag in any
+// reply message: a reply that arrives is a reply that succeeded, so that a
+// caller cannot mistake a transport-level failure for a refusal or the other
+// way round.
 service PodInterfaceLifecycle {
-  rpc CreatePodInterface(CreatePodInterfaceRequest) returns (CreatePodInterfaceReply);
-  rpc DeletePodInterface(DeletePodInterfaceRequest) returns (DeletePodInterfaceReply);
+    // CreatePodInterface creates the Pod's interface and makes it usable.
+    //
+    // A successful reply is a publication barrier. By the time it is sent, the
+    // provider has created the interface, has obtained its exact handle, has
+    // published the corresponding attachment binding and has received that
+    // binding's acknowledgement. The caller may therefore treat the reply as
+    // proof that the attachment is fully realized, and reports CNI ADD success
+    // only after receiving it.
+    //
+    // Any failure - including a failure to publish the binding - must leave no
+    // interface behind, and is reported as a gRPC error status. The caller
+    // fails the CNI ADD; it never falls back to realizing the datapath itself.
+    //
+    // The call is idempotent for a repeated request that carries the same
+    // attachment_id, netns and ifname: a retry of an interrupted CreatePodInterface
+    // returns the handle of the interface that already exists for that
+    // attachment rather than creating a second one.
+    rpc CreatePodInterface(CreatePodInterfaceRequest) returns (CreatePodInterfaceReply);
+
+    // DeletePodInterface revokes the attachment binding and destroys the Pod's
+    // interface.
+    //
+    // It is called on CNI DEL, before the endpoint is deleted from the Cilium
+    // agent. NOT_FOUND means the attachment is already gone and is treated by
+    // the caller as success, because CNI DEL is retried and must converge.
+    rpc DeletePodInterface(DeletePodInterfaceRequest) returns (DeletePodInterfaceReply);
 }
 
+// CreatePodInterfaceRequest asks the provider to realize one Pod attachment.
 message CreatePodInterfaceRequest {
-  // attachment_id is the completed CNI attachment identity, passed verbatim.
-  // It is required, is stored and published without transformation, and is
-  // rejected rather than truncated when it is outside 1..255 bytes of
-  // printable ASCII (design/detail/02-headend-dataplane.md §8.1 rule 1).
-  string attachment_id = 1;
-  // netns is the host path of the Pod network namespace.
-  string netns = 2;
-  // ifname is the interface name to create inside the Pod netns.
-  string ifname = 3;
-  // addresses are the Pod addresses in CIDR form, as decided by the caller's
-  // IPAM. Each address is a host address (/128).
-  repeated string addresses = 4;
-  // routes are the routes to install inside the Pod netns, in CIDR form.
-  repeated string routes = 5;
-  // mtu is the MTU to configure on the Pod-side interface.
-  uint32 mtu = 6;
+    // attachment_id is the CNI attachment identity, verbatim: the identifier
+    // Cilium itself uses for this attachment, formed as
+    // "<container id>:<container interface name>".
+    //
+    // It is required and is never re-derived, re-parsed or reconstructed by the
+    // provider: the component that knows the identity passes it to the
+    // component that knows the interface handle, so that the two never have to
+    // be correlated after the fact. It must be between 1 and 255 bytes long and
+    // consist of printable ASCII (0x20..0x7e) only. A request that does not
+    // satisfy this is rejected with INVALID_ARGUMENT.
+    string attachment_id = 1;
+
+    // netns is the path of the Pod's network namespace, as the container
+    // runtime gave it to the CNI plugin (CNI_NETNS). Required.
+    string netns = 2;
+
+    // ifname is the name the interface must have inside that network namespace,
+    // as the container runtime gave it to the CNI plugin (CNI_IFNAME).
+    // Required.
+    string ifname = 3;
+
+    // addresses are the addresses to configure on the interface inside the Pod
+    // network namespace, in CIDR notation, as allocated by Cilium IPAM. They
+    // are host routes: an IPv6 address is a /128 and an IPv4 address is a /32,
+    // because the Pod attachment is L3-only and the Pod is not on a shared
+    // link with anything.
+    //
+    // At least one address is required.
+    repeated string addresses = 4;
+
+    // routes are the destination prefixes, in CIDR notation, to install inside
+    // the Pod network namespace. Each one is installed as a device route out of
+    // the created interface, with no gateway and no on-link neighbour: the
+    // attachment is L3-only, so there is no next hop to resolve.
+    //
+    // May be empty, in which case the provider installs no routes beyond the
+    // ones implied by the addresses.
+    repeated string routes = 5;
+
+    // mtu is the MTU to set on the interface, in bytes. Required, and must be
+    // greater than zero.
+    uint32 mtu = 6;
 }
 
+// CreatePodInterfaceReply reports the exact handle of the interface that was
+// created. Its arrival is the publication barrier described on
+// CreatePodInterface.
 message CreatePodInterfaceReply {
-  // sw_if_index and if_incarnation are the InterfaceHandle the binding was
-  // published against. They are returned for observability; the caller is not
-  // expected to resolve anything with them.
-  uint32 sw_if_index = 1;
-  uint32 if_incarnation = 2;
+    // sw_if_index is the provider's interface index for the created interface.
+    //
+    // It is reported for diagnostics and for correlation with the provider's
+    // own state. It is not an identifier Cilium resolves anything by: the
+    // authoritative association between an attachment and an interface handle
+    // travels through the attachment binding the provider published, not
+    // through this field.
+    uint32 sw_if_index = 1;
+
+    // if_incarnation distinguishes successive interfaces that reuse the same
+    // sw_if_index. Together with sw_if_index it forms the exact handle of one
+    // interface lifetime, which is what a later revocation must name.
+    uint32 if_incarnation = 2;
 }
 
+// DeletePodInterfaceRequest asks the provider to tear one Pod attachment down.
 message DeletePodInterfaceRequest {
-  string attachment_id = 1;
-  string netns = 2;
-  string ifname = 3;
+    // attachment_id is the same CNI attachment identity that was passed to
+    // CreatePodInterface, verbatim. Required, and subject to the same
+    // constraints.
+    string attachment_id = 1;
+
+    // netns is the path of the Pod's network namespace. It may no longer exist
+    // by the time this call is made; that does not excuse the provider from
+    // revoking the binding and destroying the interface.
+    string netns = 2;
+
+    // ifname is the name of the interface inside that network namespace.
+    string ifname = 3;
 }
 
-// DeletePodInterfaceReply is empty: a NOT_FOUND status, not a field, reports
-// that the attachment is unknown, and the caller treats that as an idempotent
-// success.
+// DeletePodInterfaceReply is empty: the fact that it arrived is the result.
 message DeletePodInterfaceReply {}

@@ -10,13 +10,8 @@
 # here is remapped at generation time by calico-vpp-agent/proto/Makefile, so the
 # .proto file itself can stay byte-identical to the canonical one.
 #
-# PODINTERFACE_PROTO_SOURCE_COMMIT is intentionally empty: as of this commit the
-# canonical file has not landed in the Cilium repository yet (it is part of
-# Stage 0 step B, which is being implemented in parallel). The content below was
-# fixed by the PM ruling of 2026-09-10 recorded on Issue #135, and the Cilium
-# side is expected to adopt it verbatim. Until the pin is filled in,
-# scripts/check-podinterface-proto-sync.sh fails, which is the intended state:
-# an unpinned snapshot must not silently look verified.
+# PODINTERFACE_PROTO_SOURCE_COMMIT pins the Cilium commit whose canonical file this
+# snapshot equals byte-for-byte (verified by scripts/check-podinterface-proto-sync.sh).
 PODINTERFACE_PROTO_SOURCE_REPO=https://github.com/ryskn/cilium-private.git
 PODINTERFACE_PROTO_SOURCE_PATH=api/v1/podinterface/podinterface.proto
-PODINTERFACE_PROTO_SOURCE_COMMIT=
+PODINTERFACE_PROTO_SOURCE_COMMIT=f88b4127f0cd41ffeb7d58108ec52df8096edd4b
