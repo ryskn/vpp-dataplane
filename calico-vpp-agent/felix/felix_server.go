@@ -1415,7 +1415,10 @@ func (s *Server) GetPrefixIPPool(prefix *net.IPNet) *proto.IPAMPool {
 	return nil
 }
 
-func (s *Server) IPNetNeedsSNAT(prefix *net.IPNet) bool {
+// NeedsSNAT implements common.SNATPolicy: in the Calico profile the IP pool
+// that contains the prefix is what decides, and a prefix outside every known
+// pool is not masqueraded.
+func (s *Server) NeedsSNAT(prefix *net.IPNet) bool {
 	pool := s.GetPrefixIPPool(prefix)
 	if pool == nil {
 		return false

@@ -56,22 +56,28 @@ const DefaultPrimaryInterfaceName = "eth0"
 // IPAM and endpoint authority; this server is only the interface lifecycle
 // authority.
 func NewLifecycleServer(vpp *vpplink.VppLink, ifBinding IfBindingWriter, log *logrus.Entry) *Server {
+	// The SNAT authority is constructed here, explicitly, rather than left
+	// out: see the snatPolicy field below.
+	var snatPolicy common.SNATPolicy = common.NoSNATPolicy{}
 	server := &Server{
 		vpp: vpp,
 		log: log,
 
-		// felixServerIpam is deliberately left nil: see above.
-		felixServerIpam: nil,
+		// There is no Calico IPAM authority here, and that is stated rather
+		// than left as a nil dependency: NoSNATPolicy is the explicit answer
+		// "no Pod address needs SNAT", which is what having no IP pool means
+		// (Issue #135 pre-merge item 1).
+		snatPolicy: snatPolicy,
 
 		grpcServer:      grpc.NewServer(),
 		podInterfaceMap: make(map[string]model.LocalPodSpec),
 		dsrVIPs:         make(map[string]*dsrVIPState),
 		dsrDesired:      make(map[string]*common.DSRService),
 
-		tuntapDriver:   podinterface.NewTunTapPodInterfaceDriver(vpp, log, nil),
-		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, nil),
-		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, nil),
-		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, nil),
+		tuntapDriver:   podinterface.NewTunTapPodInterfaceDriver(vpp, log, snatPolicy),
+		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, snatPolicy),
+		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, snatPolicy),
+		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, snatPolicy),
 
 		cniEventChan:         make(chan common.CalicoVppEvent, common.ChanSize),
 		cniMultinetEventChan: make(chan common.CalicoVppEvent, common.ChanSize),

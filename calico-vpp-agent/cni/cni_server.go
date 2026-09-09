@@ -48,7 +48,11 @@ type Server struct {
 	log *logrus.Entry
 	vpp *vpplink.VppLink
 
-	felixServerIpam common.FelixServerIpam
+	// snatPolicy is the authority that decides whether a Pod address is
+	// source-NATed. Every profile injects one explicitly: the Calico backend
+	// injects the Felix IPAM server, the Pod interface lifecycle profile
+	// injects common.NoSNATPolicy (Issue #135 pre-merge item 1).
+	snatPolicy common.SNATPolicy
 
 	grpcServer *grpc.Server
 
@@ -352,12 +356,15 @@ func (s *Server) Del(ctx context.Context, request *cniproto.DelRequest) (*cnipro
 
 // Serve runs the grpc server for the Calico CNI backend API
 func NewCNIServer(vpp *vpplink.VppLink, felixServerIpam common.FelixServerIpam, log *logrus.Entry) *Server {
+	if felixServerIpam == nil {
+		panic("cannot build the Calico CNI server without a Felix IPAM authority")
+	}
 	server := &Server{
 		vpp: vpp,
 		log: log,
 
-		felixServerIpam: felixServerIpam,
-		cniEventChan:    make(chan common.CalicoVppEvent, common.ChanSize),
+		snatPolicy:   felixServerIpam,
+		cniEventChan: make(chan common.CalicoVppEvent, common.ChanSize),
 
 		grpcServer:      grpc.NewServer(),
 		podInterfaceMap: make(map[string]model.LocalPodSpec),
@@ -430,7 +437,7 @@ forloop:
 						if swIfIndex != vpplink.InvalidID {
 							s.log.Infof("Enable/Disable interface[%d] SNAT", swIfIndex)
 							for _, ipFamily := range vpplink.IPFamilies {
-								err := s.vpp.EnableDisableCnatSNAT(swIfIndex, ipFamily.IsIP6, podSpec.NeedsSnat(s.felixServerIpam, ipFamily.IsIP6))
+								err := s.vpp.EnableDisableCnatSNAT(swIfIndex, ipFamily.IsIP6, podSpec.NeedsSnat(s.snatPolicy, ipFamily.IsIP6))
 								if err != nil {
 									return errors.Wrapf(err, "Error enabling/disabling %s snat", ipFamily.Str)
 								}

@@ -45,10 +45,10 @@ func (d *dummy) Attrs() *netlink.LinkAttrs {
 	return &netlink.LinkAttrs{Name: d.name}
 }
 
-func NewMemifPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, felixServerIpam common.FelixServerIpam) *MemifPodInterfaceDriver {
+func NewMemifPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *MemifPodInterfaceDriver {
 	i := &MemifPodInterfaceDriver{
 		PodInterfaceDriverData: PodInterfaceDriverData{
-			felixServerIpam: felixServerIpam,
+			snatPolicy: requireSNATPolicy(snatPolicy, "memif"),
 		},
 	}
 	i.vpp = vpp

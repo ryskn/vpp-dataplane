@@ -265,19 +265,25 @@ func (podSpec *LocalPodSpec) Hasv46() (hasv4 bool, hasv6 bool) {
 	return hasv4, hasv6
 }
 
-func (podSpec *LocalPodSpec) NeedsSnat(felixServerIpam common.FelixServerIpam, isIP6 bool) bool {
-	if felixServerIpam == nil {
-		// The Pod interface lifecycle profile does not construct a Calico IPAM
-		// authority at all (Issue #135 ruling 3): there is no IP pool that
-		// could request SNAT, so no address needs it. This is the absence of
-		// the dependency, not an unknown answer from it.
-		return false
+// NeedsSnat asks the SNAT policy whether any of this Pod's addresses of the
+// requested family has to be source-NATed.
+//
+// snatPolicy is required. A nil policy is not "no address needs SNAT": it is a
+// server that was constructed without deciding, and answering no for it would
+// turn a missing dependency into a silent policy decision (Issue #135
+// pre-merge item 1). A deployment that has no IP pool authority injects
+// common.NoSNATPolicy, which answers no explicitly.
+func (podSpec *LocalPodSpec) NeedsSnat(snatPolicy common.SNATPolicy, isIP6 bool) bool {
+	if snatPolicy == nil {
+		panic("LocalPodSpec.NeedsSnat called without an SNAT policy: " +
+			"the server was constructed without one, which is a programming error, " +
+			"not a decision that no address needs SNAT")
 	}
 	for _, containerIP := range podSpec.GetContainerIPs() {
 		if containerIP.IP.To4() == nil != isIP6 {
 			continue
 		}
-		if felixServerIpam.IPNetNeedsSNAT(containerIP) {
+		if snatPolicy.NeedsSNAT(containerIP) {
 			return true
 		}
 	}

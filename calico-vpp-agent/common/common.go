@@ -52,8 +52,33 @@ const (
 	PodVRFIndex     = uint32(2)
 )
 
+// SNATPolicy is the authority that decides whether traffic sourced from a Pod
+// prefix has to be source-NATed when it leaves the node.
+//
+// It is a dependency that is always injected explicitly. There is no nil
+// SNATPolicy in production: "no address needs SNAT" is an answer a policy
+// gives, not the absence of a policy, and the two must not be the same value.
+// A deployment that has no IP pool authority at all injects NoSNATPolicy, which
+// says so.
+type SNATPolicy interface {
+	// NeedsSNAT reports whether traffic sourced from prefix must be SNATed.
+	NeedsSNAT(prefix *net.IPNet) bool
+}
+
+// NoSNATPolicy is the explicit "no Pod address needs SNAT" authority.
+//
+// The Pod interface lifecycle profile constructs it (Issue #135 pre-merge
+// item 1): that deployment has no Calico IPAM authority, so no IP pool exists
+// that could request masquerading, and this type is how that decision is
+// stated. It is not a stub standing in for a dependency that failed to be
+// built; it is the answer itself.
+type NoSNATPolicy struct{}
+
+// NeedsSNAT always answers no.
+func (NoSNATPolicy) NeedsSNAT(*net.IPNet) bool { return false }
+
 type FelixServerIpam interface {
-	IPNetNeedsSNAT(prefix *net.IPNet) bool
+	SNATPolicy
 	GetPrefixIPPool(prefix *net.IPNet) *proto.IPAMPool
 }
 

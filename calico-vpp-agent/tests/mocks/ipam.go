@@ -69,7 +69,7 @@ func (s *IpamCacheStub) WaitReady() {
 	panic("not implemented")
 }
 
-func (s *IpamCacheStub) IPNetNeedsSNAT(prefix *net.IPNet) bool {
+func (s *IpamCacheStub) NeedsSNAT(prefix *net.IPNet) bool {
 	return false
 }
 

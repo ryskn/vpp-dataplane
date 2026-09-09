@@ -28,10 +28,10 @@ type LoopbackPodInterfaceDriver struct {
 	PodInterfaceDriverData
 }
 
-func NewLoopbackPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, felixServerIpam common.FelixServerIpam) *LoopbackPodInterfaceDriver {
+func NewLoopbackPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *LoopbackPodInterfaceDriver {
 	i := &LoopbackPodInterfaceDriver{
 		PodInterfaceDriverData: PodInterfaceDriverData{
-			felixServerIpam: felixServerIpam,
+			snatPolicy: requireSNATPolicy(snatPolicy, "loopback"),
 		},
 	}
 	i.vpp = vpp

@@ -18,6 +18,7 @@ package cni
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/cni/model"
+	"github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/common"
 	podinterfacepb "github.com/projectcalico/vpp-dataplane/v3/calico-vpp-agent/proto/podinterface"
 	"github.com/projectcalico/vpp-dataplane/v3/config"
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
@@ -858,5 +860,27 @@ func TestRescanLifecycleStateFailsClosedWithoutAStoredIdentity(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("the state file was discarded: %v", err)
+	}
+}
+
+// --- explicit dependencies --------------------------------------------------
+
+// The lifecycle profile has no Calico IPAM authority behind it. That is stated
+// by constructing NoSNATPolicy, not by leaving the dependency nil: a nil
+// dependency and an authority that decided no address needs SNAT would
+// otherwise be the same value (Issue #135 pre-merge item 1).
+func TestNewLifecycleServerConstructsAnExplicitSNATPolicy(t *testing.T) {
+	log := logrus.New()
+	log.SetOutput(&strings.Builder{})
+	s := NewLifecycleServer(nil /* vpp */, newFakeIfBindingWriter(), logrus.NewEntry(log))
+
+	if s.snatPolicy == nil {
+		t.Fatalf("the lifecycle server was built without an SNAT policy")
+	}
+	if _, ok := s.snatPolicy.(common.NoSNATPolicy); !ok {
+		t.Fatalf("the lifecycle server's SNAT policy is %T, want common.NoSNATPolicy", s.snatPolicy)
+	}
+	if s.snatPolicy.NeedsSNAT(&net.IPNet{IP: net.ParseIP("fd00::1"), Mask: net.CIDRMask(128, 128)}) {
+		t.Fatalf("NoSNATPolicy asked for SNAT")
 	}
 }

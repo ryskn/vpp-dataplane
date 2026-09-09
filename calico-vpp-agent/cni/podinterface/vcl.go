@@ -35,10 +35,10 @@ func getPodAppNamespaceName(podSpec *model.LocalPodSpec) string {
 	return fmt.Sprintf("app-ns-%s", podSpecKey)
 }
 
-func NewVclPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, felixServerIpam common.FelixServerIpam) *VclPodInterfaceDriver {
+func NewVclPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *VclPodInterfaceDriver {
 	i := &VclPodInterfaceDriver{
 		PodInterfaceDriverData: PodInterfaceDriverData{
-			felixServerIpam: felixServerIpam,
+			snatPolicy: requireSNATPolicy(snatPolicy, "vcl"),
 		},
 	}
 	i.vpp = vpp

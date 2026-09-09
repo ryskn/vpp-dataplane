@@ -42,10 +42,10 @@ type TunTapPodInterfaceDriver struct {
 	vxlanEncapRefCounts int /* how many ippools with VXLAN */
 }
 
-func NewTunTapPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, felixServerIpam common.FelixServerIpam) *TunTapPodInterfaceDriver {
+func NewTunTapPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *TunTapPodInterfaceDriver {
 	i := &TunTapPodInterfaceDriver{
 		PodInterfaceDriverData: PodInterfaceDriverData{
-			felixServerIpam: felixServerIpam,
+			snatPolicy: requireSNATPolicy(snatPolicy, "tun"),
 		},
 	}
 	i.vpp = vpp

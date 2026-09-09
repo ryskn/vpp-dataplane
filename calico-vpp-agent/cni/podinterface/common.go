@@ -27,11 +27,25 @@ import (
 )
 
 type PodInterfaceDriverData struct {
-	log             *logrus.Entry
-	vpp             *vpplink.VppLink
-	Name            string
-	NDataThreads    int
-	felixServerIpam common.FelixServerIpam
+	log *logrus.Entry
+	vpp *vpplink.VppLink
+	// Name is the interface kind this driver creates ("tun", "memif", ...).
+	Name         string
+	NDataThreads int
+	// snatPolicy decides whether a Pod address is source-NATed. It is always
+	// injected: see common.SNATPolicy.
+	snatPolicy common.SNATPolicy
+}
+
+// requireSNATPolicy rejects a driver that would be built without an SNAT
+// authority, so that the omission is a construction failure and never a
+// silent "no SNAT" answer in the data path (Issue #135 pre-merge item 1).
+func requireSNATPolicy(snatPolicy common.SNATPolicy, driver string) common.SNATPolicy {
+	if snatPolicy == nil {
+		panic("cannot build the " + driver + " pod interface driver without an SNAT policy: " +
+			"inject common.NoSNATPolicy to state that no address needs SNAT")
+	}
+	return snatPolicy
 }
 
 func (i *PodInterfaceDriverData) SpreadTxQueuesOnWorkers(swIfIndex uint32, numTxQueues int) (err error) {
@@ -89,7 +103,7 @@ func (i *PodInterfaceDriverData) UndoPodIfNatConfiguration(swIfIndex uint32) {
 
 func (i *PodInterfaceDriverData) DoPodIfNatConfiguration(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack, swIfIndex uint32) (err error) {
 	for _, ipFamily := range vpplink.IPFamilies {
-		if podSpec.NeedsSnat(i.felixServerIpam, ipFamily.IsIP6) {
+		if podSpec.NeedsSnat(i.snatPolicy, ipFamily.IsIP6) {
 			i.log.Infof("pod(add) Enable interface[%d] SNAT", swIfIndex)
 			err = i.vpp.EnableDisableCnatSNAT(swIfIndex, ipFamily.IsIP6, true /*isEnable*/)
 			if err != nil {
