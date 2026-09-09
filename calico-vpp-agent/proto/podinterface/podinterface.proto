@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Cilium Authors
+
+// PodInterfaceLifecycle is the interface between the CNI plugin that owns Pod
+// attachment identity and IPAM, and the VPP Pod interface lifecycle owner that
+// creates the Pod-facing VPP interface.
+//
+// The split exists because SRv6 Endpoint Context v1 requires the component that
+// creates the interface to publish the CNI attachment identity against the
+// exact InterfaceHandle it just created (design/detail/00-overview.md §2.12.6,
+// D-71). Making the creation request carry the attachment identity is what
+// keeps that requirement satisfiable: neither side has to reconstruct the
+// correspondence afterwards from an interface name or a Linux ifindex, which
+// §2.12.7 forbids.
+//
+// CreatePodInterface returns only after the binding has been published and
+// acknowledged. The caller MUST NOT report the CNI attachment as successful
+// before this reply arrives; the reply is the publication barrier.
+//
+// Failures are gRPC statuses. There is no "successful" field: a reply that
+// exists means the interface was created and its binding published.
+
+syntax = "proto3";
+
+package podinterface.v1;
+
+option go_package = "github.com/cilium/cilium/api/v1/podinterface;podinterface";
+
+service PodInterfaceLifecycle {
+  rpc CreatePodInterface(CreatePodInterfaceRequest) returns (CreatePodInterfaceReply);
+  rpc DeletePodInterface(DeletePodInterfaceRequest) returns (DeletePodInterfaceReply);
+}
+
+message CreatePodInterfaceRequest {
+  // attachment_id is the completed CNI attachment identity, passed verbatim.
+  // It is required, is stored and published without transformation, and is
+  // rejected rather than truncated when it is outside 1..255 bytes of
+  // printable ASCII (design/detail/02-headend-dataplane.md §8.1 rule 1).
+  string attachment_id = 1;
+  // netns is the host path of the Pod network namespace.
+  string netns = 2;
+  // ifname is the interface name to create inside the Pod netns.
+  string ifname = 3;
+  // addresses are the Pod addresses in CIDR form, as decided by the caller's
+  // IPAM. Each address is a host address (/128).
+  repeated string addresses = 4;
+  // routes are the routes to install inside the Pod netns, in CIDR form.
+  repeated string routes = 5;
+  // mtu is the MTU to configure on the Pod-side interface.
+  uint32 mtu = 6;
+}
+
+message CreatePodInterfaceReply {
+  // sw_if_index and if_incarnation are the InterfaceHandle the binding was
+  // published against. They are returned for observability; the caller is not
+  // expected to resolve anything with them.
+  uint32 sw_if_index = 1;
+  uint32 if_incarnation = 2;
+}
+
+message DeletePodInterfaceRequest {
+  string attachment_id = 1;
+  string netns = 2;
+  string ifname = 3;
+}
+
+// DeletePodInterfaceReply is empty: a NOT_FOUND status, not a field, reports
+// that the attachment is unknown, and the caller treats that as an idempotent
+// success.
+message DeletePodInterfaceReply {}

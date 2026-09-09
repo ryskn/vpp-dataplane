@@ -1,0 +1,22 @@
+# Canonical source of podinterface/podinterface.proto.
+#
+# The PodInterfaceLifecycle contract is required by, and specified from, the
+# Cilium side (Cilium is the caller), so the canonical proto file lives in the
+# Cilium repository and this repository holds a snapshot of it. The rule is the
+# same one applied to the cilium_srv6 plugin snapshot (Issue #135 decision 7):
+# one canonical source, a pinned commit, and a mechanical equality check.
+#
+# The snapshot keeps the canonical file's `go_package`; the Go import path used
+# here is remapped at generation time by calico-vpp-agent/proto/Makefile, so the
+# .proto file itself can stay byte-identical to the canonical one.
+#
+# PODINTERFACE_PROTO_SOURCE_COMMIT is intentionally empty: as of this commit the
+# canonical file has not landed in the Cilium repository yet (it is part of
+# Stage 0 step B, which is being implemented in parallel). The content below was
+# fixed by the PM ruling of 2026-09-10 recorded on Issue #135, and the Cilium
+# side is expected to adopt it verbatim. Until the pin is filled in,
+# scripts/check-podinterface-proto-sync.sh fails, which is the intended state:
+# an unpinned snapshot must not silently look verified.
+PODINTERFACE_PROTO_SOURCE_REPO=https://github.com/ryskn/cilium-private.git
+PODINTERFACE_PROTO_SOURCE_PATH=api/v1/podinterface/podinterface.proto
+PODINTERFACE_PROTO_SOURCE_COMMIT=
