@@ -884,3 +884,95 @@ func TestNewLifecycleServerConstructsAnExplicitSNATPolicy(t *testing.T) {
 		t.Fatalf("NoSNATPolicy asked for SNAT")
 	}
 }
+
+// --- the primary attachment is the only supported one -----------------------
+
+// v1 serves the Pod's primary attachment and refuses everything else, at the
+// RPC boundary, before anything is created. A secondary attachment is neither
+// ignored nor folded into the primary one: either would break the invariant
+// that one CNI attachment identity names exactly one interface (D-68).
+func TestCreatePodInterfaceRejectsEveryNonPrimaryInterfaceName(t *testing.T) {
+	for _, ifname := range []string{
+		"eth1",   // the multinet secondary attachment
+		"net1",   // its other spelling
+		"eth2",   //
+		"memif0", // the second interface of a port-based-load-balancing pod
+		"eth0x",  // not a prefix match
+		"eth",    // not a prefix match the other way round
+		"ETH0",   // not case insensitive
+		" eth0",  // not trimmed
+		"eth0 ",  //
+	} {
+		t.Run(ifname, func(t *testing.T) {
+			writer := newFakeIfBindingWriter()
+			s := testLifecycleServer(writer)
+			realized := false
+			s.realizePodInterfacesFn = func(*model.LocalPodSpec, *vpplink.CleanupStack, bool) (uint32, bool, error) {
+				realized = true
+				return vpplink.InvalidID, false, nil
+			}
+
+			request := validCreateRequest()
+			request.Ifname = ifname
+			request.AttachmentId = strings.Repeat("a", 64) + ":" + ifname
+
+			reply, err := (&lifecycleService{server: s}).CreatePodInterface(context.Background(), request)
+
+			if err == nil {
+				t.Fatalf("interface %q was accepted: %v", ifname, reply)
+			}
+			if code := statusCode(t, err); code != codes.InvalidArgument {
+				t.Fatalf("interface %q was refused with %s, want InvalidArgument", ifname, code)
+			}
+			if realized {
+				t.Fatalf("interface %q was refused only after an interface had been created for it", ifname)
+			}
+			if len(s.podInterfaceMap) != 0 {
+				t.Fatalf("a refused attachment was recorded: %v", s.podInterfaceMap)
+			}
+			if len(writer.bindings) != 0 {
+				t.Fatalf("a refused attachment published a binding: %v", writer.bindings)
+			}
+			if len(writer.calls) != 0 {
+				t.Fatalf("a refused attachment reached the plugin: %v", writer.calls)
+			}
+		})
+	}
+}
+
+// The name that is served is the one the server was configured with, and the
+// constant is that configuration's value rather than a rule of its own.
+func TestTheSupportedPrimaryInterfaceNameIsTheConfiguredOne(t *testing.T) {
+	if DefaultPrimaryInterfaceName != "eth0" {
+		t.Fatalf("the default primary interface name is %q, want eth0", DefaultPrimaryInterfaceName)
+	}
+
+	s := testLifecycleServer(newFakeIfBindingWriter())
+	if err := s.validatePrimaryInterfaceName(DefaultPrimaryInterfaceName); err != nil {
+		t.Fatalf("the configured primary interface name was refused: %v", err)
+	}
+
+	// Reconfiguring which name is primary moves the whole rule with it: the
+	// old name stops being served, and the new one starts.
+	s.SetPrimaryInterfaceName("eth9")
+	if err := s.validatePrimaryInterfaceName("eth9"); err != nil {
+		t.Fatalf("the reconfigured primary interface name was refused: %v", err)
+	}
+	if err := s.validatePrimaryInterfaceName("eth0"); err == nil {
+		t.Fatalf("eth0 is still served after the primary interface name was changed")
+	}
+}
+
+// The refusal says which name is served, so an operator can tell a
+// misconfiguration from an unsupported feature.
+func TestTheRefusalNamesTheSupportedAttachment(t *testing.T) {
+	s := testLifecycleServer(newFakeIfBindingWriter())
+	err := s.validatePrimaryInterfaceName("eth1")
+	if err == nil {
+		t.Fatalf("eth1 was accepted")
+	}
+	message := status.Convert(err).Message()
+	if !strings.Contains(message, "eth0") || !strings.Contains(message, "eth1") {
+		t.Fatalf("the refusal is %q, want it to name both the supported and the requested interface", message)
+	}
+}

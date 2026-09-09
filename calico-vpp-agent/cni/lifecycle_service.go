@@ -211,15 +211,8 @@ func (s *Server) podSpecFromCreateRequest(
 	if ifname == "" {
 		return nil, status.Error(codes.InvalidArgument, "ifname is required")
 	}
-	if ifname != s.primaryInterfaceName {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"only the primary attachment %q is supported, got %q: secondary attachments are out of scope "+
-				"and must not be folded into the primary one",
-			s.primaryInterfaceName, ifname)
-	}
-	if strings.HasPrefix(ifname, "memif") {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"memif interfaces are out of scope for the pod interface lifecycle service")
+	if err := s.validatePrimaryInterfaceName(ifname); err != nil {
+		return nil, err
 	}
 	// The attachment identity is of the form <container id>:<ifname>. Requiring
 	// the two to agree is a consistency check on what the caller sent; the
@@ -289,6 +282,43 @@ func (s *Server) podSpecFromCreateRequest(
 	}
 
 	return podSpec, nil
+}
+
+// validatePrimaryInterfaceName rejects every attachment that is not the Pod's
+// primary one.
+//
+// v1 supports the primary attachment and nothing else (Issue #135 ruling 3 of
+// the 7-point set): a secondary (multinet) attachment would need the Cilium
+// endpoint model to treat it as an independent endpoint, which is not
+// established. Being out of scope is expressed as a refusal, not as silence.
+// Accepting the request and ignoring the interface name would create an
+// interface for eth1 under eth0's identity, and ignoring the request would tell
+// the CNI that an attachment it asked for exists when it does not; either way
+// one CNI attachment identity would stop naming exactly one interface, which is
+// the invariant of D-68.
+//
+// The comparison is exact. There is no normalisation, no prefix matching and no
+// "looks like a primary interface" rule: a name this service was not configured
+// for is a name it does not serve. DefaultPrimaryInterfaceName is what the
+// lifecycle server is configured with, and SetPrimaryInterfaceName is the only
+// way that changes.
+func (s *Server) validatePrimaryInterfaceName(ifname string) error {
+	if ifname == s.primaryInterfaceName {
+		return nil
+	}
+	if strings.HasPrefix(ifname, "memif") {
+		// Reachable only if this service was configured with a memif name as
+		// its primary interface. Memif is out of scope regardless: it is the
+		// second interface of a port-based-load-balancing attachment, and
+		// which of the two owns the attachment is not something a
+		// configuration convenience may decide (Issue #135 ruling 2).
+		return status.Errorf(codes.InvalidArgument,
+			"memif interfaces are out of scope for the pod interface lifecycle service")
+	}
+	return status.Errorf(codes.InvalidArgument,
+		"only the primary attachment %q is supported, got %q: secondary attachments are out of scope, "+
+			"and are neither ignored nor folded into the primary one",
+		s.primaryInterfaceName, ifname)
 }
 
 func lifecycleIfSpec(isL3 bool) config.InterfaceSpec {
