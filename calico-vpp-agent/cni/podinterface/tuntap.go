@@ -66,6 +66,13 @@ func reduceMtuIf(podMtu *int, tunnelMtu int, tunnelEnabled bool) {
  * and other sources (typically ippool) for vxlanEnabled / ipInIpEnabled
  */
 func (i *TunTapPodInterfaceDriver) computePodMtu(podSpecMtu int, fc *felixConfig.Config, ipipEnabled bool, vxlanEnabled bool) (podMtu int) {
+	if fc == nil {
+		// The Pod interface lifecycle profile has no Felix behind it
+		// (Issue #135 ruling 3), so there is no encapsulation configuration to
+		// reduce the MTU for. An empty config makes every reduction below a
+		// no-op, leaving the requested MTU or the host MTU.
+		fc = &felixConfig.Config{}
+	}
 	hostMtu := vpplink.CalicoVppMaxMTu
 	if len(common.VppManagerInfo.UplinkStatuses) != 0 {
 		for _, v := range common.VppManagerInfo.UplinkStatuses {
@@ -298,6 +305,48 @@ func (i *TunTapPodInterfaceDriver) configureContainerSysctls(podSpec *model.Loca
 	return nil
 }
 
+// suppressIPv6Autoconfiguration turns off the kernel's own IPv6 address
+// configuration on the Pod-side interface: router advertisements are not
+// accepted and no address, not even a link-local one, is generated from the
+// link layer.
+//
+// D-50 makes the Pod attachment L3-only: the interface carries exactly the
+// addresses the CNI decided and nothing else. An address learned from an RA, or
+// a generated link-local address, would be a second and unmanaged source of Pod
+// addresses, and on an L3 tun there is no Ethernet link for neighbour discovery
+// to be about in the first place.
+//
+// This is part of the interface creation transaction rather than a best-effort
+// nicety: a failure fails the ADD and the interface is rolled back (Issue #135
+// ruling 8). Continuing with a warning would leave an interface whose address
+// set the CNI does not control.
+//
+// It applies to L3 interfaces only: an L2 pod interface needs its link-local
+// address for neighbour discovery, so suppressing address generation there
+// would break it.
+func (i *TunTapPodInterfaceDriver) suppressIPv6Autoconfiguration(podSpec *model.LocalPodSpec) error {
+	acceptRAPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", podSpec.InterfaceName)
+	if err := WriteProcSys(acceptRAPath, "0"); err != nil {
+		return fmt.Errorf("failed to set %s=0: %s", acceptRAPath, err)
+	}
+	// addr_gen_mode 1 is IN6_ADDR_GEN_MODE_NONE: no link-local address is
+	// generated for this interface.
+	addrGenModePath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", podSpec.InterfaceName)
+	if err := WriteProcSys(addrGenModePath, "1"); err != nil {
+		return fmt.Errorf("failed to set %s=1 (none): %s", addrGenModePath, err)
+	}
+	return nil
+}
+
+// configureNamespaceSideTun configures the Pod side of the tun in the order the
+// ADD sequence fixes (Issue #135 ruling 8):
+//
+//	IPv6 autoconfiguration suppression -> addresses -> device routes -> MTU
+//
+// The suppression comes first so that no kernel-generated address exists on the
+// interface even briefly, and the addresses come before the routes so that a
+// route towards the interface is never installed while it still has no source
+// address.
 func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, podSpec *model.LocalPodSpec) func(hostNS ns.NetNS) error {
 	return func(hostNS ns.NetNS) error {
 		contTun, err := netlink.LinkByName(podSpec.InterfaceName)
@@ -319,6 +368,20 @@ func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, p
 			if err = WriteProcSys("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "0"); err != nil {
 				return fmt.Errorf("failed to set net.ipv6.conf.lo.disable_ipv6=0: %s", err)
 			}
+			if podSpec.IfSpec.IsL3 != nil && *podSpec.IfSpec.IsL3 {
+				if err = i.suppressIPv6Autoconfiguration(podSpec); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Add the IPs to the container side of the tun before the routes.
+		for _, containerIP := range podSpec.GetContainerIPs() {
+			i.log.Infof("pod(add) tun address swIfIndex=%d linux-ifIndex=%d address=%s", swIfIndex, contTun.Attrs().Index, containerIP.String())
+			err = netlink.AddrAdd(contTun, &netlink.Addr{IPNet: containerIP})
+			if err != nil {
+				return errors.Wrapf(err, "failed to add IP addr to %s: %v", contTun.Attrs().Name, err)
+			}
 		}
 
 		for _, route := range podSpec.Routes {
@@ -339,13 +402,12 @@ func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, p
 			}
 		}
 
-		// Now add the IPs to the container side of the tun.
-		for _, containerIP := range podSpec.GetContainerIPs() {
-			i.log.Infof("pod(add) tun address swIfIndex=%d linux-ifIndex=%d address=%s", swIfIndex, contTun.Attrs().Index, containerIP.String())
-			err = netlink.AddrAdd(contTun, &netlink.Addr{IPNet: containerIP})
-			if err != nil {
-				return errors.Wrapf(err, "failed to add IP addr to %s: %v", contTun.Attrs().Name, err)
-			}
+		// The MTU was already requested when the tun was created; setting it
+		// again is idempotent and puts the step where the fixed ADD order puts
+		// it, after the device routes.
+		podMtu := i.computePodMtu(podSpec.Mtu, i.felixConfig, i.ipipEncapRefCounts > 0, i.vxlanEncapRefCounts > 0)
+		if err = netlink.LinkSetMTU(contTun, podMtu); err != nil {
+			return errors.Wrapf(err, "failed to set mtu %d on %s", podMtu, contTun.Attrs().Name)
 		}
 
 		if err = i.configureContainerSysctls(podSpec); err != nil {

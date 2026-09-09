@@ -16,6 +16,8 @@
 package model
 
 import (
+	"fmt"
+
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink"
 )
 
@@ -49,6 +51,43 @@ type LocalPodSpecStatus struct {
 	V6VrfID uint32 `json:"v6VrfId"`
 	// V6RPFVrfID is the table ID for the v6 uRPF VRF created for the pod
 	V6RPFVrfID uint32 `json:"v6RPFVrfId"`
+	// PublishedIfAttachment is the IF-4 binding tuple this pod spec published
+	// into the cilium_srv6 plugin, or nil when nothing was published.
+	PublishedIfAttachment *PublishedIfAttachment `json:"publishedIfAttachment,omitempty"`
+}
+
+// PublishedIfAttachment is the exact (attachment_id, sw_if_index,
+// if_incarnation) tuple that was written to the cilium_srv6 IF-4 binding table.
+//
+// It is recorded verbatim because every later operation on the binding uses the
+// tuple that was published and never a freshly resolved one: the plugin deletes
+// on exact match only (02 §8.1 rule 6), and re-resolving a stale handle onto
+// the current one is forbidden (00 §2.12.7 prohibition 4) precisely because the
+// sw_if_index may since have been reused by another Pod's interface.
+type PublishedIfAttachment struct {
+	AttachmentID  string `json:"attachmentId"`
+	SwIfIndex     uint32 `json:"swIfIndex"`
+	IfIncarnation uint32 `json:"ifIncarnation"`
+}
+
+// Equals reports whether two published tuples are the same binding. It is what
+// separates an idempotent replay of the exact same tuple (02 §8.1 rule 4) from
+// a conflicting write.
+func (p *PublishedIfAttachment) Equals(other *PublishedIfAttachment) bool {
+	if p == nil || other == nil {
+		return p == nil && other == nil
+	}
+	return p.AttachmentID == other.AttachmentID &&
+		p.SwIfIndex == other.SwIfIndex &&
+		p.IfIncarnation == other.IfIncarnation
+}
+
+// String renders the tuple for logs.
+func (p *PublishedIfAttachment) String() string {
+	if p == nil {
+		return "<none>"
+	}
+	return fmt.Sprintf("(%s, if[%d], incarnation %d)", p.AttachmentID, p.SwIfIndex, p.IfIncarnation)
 }
 
 func NewLocalPodSpecStatus() *LocalPodSpecStatus {

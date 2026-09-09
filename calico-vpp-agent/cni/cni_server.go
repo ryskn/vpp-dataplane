@@ -74,6 +74,25 @@ type Server struct {
 	networkDefinitions   sync.Map
 	cniMultinetEventChan chan common.CalicoVppEvent
 	nodeBGPSpec          *common.LocalNodeSpec
+
+	// lifecycleProfile selects the Pod interface lifecycle profile: this server
+	// is the VPP interface lifecycle authority for an external CNI, it
+	// publishes IF-4 bindings, and there is no Calico control plane behind it
+	// (Issue #135 ruling 3). It is false for the Calico CNI backend.
+	lifecycleProfile bool
+	// ifBinding is the IF-4 binding writer. It is nil outside the lifecycle
+	// profile, and then no binding is ever published.
+	ifBinding IfBindingWriter
+	// notReadyReason is non-empty when the lifecycle service must refuse to
+	// serve because durable ownership could not be established exactly. It is
+	// cleared only by an explicit dataplane reset, that is, by starting again
+	// against state that can be interpreted (Issue #135 ruling 4).
+	notReadyReason string
+	// primaryInterfaceName is the only Pod interface name the lifecycle
+	// profile supports in v1. Secondary (multinet) attachments and
+	// port-based-load-balancing interfaces are out of scope and are rejected
+	// rather than folded into the primary attachment (Issue #135 ruling 2).
+	primaryInterfaceName string
 }
 
 func swIfIdxToIfName(idx uint32) string {
@@ -192,6 +211,11 @@ func (s *Server) rescanState() {
 			/* it might already be enabled, do not return */
 			s.log.Errorf("Error initializing VCL %v", err)
 		}
+	}
+
+	if s.lifecycleProfile {
+		s.rescanLifecycleState()
+		return
 	}
 
 	cniServerState, err := model.LoadCniServerState(config.CniServerStateFilename)

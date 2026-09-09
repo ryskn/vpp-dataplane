@@ -76,6 +76,16 @@ type LocalPodSpec struct {
 	// It is set to the empty string for multinet disabled and to represent
 	// the default network.
 	NetworkName string `json:"networkName"`
+	// AttachmentID is the CNI attachment identity of this pod & interface
+	// couple, stored verbatim as it was received. It is empty when the
+	// interface was created through a path that does not carry one (the
+	// Calico CNI backend); it is the identity published in the cilium_srv6
+	// IF-4 binding table when it is set.
+	//
+	// It is durable state on purpose: after a restart the exact identity that
+	// was published has to be recoverable without reconstructing it from an
+	// interface name, which 00 §2.12.7 prohibition 1 forbids.
+	AttachmentID string `json:"attachmentId"`
 }
 
 func NewLocalPodSpecFromAdd(request *cniproto.AddRequest, nodeBGPSpec *common.LocalNodeSpec) (*LocalPodSpec, error) {
@@ -256,6 +266,13 @@ func (podSpec *LocalPodSpec) Hasv46() (hasv4 bool, hasv6 bool) {
 }
 
 func (podSpec *LocalPodSpec) NeedsSnat(felixServerIpam common.FelixServerIpam, isIP6 bool) bool {
+	if felixServerIpam == nil {
+		// The Pod interface lifecycle profile does not construct a Calico IPAM
+		// authority at all (Issue #135 ruling 3): there is no IP pool that
+		// could request SNAT, so no address needs it. This is the absence of
+		// the dependency, not an unknown answer from it.
+		return false
+	}
 	for _, containerIP := range podSpec.GetContainerIPs() {
 		if containerIP.IP.To4() == nil != isIP6 {
 			continue

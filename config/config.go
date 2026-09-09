@@ -39,12 +39,18 @@ import (
 )
 
 const (
-	CNIServerSocket      = "/var/run/calico/cni-server.sock"
-	FelixDataplaneSocket = "/var/run/calico/felix-dataplane.sock"
-	VppAPISocket         = "/var/run/vpp/vpp-api.sock"
-	VppManagerInfoFile   = "/var/run/vpp/vppmanagerinfofile"
-	CalicoVppPidFile     = "/var/run/vpp/calico_vpp.pid"
-	CalicoVppVersionFile = "/etc/calicovppversion"
+	CNIServerSocket = "/var/run/calico/cni-server.sock"
+	// PodInterfaceLifecycleSocket is where the Pod interface lifecycle
+	// service listens. It is a separate socket from CNIServerSocket because
+	// it serves a different contract (PodInterfaceLifecycle rather than the
+	// Calico CNI backend) to a different caller, and the two profiles are
+	// never both active on a node.
+	PodInterfaceLifecycleSocket = "/var/run/vpp/podinterface-lifecycle.sock"
+	FelixDataplaneSocket        = "/var/run/calico/felix-dataplane.sock"
+	VppAPISocket                = "/var/run/vpp/vpp-api.sock"
+	VppManagerInfoFile          = "/var/run/vpp/vppmanagerinfofile"
+	CalicoVppPidFile            = "/var/run/vpp/calico_vpp.pid"
+	CalicoVppVersionFile        = "/etc/calicovppversion"
 
 	DefaultVXLANVni      = 4096
 	DefaultVXLANPort     = 4789
@@ -64,7 +70,12 @@ const (
 	BaseVppSideHardwareAddress = "02:ca:11:c0:fd:00"
 	// CniServerStateFileVersion is the version of the CNI server state file
 	// it is used to ensure compatibility when reloading data
-	CniServerStateFileVersion = 11
+	//
+	// v12 adds LocalPodSpec.AttachmentID and
+	// LocalPodSpecStatus.PublishedIfAttachment, the durable record of the CNI
+	// attachment identity and of the exact IF-4 binding tuple published for it
+	// (SRv6 Endpoint Context v1, D-71).
+	CniServerStateFileVersion = 12
 	// MaxAPITagLen is the limit number of character allowed in VPP API tags
 	MaxAPITagLen = 63
 	// VrfTagHashLen is the number of hash charatecters (b64) of the name

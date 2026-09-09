@@ -14,6 +14,7 @@ bin:
 build: bin
 	${DOCKER_RUN} go build $(COVER_OPTS) -o ./bin/felix-api-proxy ./cmd/api-proxy
 	${DOCKER_RUN} go build $(COVER_OPTS) -o ./bin/calico-vpp-agent ./cmd
+	${DOCKER_RUN} go build $(COVER_OPTS) -o ./bin/podinterface-lifecycle ./cmd/podinterface-lifecycle
 	${DOCKER_RUN} go build -o ./bin/gobgp github.com/osrg/gobgp/v3/cmd/gobgp/
 
 .PHONY: image

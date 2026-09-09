@@ -112,6 +112,10 @@ func (s *Server) removeConflictingContainers(newAddresses []net.IP, networkName 
 	}
 	for _, podSpec := range podSpecsToDelete {
 		s.log.Infof("Deleting conflicting podSpec=%s", podSpec.Key())
+		// DelVppInterface withdraws the exact tuple this pod spec published,
+		// before destroying its interface, when the durable state has one; when
+		// it has none nothing is guessed and the plugin's interface delete
+		// callback is the safety net (Issue #135 ruling 5).
 		s.DelVppInterface(&podSpec)
 		delete(s.podInterfaceMap, podSpec.Key())
 		err := model.PersistCniServerState(
@@ -144,11 +148,43 @@ func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf boo
 	// if yes we postulate the pod is already well setup
 	if s.v4v6VrfsExistInVPP(podSpec) {
 		s.log.Infof("VRF already exists in VPP podSpec=%s", podSpec.Key())
+		if s.ifBinding != nil {
+			// The VRFs surviving is not evidence that the interface did.
+			// Verify the stored handle against a fresh dump instead of
+			// trusting the saved sw_if_index, which VPP may have handed to a
+			// different interface in the meantime, and fail rather than
+			// re-resolve the binding onto whatever handle is current now
+			// (00 §2.12.7 prohibition 4).
+			live, err := s.storedHandleStillLive(podSpec)
+			if err != nil {
+				return vpplink.InvalidID, errors.Wrapf(err,
+					"cannot verify the stored interface handle of pod %s", podSpec.Key())
+			}
+			if !live {
+				return vpplink.InvalidID, errors.Errorf(
+					"pod %s has VPP VRFs but its published interface handle %s is no longer live; "+
+						"refusing to re-resolve the binding onto a different handle",
+					podSpec.Key(), podSpec.PublishedIfAttachment)
+			}
+			// Exact same tuple: replaying the ADD is idempotent
+			// (02 §8.1 rule 4). No cleanup stack is passed, because this call
+			// created nothing that a failure would have to roll back.
+			if err := s.publishIfAttachment(podSpec, nil); err != nil {
+				return vpplink.InvalidID, err
+			}
+		}
 		return podSpec.TunTapSwIfIndex, nil
 	}
 
 	// We do not have a VRF in VPP for this pod, clear the existing pod status
 	// If there was state left, we assume VPP restarted and the state is not valid anymore
+	//
+	// The interface that state described is therefore gone, and with it the
+	// meaning of any binding published for it. Withdraw the old tuple before
+	// forgetting it, so the plugin's table does not keep a binding this side
+	// can no longer name; the new interface publishes a new binding under the
+	// normal ADD contract (00 §2.12.8).
+	s.revokeIfAttachment(podSpec)
 	podSpec.LocalPodSpecStatus = *model.NewLocalPodSpecStatus()
 
 	// Do we already have a pod with this address in VPP ?
@@ -283,6 +319,18 @@ func (s *Server) AddVppInterface(podSpec *model.LocalPodSpec, doHostSideConf boo
 		s.log.Errorf("failed to activate rpf strict on interface : %s", err)
 		goto err
 	}
+
+	// Publish the CNI attachment identity against the interface handle that
+	// was just created, and do it here, while the cleanup stack is still in
+	// scope: a failed publication has to roll the interface back and make the
+	// CNI ADD fail (00 §2.12.6, completion criteria 1 and 3 of §2.12.9). This
+	// is the last step of AddVppInterface, so the caller cannot return success
+	// to the CNI before the binding ADD was acknowledged.
+	err = s.publishIfAttachment(podSpec, stack)
+	if err != nil {
+		s.log.Errorf("failed to publish the CNI attachment binding: %s", err)
+		goto err
+	}
 	return podSpec.TunTapSwIfIndex, err
 
 err:
@@ -293,21 +341,46 @@ err:
 }
 
 // CleanUpVPPNamespace deletes the devices in the network namespace.
+//
+// Teardown is three independent operations (Issue #135 ruling 6):
+//
+//  1. withdraw the published IF-4 binding, using the exact tuple that was
+//     written; best effort, and its failure never stops operation 2
+//  2. destroy the VPP-side interfaces
+//  3. clean up the Pod side of the interface
+//
+// Only operation 3 needs the Pod network namespace to still exist. A namespace
+// that is already gone therefore no longer causes the binding to stay published
+// and the VPP interface to stay alive, which is what the previous early return
+// did.
 func (s *Server) DelVppInterface(podSpec *model.LocalPodSpec) {
+	netnsPresent := ns.IsNSorErr(podSpec.NetnsName) == nil
+	if !netnsPresent {
+		s.log.Infof("pod(del) netns '%s' doesn't exist, skipping the namespace-side cleanup only", podSpec.NetnsName)
+	}
+
+	// Operation 1, first and unconditionally: the binding names an identity
+	// and a handle, neither of which lives in the Pod netns.
+	s.revokeIfAttachment(podSpec)
+
 	if len(config.GetCalicoVppInitialConfig().RedirectToHostRules) != 0 && podSpec.NetworkName == "" {
 		err := s.DelRedirectToHostOnInterface(podSpec.TunTapSwIfIndex)
 		if err != nil {
 			s.log.Error(err)
 		}
 	}
-	err := ns.IsNSorErr(podSpec.NetnsName)
-	if err != nil {
-		s.log.Infof("pod(del) netns '%s' doesn't exist, skipping", podSpec.NetnsName)
-		return
-	}
 
 	if !s.v4v6VrfsExistInVPP(podSpec) {
-		s.log.Warnf("pod(del) VRF for netns '%s' doesn't exist, skipping", podSpec.NetnsName)
+		s.log.Warnf("pod(del) VRF for netns '%s' doesn't exist", podSpec.NetnsName)
+		// The per-pod VRFs are gone, so the routing state this function would
+		// tear down is gone with them. The interfaces may not be: destroy the
+		// ones whose recorded handle is provably still ours. Outside the
+		// lifecycle profile there is no incarnation to prove that with, so the
+		// stored sw_if_index is not trusted and the old behaviour of leaving
+		// the interfaces to VPP is kept.
+		if s.lifecycleProfile {
+			s.delOrphanedVppInterfaces(podSpec, netnsPresent)
+		}
 		return
 	}
 
@@ -388,4 +461,40 @@ func (s *Server) DelVppInterface(podSpec *model.LocalPodSpec) {
 		Type: common.PodDeleted,
 		Old:  podSpec,
 	})
+}
+
+// delOrphanedVppInterfaces performs teardown operation 2 for a pod whose
+// per-pod VRFs are already gone.
+//
+// The stored sw_if_index alone is not enough to act on: VPP may have given it
+// to a different interface, and destroying that one would tear down another
+// Pod's datapath. The recorded incarnation is what makes the handle provable
+// (D-31), so the interfaces are destroyed only when the published tuple is
+// still the live one; otherwise nothing is touched and the plugin's interface
+// delete callback remains the safety net (02 §8.1 rule 7).
+func (s *Server) delOrphanedVppInterfaces(podSpec *model.LocalPodSpec, netnsPresent bool) {
+	if podSpec.TunTapSwIfIndex == vpplink.InvalidID {
+		return
+	}
+	if s.ifBinding == nil {
+		return
+	}
+	live, err := s.storedHandleStillLive(podSpec)
+	if err != nil {
+		s.log.WithError(err).Warnf("pod(del) cannot verify the stored handle of %s, leaving its VPP interfaces alone",
+			podSpec.Key())
+		return
+	}
+	if !live {
+		s.log.Infof("pod(del) stored handle of %s is no longer live, leaving its VPP interfaces alone",
+			podSpec.Key())
+		return
+	}
+	plan := planTeardown(podSpec.PublishedIfAttachment != nil, netnsPresent, true /* vppStateStillOwned */)
+	if !plan.DeleteVppInterfaces {
+		return
+	}
+	s.log.Infof("pod(del) destroying the VPP interfaces of %s without its per-pod VRFs", podSpec.Key())
+	s.tuntapDriver.DeleteInterface(podSpec)
+	s.loopbackDriver.DeleteInterface(podSpec)
 }
