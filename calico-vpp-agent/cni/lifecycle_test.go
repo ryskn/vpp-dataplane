@@ -940,6 +940,103 @@ func TestCreatePodInterfaceRejectsEveryNonPrimaryInterfaceName(t *testing.T) {
 	}
 }
 
+// The delete side answers the same question the create side does, and answers
+// it before it looks at its stored state (Issue #135 merge condition 2).
+//
+// An unsupported interface name and an attachment that is already gone are two
+// different answers: NOT_FOUND is what the CNI DEL turns into an idempotent
+// success, so answering an unsupported request out of the map would make "this
+// service does not serve eth1" indistinguishable from "eth1 was already
+// deleted", and a caller that is attaching secondary interfaces would never
+// learn that they are unsupported.
+//
+// Each name is refused in both states the stored map can be in, and the two
+// states catch different mistakes:
+//
+//   - "absent" is the case the ordering is about. Nothing is stored under the
+//     key, so a validation placed after the lookup answers NOT_FOUND — the very
+//     conflation this test exists to prevent — while the validation placed
+//     before it answers INVALID_ARGUMENT.
+//   - "stored" is the case a missing validation shows up in: the lookup hits,
+//     and without the check the attachment would be torn down and dropped.
+func TestDeletePodInterfaceRejectsEveryNonPrimaryInterfaceName(t *testing.T) {
+	for _, ifname := range []string{
+		"eth1",   // the multinet secondary attachment
+		"net1",   // its other spelling
+		"memif0", // the second interface of a port-based-load-balancing pod
+		"eth0x",  // not a prefix match
+		"eth",    // not a prefix match the other way round
+		"ETH0",   // not case insensitive
+		" eth0",  // not trimmed
+		"eth0 ",  //
+	} {
+		for _, stored := range []bool{false, true} {
+			name := ifname + "/absent"
+			if stored {
+				name = ifname + "/stored"
+			}
+			t.Run(name, func(t *testing.T) {
+				writer := newFakeIfBindingWriter()
+				s, service := testLifecycleService(t, writer)
+				netns := "/proc/1234/ns/net"
+				attachmentID := "container:" + ifname
+				key := model.LocalPodSpecKey(netns, ifname)
+				if stored {
+					s.podInterfaceMap[key] = model.LocalPodSpec{
+						InterfaceName: ifname,
+						NetnsName:     netns,
+						AttachmentID:  attachmentID,
+					}
+				}
+				s.delVppInterfaceFn = func(*model.LocalPodSpec) {
+					t.Fatalf("teardown ran for the unsupported interface %q", ifname)
+				}
+
+				_, err := service.DeletePodInterface(context.Background(), &podinterfacepb.DeletePodInterfaceRequest{
+					AttachmentId: attachmentID,
+					Netns:        netns,
+					Ifname:       ifname,
+				})
+
+				if code := statusCode(t, err); code != codes.InvalidArgument {
+					t.Fatalf("deleting %q was refused with %s, want InvalidArgument", ifname, code)
+				}
+				if _, ok := s.podInterfaceMap[key]; ok != stored {
+					t.Fatalf("a refused delete changed the stored attachment (stored=%t)", stored)
+				}
+				if len(writer.calls) != 0 {
+					t.Fatalf("a refused delete reached the plugin: %v", writer.calls)
+				}
+			})
+		}
+	}
+}
+
+// The supported name with nothing stored for it stays NOT_FOUND, which is what
+// the CNI DEL treats as an idempotent success. Only the unsupported name became
+// a contract violation; deleting the primary attachment twice did not.
+func TestDeletePodInterfaceReportsAnAbsentPrimaryAttachmentAsNotFound(t *testing.T) {
+	writer := newFakeIfBindingWriter()
+	s, service := testLifecycleService(t, writer)
+	s.delVppInterfaceFn = func(*model.LocalPodSpec) {
+		t.Fatalf("teardown ran for an attachment that is not stored")
+	}
+
+	_, err := service.DeletePodInterface(context.Background(), &podinterfacepb.DeletePodInterfaceRequest{
+		AttachmentId: "container:" + DefaultPrimaryInterfaceName,
+		Netns:        "/proc/1234/ns/net",
+		Ifname:       DefaultPrimaryInterfaceName,
+	})
+
+	if code := statusCode(t, err); code != codes.NotFound {
+		t.Fatalf("deleting an absent %s was refused with %s, want NotFound",
+			DefaultPrimaryInterfaceName, code)
+	}
+	if len(writer.calls) != 0 {
+		t.Fatalf("a delete of an unknown attachment reached the plugin: %v", writer.calls)
+	}
+}
+
 // The name that is served is the one the server was configured with, and the
 // constant is that configuration's value rather than a rule of its own.
 func TestTheSupportedPrimaryInterfaceNameIsTheConfiguredOne(t *testing.T) {

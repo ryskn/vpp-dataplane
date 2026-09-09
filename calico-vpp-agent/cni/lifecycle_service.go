@@ -132,6 +132,15 @@ func (l *lifecycleService) CreatePodInterface(
 // unknown attachment: without a stored tuple there is nothing exact to
 // withdraw, and the plugin's interface delete callback is the safety net
 // (Issue #135 ruling 5).
+//
+// Which interface names this service serves is decided before the stored state
+// is consulted at all, exactly as it is on the create side. A non-primary
+// attachment is out of scope in v1, and saying so is not the same statement as
+// "this attachment is not here": if an unsupported request were answered from
+// the map it would come back as NOT_FOUND, which the caller treats as an
+// idempotent DEL, and an interface name this service never serves would be
+// indistinguishable from one that was already deleted (Issue #135 merge
+// condition 2). The order matters for that reason and not only for efficiency.
 func (l *lifecycleService) DeletePodInterface(
 	ctx context.Context,
 	request *podinterfacepb.DeletePodInterfaceRequest,
@@ -146,6 +155,13 @@ func (l *lifecycleService) DeletePodInterface(
 	}
 	if request.GetIfname() == "" {
 		return nil, status.Error(codes.InvalidArgument, "ifname is required")
+	}
+	// Symmetric with CreatePodInterface, and by the same rule
+	// (validatePrimaryInterfaceName): the name is compared exactly, is never
+	// folded into the primary attachment, and is decided here rather than by
+	// whether a lookup happens to miss.
+	if err := s.validatePrimaryInterfaceName(request.GetIfname()); err != nil {
+		return nil, err
 	}
 
 	key := model.LocalPodSpecKey(request.GetNetns(), request.GetIfname())
