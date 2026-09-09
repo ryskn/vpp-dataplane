@@ -280,6 +280,11 @@ func WriteProcSys(path, value string) error {
 	return err
 }
 
+// writeProcSys is the sysctl writer suppressIPv6Autoconfiguration uses. It is a
+// variable so that a test can make a sysctl fail without a Pod netns; nothing
+// in production ever replaces it.
+var writeProcSys = WriteProcSys
+
 // configureContainerSysctls configures necessary sysctls required inside the container netns.
 // This method was adapted from cni-plugin/internal/pkg/utils/network_linux.go
 func (i *TunTapPodInterfaceDriver) configureContainerSysctls(podSpec *model.LocalPodSpec) error {
@@ -326,13 +331,13 @@ func (i *TunTapPodInterfaceDriver) configureContainerSysctls(podSpec *model.Loca
 // would break it.
 func (i *TunTapPodInterfaceDriver) suppressIPv6Autoconfiguration(podSpec *model.LocalPodSpec) error {
 	acceptRAPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", podSpec.InterfaceName)
-	if err := WriteProcSys(acceptRAPath, "0"); err != nil {
+	if err := writeProcSys(acceptRAPath, "0"); err != nil {
 		return fmt.Errorf("failed to set %s=0: %s", acceptRAPath, err)
 	}
 	// addr_gen_mode 1 is IN6_ADDR_GEN_MODE_NONE: no link-local address is
 	// generated for this interface.
 	addrGenModePath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", podSpec.InterfaceName)
-	if err := WriteProcSys(addrGenModePath, "1"); err != nil {
+	if err := writeProcSys(addrGenModePath, "1"); err != nil {
 		return fmt.Errorf("failed to set %s=1 (none): %s", addrGenModePath, err)
 	}
 	return nil

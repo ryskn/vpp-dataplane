@@ -88,7 +88,7 @@ func (l *lifecycleService) CreatePodInterface(
 		podSpec = &existingCopy
 	}
 
-	swIfIndex, err := s.AddVppInterface(podSpec, true /* doHostSideConf */)
+	swIfIndex, err := s.createVppInterface(podSpec, true /* doHostSideConf */)
 	if err != nil {
 		s.log.Errorf("Interface add failed %s : %v", podSpec.String(), err)
 		return nil, status.Errorf(codes.Internal, "cannot create the pod interface: %v", err)
@@ -104,13 +104,13 @@ func (l *lifecycleService) CreatePodInterface(
 	s.podInterfaceMap[podSpec.Key()] = *podSpec
 	if err := model.PersistCniServerState(
 		model.NewCniServerState(s.podInterfaceMap),
-		config.CniServerStateFilename,
+		s.stateFilename,
 	); err != nil {
 		// The interface exists and its binding is published; losing the
 		// durable record would make the next restart unable to name the exact
 		// tuple it must withdraw, so this is a failure, not a warning.
 		s.log.Errorf("CNI state persist errored %v", err)
-		s.DelVppInterface(podSpec)
+		s.delVppInterface(podSpec)
 		delete(s.podInterfaceMap, podSpec.Key())
 		return nil, status.Errorf(codes.Internal, "cannot persist the pod interface state: %v", err)
 	}
@@ -166,12 +166,12 @@ func (l *lifecycleService) DeletePodInterface(
 	}
 
 	s.log.Infof("pod(del) attachment=%s spec=%s", podSpec.AttachmentID, podSpec.String())
-	s.DelVppInterface(&podSpec)
+	s.delVppInterface(&podSpec)
 
 	delete(s.podInterfaceMap, key)
 	if err := model.PersistCniServerState(
 		model.NewCniServerState(s.podInterfaceMap),
-		config.CniServerStateFilename,
+		s.stateFilename,
 	); err != nil {
 		s.log.Errorf("CNI state persist errored %v", err)
 	}

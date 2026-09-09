@@ -93,6 +93,33 @@ type Server struct {
 	// port-based-load-balancing interfaces are out of scope and are rejected
 	// rather than folded into the primary attachment (Issue #135 ruling 2).
 	primaryInterfaceName string
+	// stateFilename is where the lifecycle profile keeps its durable state.
+	stateFilename string
+	// createVppInterfaceFn overrides the interface creation step. It exists so
+	// that the ordering the lifecycle service enforces around interface
+	// creation can be tested without a live VPP; production leaves it nil and
+	// AddVppInterface is used.
+	createVppInterfaceFn func(podSpec *model.LocalPodSpec, doHostSideConf bool) (uint32, error)
+	// delVppInterfaceFn overrides the teardown step, for the same reason.
+	delVppInterfaceFn func(podSpec *model.LocalPodSpec)
+}
+
+// createVppInterface creates the Pod-facing VPP interface and publishes its
+// IF-4 binding before returning (see AddVppInterface).
+func (s *Server) createVppInterface(podSpec *model.LocalPodSpec, doHostSideConf bool) (uint32, error) {
+	if s.createVppInterfaceFn != nil {
+		return s.createVppInterfaceFn(podSpec, doHostSideConf)
+	}
+	return s.AddVppInterface(podSpec, doHostSideConf)
+}
+
+// delVppInterface runs the three teardown operations (see DelVppInterface).
+func (s *Server) delVppInterface(podSpec *model.LocalPodSpec) {
+	if s.delVppInterfaceFn != nil {
+		s.delVppInterfaceFn(podSpec)
+		return
+	}
+	s.DelVppInterface(podSpec)
 }
 
 func swIfIdxToIfName(idx uint32) string {

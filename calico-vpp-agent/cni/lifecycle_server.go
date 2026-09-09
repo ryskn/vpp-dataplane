@@ -79,6 +79,7 @@ func NewLifecycleServer(vpp *vpplink.VppLink, ifBinding IfBindingWriter, log *lo
 		lifecycleProfile:     true,
 		ifBinding:            ifBinding,
 		primaryInterfaceName: DefaultPrimaryInterfaceName,
+		stateFilename:        config.CniServerStateFilename,
 	}
 	return server
 }
@@ -122,7 +123,7 @@ func (s *Server) markNotReady(reason string) {
 //   - ownership cannot be established exactly: fail closed. Nothing is guessed,
 //     and nothing is deleted from the durable state.
 func (s *Server) rescanLifecycleState() {
-	cniServerState, err := model.LoadLifecycleState(config.CniServerStateFilename)
+	cniServerState, err := model.LoadLifecycleState(s.stateFilename)
 	if err != nil {
 		s.lock.Lock()
 		defer s.lock.Unlock()
@@ -140,26 +141,49 @@ func (s *Server) rescanLifecycleState() {
 	for key, podSpec := range cniServerState.PodSpecs {
 		podSpecCopy := podSpec.Copy()
 
-		if podSpecCopy.AttachmentID == "" {
-			// Without the attachment identity the binding could only be
-			// re-published by reconstructing it, which 00 §2.12.7 prohibition 1
-			// forbids. Keep the entry so the state is not silently discarded
-			// and refuse to serve.
+		// Decide from a fresh observation of VPP, not from the stored state
+		// alone. v4v6VrfsExistInVPP says whether the per-pod VRFs this state
+		// describes are still there, and storedHandleStillLive says whether the
+		// stored sw_if_index still carries the incarnation the binding was
+		// published for.
+		vrfsExist := s.v4v6VrfsExistInVPP(&podSpecCopy)
+		handleStillLive := false
+		if vrfsExist {
+			live, err := s.storedHandleStillLive(&podSpecCopy)
+			if err != nil {
+				s.log.WithError(err).Warnf("pod(rescan) cannot verify the stored handle of %s", key)
+			} else {
+				handleStillLive = live
+			}
+		}
+
+		decision := planRescan(podSpecCopy.AttachmentID != "", !vrfsExist, handleStillLive)
+		s.log.Infof("pod(rescan) %s: %s (vrfs=%t handle-live=%t)", key, decision, vrfsExist, handleStillLive)
+
+		if decision == rescanFailClosed {
+			// Keep the entry: the interface it describes may still exist, so
+			// this state must not be discarded. Nothing is reconstructed —
+			// re-publishing without the stored identity, or onto a handle that
+			// moved, is what 00 §2.12.7 prohibitions 1 and 4 forbid.
 			s.podInterfaceMap[key] = podSpecCopy
 			s.markNotReady(errors.Errorf(
-				"stored pod interface %s has no CNI attachment identity; exact ownership cannot be recovered",
-				key).Error())
+				"cannot establish exact ownership of stored pod interface %s (identity %q, published binding %s)",
+				key, podSpecCopy.AttachmentID, podSpecCopy.PublishedIfAttachment).Error())
 			continue
 		}
 
-		_, err := s.AddVppInterface(&podSpecCopy, false /* doHostSideConf */)
+		// rescanReplay re-sends the exact same tuple, which the plugin treats
+		// as idempotent; rescanNewLifecycle withdraws the old tuple and creates
+		// a new interface that publishes a new binding. AddVppInterface does
+		// both, selected by the same VRF observation.
+		_, err := s.createVppInterface(&podSpecCopy, false /* doHostSideConf */)
 		switch err.(type) {
 		case PodNSNotFoundErr:
 			// The Pod is gone. Its binding and its VPP interface are not: run
 			// the teardown, which needs neither the netns nor a subsequent CNI
 			// DEL (Issue #135 ruling 6), and drop the entry.
 			s.log.Infof("pod(rescan) netns of %s is gone, tearing its interface down", podSpecCopy.String())
-			s.DelVppInterface(&podSpecCopy)
+			s.delVppInterface(&podSpecCopy)
 		case nil:
 			s.log.Infof("pod(rescan) restored podSpec=%s binding=%s",
 				podSpecCopy.String(), podSpecCopy.PublishedIfAttachment)
@@ -174,7 +198,7 @@ func (s *Server) rescanLifecycleState() {
 
 	if err := model.PersistCniServerState(
 		model.NewCniServerState(s.podInterfaceMap),
-		config.CniServerStateFilename,
+		s.stateFilename,
 	); err != nil {
 		s.log.Errorf("CNI state persist errored %v", err)
 	}
