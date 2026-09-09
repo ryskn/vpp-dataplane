@@ -87,9 +87,19 @@ message CreatePodInterfaceRequest {
     repeated string addresses = 4;
 
     // routes are the destination prefixes, in CIDR notation, to install inside
-    // the Pod network namespace. Each one is installed as a device route out of
-    // the created interface, with no gateway and no on-link neighbour: the
-    // attachment is L3-only, so there is no next hop to resolve.
+    // the Pod network namespace. Each entry is an on-link prefix that has no
+    // gateway: it is installed as a device route out of the created interface,
+    // and the attachment is L3-only, so there is no next hop to resolve.
+    //
+    // gateway semantics MUST NOT be inferred; each entry is a device route.
+    //
+    // The field is not a general routing object. It carries a destination
+    // prefix and nothing else, so a provider MUST NOT derive a next hop, a
+    // gateway address or any other route attribute from an entry, and MUST NOT
+    // treat an entry as a request for anything other than a gateway-less
+    // device route out of the interface it created for this attachment. A
+    // future need for routes that do have a gateway is a new field, not a
+    // widened reading of this one.
     //
     // May be empty, in which case the provider installs no routes beyond the
     // ones implied by the addresses.

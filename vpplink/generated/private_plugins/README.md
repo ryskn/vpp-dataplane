@@ -25,5 +25,14 @@ holds a vendored snapshot of it.
 Neither submodule nor subtree is used: both would make the snapshot look like a
 second place where the plugin can be modified.
 
+The pinned commit SHA is the only authority for which version of the canonical
+source a snapshot corresponds to. A pull request number is not one, and is not
+written down as if it were: a pull request can be rebased, retargeted, closed
+and reopened under a different number, and in none of those cases does its
+number name a file's contents. The same rule governs the `PodInterfaceLifecycle`
+proto snapshot under `calico-vpp-agent/proto/`, which is refreshed by
+`scripts/sync-podinterface-proto.sh`, pinned by `PODINTERFACE_PROTO_SOURCE` and
+checked by `scripts/check-podinterface-proto-sync.sh`.
+
 The other directories here (`ip_ttl_fixup`, `pbl`) are maintained in this
 repository and have no upstream pin.
