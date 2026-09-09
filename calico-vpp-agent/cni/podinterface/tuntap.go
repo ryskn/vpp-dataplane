@@ -466,29 +466,55 @@ func (i *TunTapPodInterfaceDriver) addPodAddresses(contTun netlink.Link, podSpec
 	return nil
 }
 
-// addPodRoutes installs the device routes of the pod spec out of the tun.
+// AddPodRoutes installs the device routes of the pod spec out of the tun, and
+// applies this driver's profile policy to a route that could not be installed.
 //
-// A route that cannot be added is logged and not returned, which is what this
-// code has always done ("in ipv6 '::' already exists"); both profiles keep that
-// behaviour.
-func (i *TunTapPodInterfaceDriver) addPodRoutes(contTun netlink.Link, podSpec *model.LocalPodSpec, swIfIndex uint32, hasv4 bool, hasv6 bool) {
+// Installing a route is shared code; what a failed installation means is not
+// (Issue #135 merge condition 1):
+//
+//   - LifecycleProfile returns the failure, so the ADD fails and the caller's
+//     cleanup stack rolls the interface back. What a successful CNI ADD means
+//     for this service is "the namespace-side L3 realization is complete, the
+//     VPP-side realization is complete, and the exact binding is published". A
+//     device route that is missing leaves an attachment that looks finished
+//     from every side that can be observed — the tun exists, the address is on
+//     it, the binding is published, the Cilium endpoint is Ready — while the
+//     Pod cannot reach the destinations that route was for. Exactly one
+//     component owns the L3 realization of an attachment, and that owner must
+//     not report success for a realization it knows failed.
+//   - CalicoProfile logs the failure and continues, which is what this code has
+//     always done ("in ipv6 '::' already exists"). Shared code is not shared
+//     policy: changing what a Calico deployment does with a failed route is a
+//     change to that product, needs its own reasons, and is not made here.
+//
+// routeAdd is a parameter rather than a direct call to netlink.RouteAdd so that
+// this step, with the real policy above, can be run where there is no Pod netns
+// to install routes into. configureNamespaceSideTun passes netlink.RouteAdd,
+// and nothing in production passes anything else.
+func (i *TunTapPodInterfaceDriver) AddPodRoutes(routeAdd func(*netlink.Route) error, linkIndex int, podSpec *model.LocalPodSpec, swIfIndex uint32, hasv4 bool, hasv6 bool) error {
 	for _, route := range podSpec.Routes {
 		isV6 := route.IP.To4() == nil
 		if (isV6 && !hasv6) || (!isV6 && !hasv4) {
 			i.log.Infof("pod(add) Skipping tun swIfIndex=%d route=%s", swIfIndex, route.String())
 			continue
 		}
-		i.log.Infof("pod(add) tun route swIfIndex=%d linux-ifIndex=%d route=%s", swIfIndex, contTun.Attrs().Index, route.String())
-		err := netlink.RouteAdd(&netlink.Route{
-			LinkIndex: contTun.Attrs().Index,
+		i.log.Infof("pod(add) tun route swIfIndex=%d linux-ifIndex=%d route=%s", swIfIndex, linkIndex, route.String())
+		err := routeAdd(&netlink.Route{
+			LinkIndex: linkIndex,
 			Scope:     netlink.SCOPE_UNIVERSE,
 			Dst:       &route,
 		})
-		if err != nil {
+		if err == nil {
+			continue
+		}
+		if i.profile != LifecycleProfile {
 			// TODO : in ipv6 '::' already exists
 			i.log.Errorf("Error adding tun[%d] route for %s", swIfIndex, route.String())
+			continue
 		}
+		return errors.Wrapf(err, "failed to add device route %s on %s", route.String(), podSpec.InterfaceName)
 	}
+	return nil
 }
 
 // setPodMtu sets the MTU on the Pod side of the tun.
@@ -522,8 +548,7 @@ func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, p
 			case stepAddresses:
 				err = i.addPodAddresses(contTun, podSpec, swIfIndex)
 			case stepRoutes:
-				i.addPodRoutes(contTun, podSpec, swIfIndex, hasv4, hasv6)
-				err = nil
+				err = i.AddPodRoutes(netlink.RouteAdd, contTun.Attrs().Index, podSpec, swIfIndex, hasv4, hasv6)
 			case stepMtu:
 				err = i.setPodMtu(contTun, podSpec)
 			case stepContainerSysctls:
