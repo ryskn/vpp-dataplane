@@ -1,0 +1,351 @@
+# SRv6 Endpoint Context — Stage 0 deployment
+
+This document describes the vpp-dataplane half of the Stage 0 test bed for the
+SRv6 Endpoint Context v1 design: what it deploys, how the images are made
+reproducible, and what is known to be missing or unresolved.
+
+Stage 0 is defined in Issue #21 and Issue #135 of the Cilium fork. Its purpose
+is not throughput and not a demonstration that packets flow. It is to establish
+that:
+
+* Cilium keeps CNI, IPAM, endpoint identity and policy authority;
+* the Pod's L3 datapath is owned by VPP and by nothing else;
+* the exact `(attachment_id, sw_if_index, if_incarnation)` binding is published
+  by the component that created the interface, before the CNI ADD succeeds
+  (D-71).
+
+Cross-node SRv6 forwarding is explicitly *not* expected in Stage 0 or Stage 1.
+The profile runs with `FabricAuthority = none`, and with no interface classified
+as `TRUSTED_FABRIC` the guard drops `SRV6_BLOCK`-destined ingress on the uplink.
+That is the designed behaviour, not a defect of this deployment.
+
+## 1. Topology
+
+```
+  Kubernetes control plane
+  Cilium agent (CNI, IPAM, endpoint identity, policy, srv6ec)
+        |
+        |  CreatePodInterface / DeletePodInterface
+        |  unix:/var/run/vpp/podinterface-lifecycle.sock
+        v
+  +--------------------------- DaemonSet srv6ec-vpp-node ---------------------+
+  |                                                                          |
+  |  podinterface-lifecycle          vppapi-proxy            vpp              |
+  |  (lifecycle authority)           (socat)                 (vpp-manager)    |
+  |         |                            |                        |          |
+  |         |  IF-2 binary API           |  IF-2 forwarded        | starts    |
+  |         |  /var/run/vpp/             |  /var/run/vpp-srv6ec/  | and owns  |
+  |         |  vpp-api.sock              |  vpp-api.sock          | VPP       |
+  |         v                            v                        v          |
+  |  +--------------------------------------------------------------------+  |
+  |  |  VPP + cilium_srv6 plugin                                          |  |
+  |  |  uplink (virtio)   vpptap0   Pod TUNs                              |  |
+  |  +--------------------------------------------------------------------+  |
+  +--------------------------------------------------------------------------+
+                              ^
+                              |  IF-2, via the proxy socket
+                        Cilium agent (srv6ec)
+```
+
+The Cilium agent reaches VPP through the proxy socket, not through VPP's own;
+section 4 explains why.
+
+## 2. Containers
+
+| container | image | entrypoint | what it owns |
+|---|---|---|---|
+| `vpp` | `calicovpp/vpp` (with `cilium_srv6_plugin.so`) | `/usr/bin/vpp-manager` | the uplink, `vpptap0`, the VPP process |
+| `podinterface-lifecycle` | `calicovpp/agent` | `/bin/podinterface-lifecycle` | Pod TUN creation and deletion, the IF-4 attachment binding, the durable lifecycle state |
+| `vppapi-proxy` | `calicovpp/agent` | `socat` | the IF-2 socket the Cilium agent connects to |
+
+Not deployed, and deliberately so: `calico-node`, Felix, Typha, the Calico CNI
+installer, `calico-vpp-agent`, GoBGP. Issue #135 ruling 3 rejects making
+interface creation depend on a second network control plane, so the lifecycle
+service is a separate entrypoint rather than a mode of the agent: it never
+reaches the Felix configuration barrier and never constructs the Calico v3
+client, the BGP server, the Felix server, the connectivity/routing/service
+servers, the watchers, or multinet.
+
+## 3. Sockets, host paths and state
+
+| path | kind | producer | consumer |
+|---|---|---|---|
+| `/var/run/vpp/vpp-api.sock` | unix socket, VPP-created (0660 in a 0755 dir) | VPP `socksvr` | `podinterface-lifecycle`, `vppapi-proxy` |
+| `/var/run/vpp-srv6ec/vpp-api.sock` | unix socket, 0600 in a 0700 dir | `vppapi-proxy` | Cilium agent (IF-2) |
+| `/var/run/vpp/podinterface-lifecycle.sock` | unix socket, gRPC | `podinterface-lifecycle` | Cilium CNI plugin |
+| `/var/run/vpp/vppmanagerinfofile` | file | `vpp-manager` | `podinterface-lifecycle` (uplink MTU) |
+| `/var/run/vpp/calicovpp_state.v12.json` | file | `podinterface-lifecycle` | itself, across restarts |
+| `/var/run/vpp/cli.sock` | unix socket | VPP | `vppctl` / `calivppctl` |
+
+hostPath volumes of the DaemonSet:
+
+| volume | host path | why |
+|---|---|---|
+| `vpp-rundir` | `/var/run/vpp` | the sockets and the durable lifecycle state above |
+| `srv6ec-if2-rundir` | `/var/run/vpp-srv6ec` | the proxied IF-2 socket; a hostPath because the Cilium agent Pod mounts the same directory |
+| `vpp-data` | `/var/lib/vpp` | VPP core files |
+| `vpp-config` | `/etc/vpp` | generated `startup.conf` / `startup.exec` |
+| `netns` | `/run/netns` | Pod network namespaces, mounted `Bidirectional` |
+| `devices` / `hostsys` / `lib-firmware` / `host-root` | `/dev`, `/sys`, `/lib/firmware`, `/` | uplink driver binding, as in the Calico profile |
+
+Note on durability: the lifecycle state file lives under `/var/run/vpp`, which
+on most distributions is a tmpfs. It therefore survives a container restart and
+an agent restart — which is what the D-71 rescan and the E2E 7 case need — but
+not a node reboot. A node reboot is a clean dataplane reset in this profile
+(VPP's interfaces are gone too), so the two are consistent, but a test that
+expects state to survive a reboot is testing something this profile does not
+provide.
+
+## 4. The IF-2 socket proxy
+
+`pkg/srv6ec/vppapi.VerifySocketPath` in the Cilium fork requires the VPP binary
+API socket to be a Unix domain socket owned by an accepted UID, with no access
+for group or other, inside a directory with the same ownership rule and mode
+`0700`. That is the deployment contract of 00 §4.1 (D-27). VPP creates its
+socket mode 0660 in `/var/run/vpp`, which is mode 0755, so the agent refuses it
+and no IF-2 connection is established.
+
+`chmod` on VPP's own socket is not a fix. VPP recreates the socket on every
+start, and E2E 6 restarts VPP on purpose, so the fix would be undone by the
+very test it has to survive.
+
+Stage 0 therefore puts a forwarding proxy in a directory this profile owns
+(Issue #21 ruling T-6). Three consequences, all of them intended:
+
+1. The listening socket and its directory are created once, by a container
+   whose lifetime is independent of VPP's, so a VPP restart does not change the
+   socket the agent is configured with.
+2. Killing the `vppapi-proxy` container breaks the IF-2 transport without
+   touching VPP. That is exactly the E2E 5 fault: the agent must observe a
+   transport reconnect with an unchanged `plugin_instance_id` and an unchanged
+   `context_epoch`, as distinct from the E2E 6 fault where the
+   `plugin_instance_id` changes.
+3. The peer credential the agent reads belongs to `socat`, not to VPP.
+
+Point 3 is a real trust delta and is stated rather than hidden. `transport.go`
+already documents that the peer credential proves the UID of the process on the
+other end and never that the process is VPP, so the check keeps exactly the
+meaning it claims; what changes is that the process at the far end of the
+accepted connection is one hop away. Both processes are root in the same Pod on
+a test bed, which is why this is acceptable here. It is not an answer to the
+production socket-mode question, which is open in Issue #60 section A.
+
+Forwarding bytes is sufficient for the binary API. The adapter the Cilium agent
+dials with is govpp's `socketclient`, which carries the whole API as a
+length-prefixed message stream over a `SOCK_STREAM` socket and passes no file
+descriptors — there is no `SCM_RIGHTS` and no shared-memory segment handshake in
+`vendor/go.fd.io/govpp/adapter/socketclient`. A byte-forwarding proxy therefore
+preserves the protocol. This does not generalise to VPP API clients that use the
+shared-memory transport.
+
+## 5. Image reproducibility
+
+Issue #135 ruling 6 requires an immutable identity for the VPP image, derived
+from three commits, and the digest to be recorded with the test result.
+
+### Tag derivation
+
+`scripts/srv6ec-image-tag.sh` produces
+
+```
+vpp-<VPP upstream commit:12>-dp-<vpp-dataplane commit:12>-srv6-<cilium_srv6 commit:12>
+```
+
+for example
+
+```
+vpp-e84849bcdb70-dp-fbc3b15557e1-srv6-b37d8847c03f
+```
+
+The three inputs:
+
+| input | where it is read | why it is authoritative |
+|---|---|---|
+| VPP upstream commit | the `BASE` default in `vpplink/generated/vpp_clone_current.sh` | it is the commit the build resets the VPP checkout to |
+| vpp-dataplane commit | `HEAD` of this repository | it contains the cherry-pick list, the patches, the deb list in `vpp-manager/Makefile` and the Dockerfile — every remaining build input |
+| cilium_srv6 commit | `CILIUM_SRV6_SOURCE_COMMIT` in `vpplink/generated/private_plugins/` | `scripts/check-cilium-srv6-sync.sh` proves the vendored tree is byte-for-byte that commit's tree |
+
+No mutable tag is produced. There is no `latest`, no branch tag and nothing a
+later build overwrites.
+
+`vpp-manager`'s own `VPP_HASH` is reported alongside the tag but is not the tag.
+It hashes the clone script, the patches, the private plugins and the deb lists,
+so it is a good cache key for the VPP tarball, but it does not name the
+vpp-dataplane commit and it says nothing about which canonical `cilium_srv6`
+commit the snapshot came from.
+
+The script refuses to emit a tag when the `BASE` assignment in the clone script
+is absent or ambiguous, and it reports a dirty working tree so callers can
+refuse to name an image after a commit that does not describe it.
+
+### CI
+
+`.github/workflows/vpp-image-srv6ec.yml`:
+
+1. **`snapshot-gate` job.** Reads both pin files, derives the canonical
+   repository slug from them, checks that repository out, and runs
+   `scripts/check-cilium-srv6-sync.sh` and
+   `scripts/check-podinterface-proto-sync.sh`. A hand-edited snapshot fails
+   here (Issue #135 ruling 7). It is a separate job so the failure arrives in
+   seconds rather than after the VPP compile. It then derives the tag.
+2. **`build` job.** `make -C vpp-manager vpp-image TAG=<tag>`, push under the
+   immutable tag, read back the digest, and write tag, digest and the three
+   commits to the job summary and to the `srv6ec-vpp-image-provenance`
+   artifact.
+
+Two things CI needs that are not in the repository:
+
+* the secret `CILIUM_PRIVATE_TOKEN`, with read access to the canonical Cilium
+  repository. The workflow's own `GITHUB_TOKEN` is scoped to this repository
+  and cannot read another one.
+* a runner with enough disk. The VPP build compiles the release *and* debug
+  packages; a GitHub-hosted `ubuntu-24.04` runner has roughly 14 GB free after
+  the standard image, and the free-disk step in the workflow may not be enough.
+  `workflow_dispatch` takes a `runner` input so the build can be sent to a
+  self-hosted Linux docker host.
+
+### Local build
+
+`scripts/srv6ec-build-vpp-image.sh --cilium-repo <path> [--push]` runs the same
+sequence on a Linux docker host. It requires Linux (the VPP build runs in a
+container that bind-mounts the build tree and compiles for x86_64), docker,
+and on the order of 40 GB of free disk across the build tree and the docker
+data root. It refuses a dirty tree unless `--allow-dirty` is passed, in which
+case the tag gets a `-dirty` suffix that the deploy helper will not accept.
+
+### Deploying
+
+`scripts/srv6ec-stage0-deploy.sh` takes only digests:
+
+```
+scripts/srv6ec-stage0-deploy.sh install \
+  --vpp   ghcr.io/ryskn/calicovpp/vpp@sha256:... \
+  --agent ghcr.io/ryskn/calicovpp/agent@sha256:...
+```
+
+A tag is refused, including an immutable-looking one, because a tag is a name a
+registry can repoint and a test result naming a tag does not name the bytes
+that were tested. `status` reports the `imageID` from the Pod status rather than
+the image from the DaemonSet spec, because on a stalled rollout those differ and
+only the first describes the system a result came from.
+
+The manifest's image references are `:REPLACE-ME` placeholders. Applying
+`yaml/srv6ec-stage0` directly produces Pods that cannot pull, on purpose.
+
+## 6. Configuration
+
+`yaml/srv6ec-stage0/` is the base. Two components:
+
+| component | effect | cost |
+|---|---|---|
+| `components/poll-sleep` | adds `poll-sleep-usec 100` to the VPP `unix` stanza | up to 100 us extra forwarding latency on an idle dataplane, and incompatible with multiple VPP workers (rules out TC-603). Needed on the 6-core test bed host (Issue #21 §1); must be off for any latency or throughput measurement |
+| `components/uplink-af-xdp` | switches the uplink driver to `af_xdp` | Stage 2 only, and **incomplete**: it changes the driver and nothing else. Hugepages, memory limits, and the securityContext an AF_XDP uplink needs are not addressed |
+
+Values in the ConfigMap that are cluster-specific and have to be checked before
+the first apply: `SERVICE_PREFIX` (the kubeadm `serviceSubnet`), and
+`uplinkInterfaces[0].interfaceName` (the host NIC name, which differs per
+cluster).
+
+### Why the uplink stays `virtio` in Stage 0 and Stage 1
+
+The plugin cannot classify a VPP native virtio-pci uplink as `TRUSTED_FABRIC`:
+the device class name of the PCI virtio-net driver is also `"virtio"`
+(`virtio/device.c:1136`), so the plugin's non-promotable list — written for
+tap/tun — covers the VM's real NIC too (errata 114). The ruling on that errata
+is that moving `"virtio"` onto the promotable list is forbidden, because it
+would widen the trust boundary for the convenience of a test bed. Stage 1 does
+not need a fabric interface, so it keeps `virtio`; Stage 2 changes the driver
+instead.
+
+## 7. What the Cilium side must provide
+
+Not part of this repository, listed because Stage 0 does not come up without it:
+
+* `--srv6-vpp-api-socket=/var/run/vpp-srv6ec/vpp-api.sock`, and the hostPath
+  `/var/run/vpp-srv6ec` mounted into the Cilium agent Pod. Root must be an
+  accepted UID, since the proxy runs as root.
+* a hostPath for `/var/lib/cilium` so that the srv6ec durable state survives an
+  agent restart. The Helm chart mounts only a `subPath` of it, which loses the
+  state and makes E2E 6 and E2E 7 unmeasurable (errata 117).
+* the CNI NetConf `cniDatapathProvider` pointing at
+  `/var/run/vpp/podinterface-lifecycle.sock`.
+* `--devices` excluding `vpptap0` and the VPP-owned uplink, so the Cilium base
+  datapath does not attach `bpf_host` to interfaces VPP owns (Issue #135 ruling
+  5). "No unexpected tc/XDP attachment on `vpptap0`" is an acceptance criterion,
+  not a nicety.
+* the srv6ec flags are named differently on the two sides: the agent takes
+  `--srv6-block`, the operator takes `--srv6-locator-block`.
+
+## 8. Known pitfalls
+
+1. **The `vpp` container requires a reachable Calico datastore.** See section 9;
+   this is the one that stops Stage 0 from starting.
+2. **`vmbr0` on the Proxmox host has `multicast_snooping=1`**, which drops IPv6
+   ND. Unaddressed at the time of writing (Issue #21 §1).
+3. **A rolling update of this DaemonSet restarts VPP** on the node it touches
+   and drops that node's Pod datapath for the duration. Expected on a test bed.
+4. **`Calico's own SRv6`** (`fcff::/48`, `cafe::/118`) would be a second SRv6
+   authority inside the same VPP. This profile does not run `calico-vpp-agent`,
+   so it does not arise here; it does arise if the Calico profile is ever
+   deployed on the same node.
+5. **`SRV6_BLOCK` must not overlap node addresses or any PodCIDR** (D-60). The
+   test bed value is `fdbb:bb00::/32`, which is a test-only value, not a
+   production default.
+
+## 9. Open items
+
+These are recorded rather than resolved, because resolving them means changing
+behaviour outside the scope of a deployment kit.
+
+### 9.1 `vpp-manager` requires the Calico datastore (blocking)
+
+`vpp-manager` calls `updateCalicoNode()` unconditionally before it writes the
+vpp-manager info file and reports `Ready`
+(`vpp-manager/vpp_runner.go:1135`). That function constructs a Calico v3 client
+from the environment, gets the `Node` resource for `NODENAME`, and writes the
+node's BGP addresses back. It retries ten times and then returns an error, and
+the caller responds with `terminateVpp`.
+
+In a Cilium-primary cluster there is no reason for the Calico datastore to
+exist, so VPP would not start. Two ways out, neither of which this kit chooses:
+
+* **A. Keep `vpp-manager` unchanged and provide the datastore.** Install the
+  Calico CRDs and ensure a `Node` resource per Kubernetes node, without running
+  any Calico control plane component. This is what the manifest's ClusterRole is
+  sized for. It stays inside the instruction not to deploy `calico-node`, Felix,
+  Typha or the Calico CNI installer, but it does add a Calico-shaped datastore
+  dependency to a profile whose entire point is that Cilium is the only control
+  plane.
+* **B. Make the call conditional in `vpp-manager`.** The BGP address write
+  exists so that Calico's BGP can advertise the node; in this profile nothing
+  reads it. Skipping it when no Calico datastore is configured is a small
+  change, but it is a change to the startup contract of a production component
+  and to `vpp-manager`'s externally visible behaviour, so it needs a decision
+  rather than an implementation.
+
+Until this is decided, the DaemonSet will not reach `Ready` on a cluster with no
+Calico datastore.
+
+### 9.2 ClusterRole width
+
+The manifest copies `calico-vpp-node-role` verbatim, which grants far more than
+this profile uses — Calico IPAM create/update/delete among it. Narrowing it
+requires knowing what `updateCalicoNode()` and `calicov3cli.NewFromEnv()`
+actually touch, which follows from the decision in 9.1.
+
+### 9.3 `socat` in the agent image
+
+The agent image now installs `socat`, for the IF-2 proxy only. It keeps the
+profile at two images, which matters on the test bed cluster because it cannot
+pull images live and every image has to be imported. It is a package added to an
+image for a test bed's benefit, which is worth revisiting if the production
+answer to the socket-mode question (Issue #60 section A) makes the proxy
+unnecessary.
+
+### 9.4 The build has not been run
+
+Neither the CI workflow nor the local build script has produced an image. The
+build needs Linux and tens of gigabytes of disk. The mechanics that could be
+checked without building — tag derivation, YAML validity, the manifest rendering
+and applying with a client dry-run, the deploy helper's digest enforcement, and
+`GOOS=linux` compilation of the lifecycle entrypoint — were checked.

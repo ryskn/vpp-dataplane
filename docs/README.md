@@ -22,6 +22,9 @@ troubleshooting commands and tools.
 
 - [Developer documentation](dev)
 - [(alpha) Multinet feature documentation](multinet.md)
+- [SRv6 Endpoint Context Stage 0 deployment](srv6ec-stage0.md) — the
+  lifecycle-only profile, in which Cilium is the CNI and this repository
+  provides only the VPP Pod interface lifecycle
 
 ## Additional resources and links
 
