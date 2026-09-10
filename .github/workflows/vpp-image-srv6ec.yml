@@ -1,0 +1,239 @@
+name: VPP image (srv6ec, amd64)
+
+# Builds the VPP image that carries the out-of-tree cilium_srv6 plugin and
+# pushes it under an immutable tag (Issue #135 ruling 6).
+#
+# The tag is derived from the three commits that determine the image contents —
+# the VPP upstream commit, the vpp-dataplane commit and the cilium_srv6 source
+# commit — by scripts/srv6ec-image-tag.sh, which documents why those three are
+# sufficient. No mutable tag is produced: there is no `latest`, no branch tag
+# and nothing that a later build overwrites. The tag and the pushed digest are
+# recorded in the job summary and as a build artifact so that a test result can
+# name the image it ran against.
+#
+# Two gates run before the build, both from Issue #135 ruling 7: the vendored
+# cilium_srv6 tree and the vendored PodInterfaceLifecycle proto must be
+# byte-for-byte the pinned canonical commits. A hand-edited snapshot fails the
+# workflow rather than reaching an image.
+#
+# Note on the runner: the VPP build compiles the release and the debug packages
+# and needs tens of gigabytes of disk. A GitHub-hosted ubuntu-24.04 runner has
+# roughly 14 GB free after the standard image, so the free-disk step below is
+# required and may still not be enough. `runner` lets the build be sent to a
+# self-hosted Linux docker host instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label for the build job'
+        required: false
+        default: 'ubuntu-24.04'
+        type: string
+      push:
+        description: 'Push the image to the registry'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - 'feat/**'
+      - 'srv6/**'
+      - 'dev/**'
+    paths:
+      - 'vpplink/generated/vpp_clone_current.sh'
+      - 'vpplink/generated/patches/**'
+      - 'vpplink/generated/private_plugins/**'
+      - 'vpp-manager/**'
+      - 'scripts/srv6ec-image-tag.sh'
+      - 'scripts/check-cilium-srv6-sync.sh'
+      - 'scripts/check-podinterface-proto-sync.sh'
+      - '.github/workflows/vpp-image-srv6ec.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+  # Checkout of the canonical Cilium repository, needed by both snapshot gates.
+  # It is private, so a token with read access to it has to be configured as a
+  # repository secret; the workflow's own GITHUB_TOKEN is scoped to this
+  # repository and cannot read it.
+  CILIUM_CHECKOUT: cilium-canonical
+
+jobs:
+  snapshot-gate:
+    # The gates prove that what is about to be built matches the pinned
+    # sources. They are a separate job so that a snapshot mismatch is reported
+    # in seconds rather than after a multi-hour VPP compile.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      image_tag: ${{ steps.tag.outputs.IMAGE_TAG }}
+      vpp_upstream_commit: ${{ steps.tag.outputs.VPP_UPSTREAM_COMMIT }}
+      dataplane_commit: ${{ steps.tag.outputs.DATAPLANE_COMMIT }}
+      cilium_srv6_commit: ${{ steps.tag.outputs.CILIUM_SRV6_SOURCE_COMMIT }}
+      vpp_hash: ${{ steps.tag.outputs.VPP_HASH }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read the pinned canonical commits
+        id: pins
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source vpplink/generated/private_plugins/CILIUM_SRV6_SOURCE_COMMIT
+          # shellcheck disable=SC1091
+          source calico-vpp-agent/proto/PODINTERFACE_PROTO_SOURCE
+          # Both pins name the same canonical repository; derive owner/name
+          # from the URL rather than hard-coding it here, so that moving the
+          # canonical repository is a change to the pin files only.
+          repo_slug="$(echo "$CILIUM_SRV6_SOURCE_REPO" | sed -E 's#^https://github.com/##; s#\.git$##')"
+          proto_slug="$(echo "$PODINTERFACE_PROTO_SOURCE_REPO" | sed -E 's#^https://github.com/##; s#\.git$##')"
+          if [ "$repo_slug" != "$proto_slug" ]; then
+            echo "the two pins name different canonical repositories: $repo_slug vs $proto_slug" >&2
+            exit 1
+          fi
+          {
+            echo "repo_slug=${repo_slug}"
+            echo "srv6_commit=${CILIUM_SRV6_SOURCE_COMMIT}"
+            echo "proto_commit=${PODINTERFACE_PROTO_SOURCE_COMMIT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the canonical Cilium repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pins.outputs.repo_slug }}
+          token: ${{ secrets.CILIUM_PRIVATE_TOKEN }}
+          path: ${{ env.CILIUM_CHECKOUT }}
+          fetch-depth: 0
+
+      - name: Fetch the pinned commits if they are not on a branch
+        working-directory: ${{ env.CILIUM_CHECKOUT }}
+        run: |
+          set -euo pipefail
+          for c in "${{ steps.pins.outputs.srv6_commit }}" "${{ steps.pins.outputs.proto_commit }}"; do
+            git cat-file -e "${c}^{commit}" 2>/dev/null || git fetch --no-tags origin "$c"
+          done
+
+      - name: Gate — cilium_srv6 snapshot matches its pin
+        run: scripts/check-cilium-srv6-sync.sh "${GITHUB_WORKSPACE}/${CILIUM_CHECKOUT}"
+
+      - name: Gate — podinterface.proto snapshot matches its pin
+        run: scripts/check-podinterface-proto-sync.sh "${GITHUB_WORKSPACE}/${CILIUM_CHECKOUT}"
+
+      - name: Derive the immutable image tag
+        id: tag
+        run: scripts/srv6ec-image-tag.sh --github "${GITHUB_SHA}"
+
+  build:
+    needs: snapshot-gate
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+        env:
+          GOTOOLCHAIN: auto
+
+      - name: Build VPP and the image
+        env:
+          IMAGE_TAG: ${{ needs.snapshot-gate.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          # `vpp-image` depends on the VPP tarball, and the tarball target
+          # builds VPP when it is absent. TAG is overridden so the local image
+          # carries the immutable tag rather than `git describe`.
+          make -C vpp-manager vpp-image "TAG=${IMAGE_TAG}"
+          docker image ls | grep calicovpp/vpp
+
+      - name: Log in to ghcr.io
+        if: ${{ inputs.push == null || inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push under the immutable tag
+        if: ${{ inputs.push == null || inputs.push }}
+        id: push
+        env:
+          IMAGE_TAG: ${{ needs.snapshot-gate.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          repo="${REGISTRY}/${IMAGE_OWNER}/calicovpp/vpp"
+          docker tag "calicovpp/vpp:${IMAGE_TAG}"     "${repo}:${IMAGE_TAG}"
+          docker tag "calicovpp/vpp:dbg-${IMAGE_TAG}" "${repo}:dbg-${IMAGE_TAG}"
+          docker push "${repo}:${IMAGE_TAG}"
+          docker push "${repo}:dbg-${IMAGE_TAG}"
+          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                    "${repo}:${IMAGE_TAG}" | grep "^${repo}@" | head -1)"
+          if [ -z "$digest" ]; then
+            echo "pushed ${repo}:${IMAGE_TAG} but docker reports no digest" >&2
+            exit 1
+          fi
+          {
+            echo "image=${repo}:${IMAGE_TAG}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Record the provenance
+        if: always()
+        env:
+          IMAGE_TAG: ${{ needs.snapshot-gate.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p provenance
+          cat > provenance/srv6ec-vpp-image.txt <<EOF
+          image_tag=${IMAGE_TAG}
+          image=${{ steps.push.outputs.image }}
+          digest=${{ steps.push.outputs.digest }}
+          vpp_upstream_commit=${{ needs.snapshot-gate.outputs.vpp_upstream_commit }}
+          dataplane_commit=${{ needs.snapshot-gate.outputs.dataplane_commit }}
+          cilium_srv6_source_commit=${{ needs.snapshot-gate.outputs.cilium_srv6_commit }}
+          vpp_build_hash=${{ needs.snapshot-gate.outputs.vpp_hash }}
+          EOF
+          cat provenance/srv6ec-vpp-image.txt
+          {
+            echo "## SRv6 Endpoint Context VPP image"
+            echo
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| image | \`${{ steps.push.outputs.image }}\` |"
+            echo "| digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| VPP upstream commit | \`${{ needs.snapshot-gate.outputs.vpp_upstream_commit }}\` |"
+            echo "| vpp-dataplane commit | \`${{ needs.snapshot-gate.outputs.dataplane_commit }}\` |"
+            echo "| cilium_srv6 source commit | \`${{ needs.snapshot-gate.outputs.cilium_srv6_commit }}\` |"
+            echo "| VPP build hash | \`${{ needs.snapshot-gate.outputs.vpp_hash }}\` |"
+            echo
+            echo "Deploy by digest, never by tag: the deploy helper refuses anything else."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the provenance artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: srv6ec-vpp-image-provenance
+          path: provenance/srv6ec-vpp-image.txt
