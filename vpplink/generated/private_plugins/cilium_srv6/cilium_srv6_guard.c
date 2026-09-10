@@ -577,7 +577,9 @@ cilium_srv6_config (vlib_main_t *vm, unformat_input_t *input)
 {
   cilium_srv6_main_t *cm = &cilium_srv6_main;
   ip6_address_t block;
+  u8 *path = 0;
   u32 block_len;
+  u32 bytes;
   f64 v;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -605,6 +607,39 @@ cilium_srv6_config (vlib_main_t *vm, unformat_input_t *input)
 	 TUN, so enabling this drops conformant traffic. */
       else if (unformat (input, "untrusted-fragment-drop-all"))
 	cm->untrusted_fragment_drop_all = 1;
+      /*
+       * IF-3 punt socket (D-27, `02` §5.6.6 and §5.6.9). The agent listens on
+       * it and the plugin connects.
+       *
+       * A relative path is refused here rather than resolved against VPP's
+       * working directory: that directory is not something the operator sets
+       * in this file, so the same configuration would name different sockets
+       * on different hosts. D-27 puts the socket in a 0700 directory whose
+       * absolute path the agent owns.
+       */
+      else if (unformat (input, "punt-socket %s", &path))
+	{
+	  if (vec_len (path) == 0 || path[0] != '/')
+	    {
+	      vec_free (path);
+	      return clib_error_return (0, "punt-socket must be an absolute path");
+	    }
+	  vec_free (cm->punt_socket_path);
+	  vec_add1 (path, 0);
+	  cm->punt_socket_path = path;
+	  path = 0;
+	}
+      /* `00` §2.18.7: the punt queue is bounded twice, by entry count and by
+	 a byte budget. The entry cap is the 4096 of `02` §5.2 and is not
+	 configurable; this is the byte budget. */
+      else if (unformat (input, "punt-queue-bytes %u", &bytes))
+	{
+	  if (bytes < CILIUM_SRV6_IF3_QUEUE_BYTES_MIN || bytes > CILIUM_SRV6_IF3_QUEUE_BYTES_MAX)
+	    return clib_error_return (0, "punt-queue-bytes must be between %u and %u",
+				      (u32) CILIUM_SRV6_IF3_QUEUE_BYTES_MIN,
+				      (u32) CILIUM_SRV6_IF3_QUEUE_BYTES_MAX);
+	  cm->punt_queue_bytes = bytes;
+	}
       else
 	return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
     }
@@ -694,6 +729,9 @@ cilium_srv6_guard_init (vlib_main_t *vm)
   cm->keepalive_timeout = CILIUM_SRV6_KEEPALIVE_TIMEOUT_DEFAULT;
   cm->quarantine_min_hold = CILIUM_SRV6_QUARANTINE_MIN_HOLD_DEFAULT;
   cm->withdraw_delay = CILIUM_SRV6_WITHDRAW_DELAY_DEFAULT;
+  /* `00` §2.18.7. There is deliberately no default for `punt_socket_path`:
+     see the note on the field. */
+  cm->punt_queue_bytes = CILIUM_SRV6_IF3_QUEUE_BYTES_DEFAULT;
 
   /*
    * D-35: arm the dead-man switch from init. Until the agent has sent its

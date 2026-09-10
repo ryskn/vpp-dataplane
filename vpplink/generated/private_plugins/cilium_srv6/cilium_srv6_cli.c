@@ -19,6 +19,7 @@
 #include <cilium_srv6/cilium_srv6_endcilium.h>
 #include <cilium_srv6/cilium_srv6_headend.h>
 #include <cilium_srv6/cilium_srv6_ct.h>
+#include <cilium_srv6/cilium_srv6_ifbind.h>
 
 static clib_error_t *
 cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -503,6 +504,7 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				     vlib_cli_command_t *cmd)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+  cilium_srv6_punt_transport_stats_t tp;
   cilium_srv6_policy_rev_t *r;
   u32 n_local = 0;
   u32 n_leased = 0;
@@ -538,24 +540,41 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		     format_ip6_address, &hm->node_address, hm->outer_fib_index, hm->outer_table_id,
 		     (u32) hm->hop_limit, (u32) hm->inner_mtu, hm->copy_dscp ? "on" : "off");
 
-  vlib_cli_output (vm,
-		   "revisions: endpoint %llu, path %llu\n"
-		   "PolicyLeaseTable: %u/%u identities, %u leased now, "
-		   "install-time lease %.1f s, %llu renewals (D-51)",
-		   hm->endpoint_revision, hm->path_revision, (u32) pool_elts (hm->policy_rev) - 1,
-		   hm->policy_rev_capacity, n_leased, (f64) hm->allow_lease_ms * 1e-3,
-		   hm->n_lease_extends);
+  /* D-83: three key spaces, no node-global revision. The PATH space is dense
+     by PathCache index, so its occupancy is counted rather than read off a
+     pool. */
+  {
+    u32 n_path_revisions = 0;
+    u32 i;
+
+    for (i = 0; i < vec_len (hm->path_revs); i++)
+      if (hm->path_revs[i] != CILIUM_SRV6_REV_ABSENT)
+	n_path_revisions++;
+
+    vlib_cli_output (vm,
+		     "revision keys (D-83): endpoint %u/%u, path %u/%u, policy %u/%u, "
+		     "%llu publishes\n"
+		     "PolicyLeaseTable: %u/%u identities, %u leased now, "
+		     "install-time lease %.1f s, %llu renewals (D-51)",
+		     (u32) pool_elts (hm->endpoint_rev) - 1, hm->endpoint_rev_capacity,
+		     n_path_revisions, hm->path_capacity, (u32) pool_elts (hm->policy_rev) - 1,
+		     hm->policy_rev_capacity, hm->n_revision_publishes,
+		     (u32) pool_elts (hm->policy_rev) - 1, hm->policy_rev_capacity, n_leased,
+		     (f64) hm->allow_lease_ms * 1e-3, hm->n_lease_extends);
+  }
 
   vlib_cli_output (vm, "LocalEndpointTable: %u endpoints", n_local);
 
   vlib_cli_output (vm,
 		   "ProgramCache: %u/%u ALLOW, %u/%u negative "
 		   "(installs %llu, deletes %llu, quota drops %llu, fair evictions %llu, "
-		   "stale installs %llu)",
+		   "stale installs %llu, missing-key installs %llu, "
+		   "absence-key ALLOW installs %llu)",
 		   hm->n_programs[1], hm->program_capacity - hm->program_negative_capacity,
 		   hm->n_programs[0], hm->program_negative_capacity, hm->n_program_installs,
 		   hm->n_program_deletes, hm->n_program_quota_drops, hm->n_program_fair_evictions,
-		   hm->n_program_stale_installs);
+		   hm->n_program_stale_installs, hm->n_program_missing_key_installs,
+		   hm->n_program_absence_key_installs);
 
   /* D-61: the reservations of an open staging transaction hold pool slots but
      are not entries of the PathCache, so they are reported separately rather
@@ -576,11 +595,56 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   hm->n_frag_quota_drops, hm->n_frag_gc, hm->n_frag_lease_rejects,
 		   hm->n_frag_punt_id_conflicts);
 
-  vlib_cli_output (vm, "conntrack hook (C10): %s, IF-3 punt transport: %s",
+  vlib_cli_output (vm, "conntrack hook (C10): %s",
 		   cilium_srv6_ct_lookup_hook ? "registered" :
-					        "absent (every packet takes 02 §7.2 branch 3)",
-		   cilium_srv6_punt_transport_registered () ? "registered" :
-							      "absent (every punt fails closed)");
+						"absent (every packet takes 02 §7.2 branch 3)");
+
+  cilium_srv6_punt_transport_stats (&tp);
+
+  /*
+   * The transport has three distinguishable states and they call for
+   * different operator action: no socket configured is a startup
+   * configuration gap, registered-but-disconnected is an agent that is not
+   * listening, and connected is working. This line used to collapse all three
+   * into "absent", which hid which one it was.
+   */
+  if (!tp.configured)
+    vlib_cli_output (vm, "IF-3 punt transport: not configured (no `cilium-srv6 { punt-socket "
+			 "<path> }`); every punt fails closed");
+  else
+    {
+      vlib_cli_output (
+	vm,
+	"IF-3 punt transport: %s to %s (wire v%u)\n"
+	"    connects %llu, connect failures %llu, disconnects %llu\n"
+	"    sent %llu frames / %llu bytes; received %llu frames "
+	"(%llu reinject, %llu release)\n"
+	"    queue %u/%u entries, %u/%u bytes (high water %u)\n"
+	"    framing rejections (each closed the connection): version %llu, "
+	"opcode %llu, length %llu, truncated %llu\n"
+	"    semantic rejections (one frame dropped, connection kept): "
+	"field %llu, token %llu; unusable token %llu, "
+	"punts the serializer refused %llu",
+	tp.connected ? "connected" : "disconnected, retrying",
+	(char *) cilium_srv6_main.punt_socket_path, (u32) CILIUM_SRV6_IF3_VERSION, tp.n_connects,
+	tp.n_connect_failures, tp.n_disconnects, tp.n_frames_sent, tp.n_bytes_sent,
+	tp.n_frames_received, tp.n_reinjects_received, tp.n_releases_received, tp.queue_entries,
+	tp.queue_entry_cap, tp.queue_bytes, tp.queue_byte_cap, tp.queue_high_water_bytes,
+	tp.n_rejections[CILIUM_SRV6_IF3_ERR_VERSION], tp.n_rejections[CILIUM_SRV6_IF3_ERR_OPCODE],
+	tp.n_rejections[CILIUM_SRV6_IF3_ERR_LENGTH], tp.n_rejections[CILIUM_SRV6_IF3_ERR_TRUNCATED],
+	tp.n_rejections[CILIUM_SRV6_IF3_ERR_FIELD], tp.n_rejections[CILIUM_SRV6_IF3_ERR_TOKEN],
+	tp.n_unknown_token, tp.n_encode_refused);
+
+      vlib_cli_output (vm,
+		       "    releases by 06 §2 reason: policy-denied %llu, "
+		       "slowpath-overflow %llu, no-remote-endpoint %llu, "
+		       "identity-unresolved %llu, fragment-unresolved %llu",
+		       tp.n_release_reason[CILIUM_SRV6_IF3_DROP_POLICY_DENIED],
+		       tp.n_release_reason[CILIUM_SRV6_IF3_DROP_SLOWPATH_OVERFLOW],
+		       tp.n_release_reason[CILIUM_SRV6_IF3_DROP_NO_REMOTE_ENDPOINT],
+		       tp.n_release_reason[CILIUM_SRV6_IF3_DROP_IDENTITY_UNRESOLVED],
+		       tp.n_release_reason[CILIUM_SRV6_IF3_DROP_FRAGMENT_UNRESOLVED]);
+    }
 
   for (i = 0; i < CILIUM_SRV6_PUNT_N_Q; i++)
     {
@@ -588,13 +652,15 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
       vlib_cli_output (vm,
 		       "punt queue %-12U outstanding %u/%u (owner quota %u, identity quota %u)\n"
-		       "    punted %llu, reinjected %llu, rejected %llu, expired %llu\n"
+		       "    punted %llu, reinjected %llu, released %llu, rejected %llu, "
+		       "expired %llu\n"
 		       "    drops: global %llu, owner %llu, identity %llu, "
-		       "no-token %llu, no-transport %llu",
+		       "no-token %llu, no-transport %llu, queue-full %llu, write-failed %llu",
 		       format_cilium_srv6_punt_queue, i, q->n_outstanding, q->capacity,
 		       q->owner_quota, q->identity_quota, q->n_punted, q->n_reinjected,
-		       q->n_reinject_rejected, q->n_expired, q->n_drop_global, q->n_drop_owner,
-		       q->n_drop_identity, q->n_drop_no_token, q->n_drop_no_transport);
+		       q->n_released, q->n_reinject_rejected, q->n_expired, q->n_drop_global,
+		       q->n_drop_owner, q->n_drop_identity, q->n_drop_no_token,
+		       q->n_drop_no_transport, q->n_drop_ring_full, q->n_drop_write_failed);
     }
 
   /* Issue #90: a reinject whose echoed punt_id is not the one its token was
@@ -602,7 +668,6 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
      the punt metadata it received. */
   vlib_cli_output (vm, "IF-3 reinjects refused for a punt_id mismatch: %llu",
 		   hm->n_reinject_punt_id_mismatch);
-
   return 0;
 }
 
@@ -650,6 +715,50 @@ VLIB_CLI_COMMAND (cilium_srv6_show_local_ep_command, static) = {
   .path = "show cilium srv6 local-endpoints",
   .short_help = "show cilium srv6 local-endpoints",
   .function = cilium_srv6_show_local_ep_command_fn,
+};
+
+/*
+ * The CNI attachment binding table (D-68), as srv6_if_attachment_dump returns
+ * it. It is the VPP-side reading of the same table the API dumps, for the case
+ * 06 §4 names explicitly: first-line investigation while the agent is down.
+ *
+ * It prints the three fields of one binding and nothing else. In particular it
+ * does not print the interface name, and it does not consult the guard/ACL
+ * table: D-68 makes this table the only authority over "which interface is
+ * this attachment behind", so an operator command that decorated a row with a
+ * name derived elsewhere would be offering a second answer to the question the
+ * table exists to answer. The attachment identity is printed verbatim, which
+ * is also how it is stored - the plugin never derives, completes or truncates
+ * one.
+ *
+ * `%v` is safe here without escaping because the identity is validated on the
+ * way in (cilium_srv6_ifbind_id_valid): printable ASCII without space, so it
+ * carries no control character, no embedded NUL and no newline that could
+ * forge a second row.
+ */
+static clib_error_t *
+cilium_srv6_show_attachments_command_fn (vlib_main_t *vm, unformat_input_t *input,
+					 vlib_cli_command_t *cmd)
+{
+  cilium_srv6_ifbind_main_t *bm = &cilium_srv6_ifbind_main;
+  const cilium_srv6_if_binding_t *b;
+
+  if (!bm->initialised)
+    return clib_error_return (0, "attachment binding table not built yet");
+
+  pool_foreach (b, bm->bindings)
+    {
+      vlib_cli_output (vm, "%v sw_if_index %u if_incarnation %u", b->attachment_id, b->sw_if_index,
+		       b->if_incarnation);
+    }
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cilium_srv6_show_attachments_command, static) = {
+  .path = "show cilium srv6 attachments",
+  .short_help = "show cilium srv6 attachments",
+  .function = cilium_srv6_show_attachments_command_fn,
 };
 
 static clib_error_t *
@@ -749,7 +858,8 @@ cilium_srv6_show_program_cache_command_fn (vlib_main_t *vm, unformat_input_t *in
       dst.as_u64[1] = e->key[1];
 
       stale = !cilium_srv6_revisions_match (hm, e->policy_rev_slot, e->policy_revision,
-					    e->endpoint_revision, e->path_revision);
+					    e->endpoint_rev_slot, e->endpoint_revision,
+					    e->path_cache_index, e->path_revision);
 
       /* D-51: the lease belongs to the entry's dependency identity, not to
 	 the entry, so it is read from the PolicyLeaseTable. */

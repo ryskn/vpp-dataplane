@@ -209,6 +209,34 @@ typedef struct
    */
   u8 untrusted_fragment_drop_all;
 
+  /*
+   * IF-3 punt socket (`cilium-srv6 { punt-socket <path> }`, D-27, `02`
+   * §5.6.9). The agent listens on it and the plugin connects (`02` §5.6.6),
+   * so this is the path the transport owner dials.
+   *
+   * A vec, NUL-terminated, or 0 when the operator did not configure one. It
+   * has no default: the path is a deployment decision (the D-27 socket lives
+   * in a 0700 directory the agent creates), and inventing one would make the
+   * plugin dial a path nobody owns. With no path there is no transport, so
+   * every punt fails closed and is counted in punt_no_transport — the same
+   * disposition as an agent that is not running.
+   *
+   * A relative path is refused at startup rather than resolved against
+   * whatever VPP's working directory happens to be.
+   */
+  u8 *punt_socket_path;
+
+  /*
+   * Byte budget of the IF-3 punt queue (`cilium-srv6 { punt-queue-bytes N }`,
+   * `00` §2.18.7). The entry cap is fixed at the 4096 of `02` §5.2; this is
+   * the second bound, and it exists because 4096 x 9216 B would reserve about
+   * 38 MB for a queue whose entries are a few hundred bytes each.
+   *
+   * See CILIUM_SRV6_IF3_QUEUE_BYTES_* below for the default and the accepted
+   * range.
+   */
+  u32 punt_queue_bytes;
+
   /* coverage accounting */
   u32 n_valid;
   u32 n_uncovered; /* valid interfaces without the guard installed */
@@ -220,6 +248,20 @@ typedef struct
   u16 msg_id_base;
   u8 initialised;
 } cilium_srv6_main_t;
+
+/*
+ * Byte budget of the IF-3 punt queue (`00` §2.18.7). 8 MiB holds roughly
+ * 8000 punts of a 1 KiB packet, i.e. more than the 4096 entry cap allows, and
+ * about 1/5 of what the entry cap alone would have reserved.
+ *
+ * The minimum is set where a queue stops being one: below a handful of
+ * maximum-size frames every burst overflows, which is a configuration mistake
+ * rather than a tuning choice, so it is refused at startup instead of
+ * producing a node that silently drops.
+ */
+#define CILIUM_SRV6_IF3_QUEUE_BYTES_DEFAULT (8u << 20)
+#define CILIUM_SRV6_IF3_QUEUE_BYTES_MIN	    (64u << 10)
+#define CILIUM_SRV6_IF3_QUEUE_BYTES_MAX	    (1u << 30)
 
 extern cilium_srv6_main_t cilium_srv6_main;
 extern vlib_node_registration_t cilium_srv6_guard_node;

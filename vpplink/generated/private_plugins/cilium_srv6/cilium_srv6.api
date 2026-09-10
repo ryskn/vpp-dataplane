@@ -645,15 +645,68 @@ autoendian define srv6_endcilium_status_get_reply
  * ------------------------------------------------------------------
  */
 
-/** \brief One (src identity, policy revision) pair of srv6_revision_publish.
+/** \brief One (src identity, policy revision) pair of the POLICY namespace.
 
     D-30 splits the policy revision by src identity so that a NetworkPolicy
-    change only stales the entries of the identities it affects. A revision
-    of ~0 is reserved as the "no slot" sentinel and is rejected.
+    change only stales the entries of the identities it affects.
+
+    D-83 fixes the value range shared by all three revision namespaces:
+
+      - `0` means *withdraw*: the key stops existing, every ProgramCache entry
+        that quotes it becomes stale, and no install may quote it. A publish
+        of 0 is therefore accepted whatever the current value is; it is not a
+        backwards move.
+      - `~0` is the reserved "no slot" sentinel and is always rejected.
+      - any other value is a real revision. Publishing the same value again is
+        idempotent, a lower one is refused, a higher one advances the key.
 */
 typedef srv6_policy_revision
 {
   u32 identity;
+  u64 revision;
+};
+
+/** \brief One (destination, endpoint revision) pair of the ENDPOINT namespace.
+
+    D-83: the ENDPOINT revision namespace is keyed by the destination IPv6
+    address a ProgramCache entry is compiled for, i.e. by
+    `srv6_program_add_del.dst`, and not by anything node-global.
+
+    The unspecified address `::` is a reserved key of this namespace with a
+    defined meaning: it is the revision of the statement *"this destination is
+    not a published endpoint of this node"*. A negative ProgramCache entry —
+    one compiled because the destination has no RemoteEndpoint, or because its
+    identity has not converged — has no destination key of its own to depend
+    on, so it depends on this one, and the agent advances it whenever the set
+    of published endpoint keys changes. Without it a negative entry would
+    never be invalidated by the destination *appearing*.
+
+    Value range: as srv6_policy_revision.
+*/
+typedef srv6_endpoint_revision
+{
+  vl_api_ip6_address_t dst;
+  u64 revision;
+};
+
+/** \brief One (PathCache index, path revision) pair of the PATH namespace.
+
+    D-83: the PATH revision namespace is keyed by the PathCache index the
+    entry points at (02 §4.4), not by PathID: a PathID is shared by every path
+    towards the same node and colour, so keying by it would stale unrelated
+    entries, which is what D-17 exists to avoid.
+
+    The index must name a currently published PathCache entry. A retired index
+    loses its revision, because every entry that quoted it also fails the
+    generation half of the handle check.
+
+    Value range: as srv6_policy_revision. A DENY ProgramCache entry has no
+    path dependency at all and quotes revision 0 (see srv6_program_add_del).
+*/
+typedef srv6_path_revision
+{
+  u32 path_index;
+  u32 pad;
   u64 revision;
 };
 
@@ -1084,10 +1137,26 @@ autoendian autoreply define srv6_path_txn_abort
     The three dependency revisions are compared against the ones this node
     currently publishes before anything is written, which is the plugin side
     of 02 §4.3's "VPP install 直前に再比較する。一つでも変化したら結果を
-    install せず再試行する". An identity that has never appeared in an
-    srv6_revision_publish has no revision slot, and its slot reads as the ~0
-    sentinel, so the first install for a new identity must be preceded by a
-    publish.
+    install せず再試行する".
+
+    D-83 fixes what "the one this node currently publishes" resolves against.
+    Each quoted revision is resolved in its own namespace, by its own key:
+
+      - `policy_revision` against the POLICY key `src_identity`;
+      - `endpoint_revision` against the ENDPOINT key `dst`, falling back to
+        the reserved `::` key when `dst` is not a published endpoint. That
+        fallback is the dependency of a negative entry: it is what makes the
+        destination *appearing* invalidate the DENY that was compiled because
+        it was absent;
+      - `path_revision` against the PATH key `path_cache_index`. A DENY has no
+        path dependency and must quote 0; an ALLOW must quote the current
+        revision of the index it names.
+
+    An install is accepted only when every referenced key exists and every
+    quoted revision matches it exactly. A key with no published revision is
+    refused rather than defaulted: the first install for a new identity,
+    destination or path index must be preceded by the publish of that key
+    (INVALID_VALUE_4, counted in `program_missing_key_installs`).
 
     Capacity is governed by 02 §5.3 / D-26 / D-42: ALLOW and negative (DENY)
     entries have separate budgets so that scan traffic cannot evict
@@ -1098,7 +1167,11 @@ autoendian autoreply define srv6_path_txn_abort
       INVALID_VALUE   - dst is the unspecified address
       INVALID_VALUE_2 - unknown verdict
       INVALID_VALUE_3 - one of the three revisions is not the one currently
-                        published (stale compile, 02 §4.3)
+                        published for its key (stale compile, 02 §4.3)
+      INVALID_VALUE_4 - a referenced revision key does not exist: the
+                        identity, the destination (with no `::` fallback
+                        published) or the PathCache index has no published
+                        revision (fail-closed, D-83)
       NO_SUCH_ENTRY   - ALLOW whose path handle does not resolve, or a delete
                         of a key that is not installed
       LIMIT_EXCEEDED  - the budget is full and fair eviction found nothing to
@@ -1110,9 +1183,11 @@ autoendian autoreply define srv6_path_txn_abort
     @param l4_discriminator - key: TCP/UDP destination port, ICMPv6
            (type << 8) | code, 0 otherwise (D-41)
     @param verdict - ALLOW or DENY
-    @param policy_revision - revision of policy_revision[src_identity] (D-30)
-    @param endpoint_revision - dst identity / RemoteEndpoint dependency
-    @param path_revision - PathCache dependency
+    @param policy_revision - POLICY key src_identity (D-30)
+    @param endpoint_revision - ENDPOINT key dst, or the reserved `::` key when
+           dst is not a published endpoint (D-83)
+    @param path_revision - PATH key path_cache_index; 0 for a DENY, which has
+           no path dependency
     @param path_cache_index - versioned handle, ALLOW only
     @param path_generation - versioned handle, ALLOW only
     @param owner_quota_class - owner(namespace) quota class (D-42)
@@ -1189,36 +1264,126 @@ autoendian define srv6_program_details
   u64 bytes;
 };
 
-/** \brief Publish the dependency revision table (IF-2, 02 §8, D-30).
+/** \brief Publish the ENDPOINT revision namespace (IF-2, 02 §8, D-83).
 
-    Every per-identity policy revision and both global revisions are applied
-    inside one worker barrier section, so a packet never observes a partially
-    applied publish (02 §4.3). Revisions are monotonic: a publish that would
-    move one backwards is refused, because that would let a revoked ALLOW
-    become valid again.
+    D-83 replaced the single node-global srv6_revision_publish with one typed
+    message per revision namespace. The key type is explicit on the wire: an
+    ENDPOINT revision names a destination address, a PATH revision names a
+    PathCache index and a POLICY revision names a SecurityIdentity, and no
+    message carries a union that has to be disambiguated by a discriminator.
+    A node-global endpoint or path revision is forbidden: it made every
+    endpoint or path change stale every ProgramCache entry on the node, which
+    is a cluster-scale fail-closed trigger reachable by an unprivileged tenant
+    (the same attack surface D-30 removed from the policy revision).
 
-    Publishing a revision for an identity that has no slot creates one. The
-    slot is retained afterwards so that the next srv6_program_add_del for
-    that identity has something to compare against.
+    Per key (02 §4.3):
+
+      - the same revision again is idempotent;
+      - a lower revision is refused (it would let a revoked ALLOW become valid
+        again);
+      - a higher revision advances the key, and every ProgramCache entry that
+        quotes the old one becomes stale at its next hot-path comparison.
+        Nothing is walked eagerly: 02 §4.2 compares per packet.
+      - revision 0 withdraws the key. The key stops existing, so every entry
+        that quotes it is stale and no install may quote it. The slot is kept
+        while ProgramCache entries still reference it, so its high water mark
+        cannot be lost while a stale quotation of it still exists.
+
+    The whole message is applied as one unit: every element is validated
+    first, and if any is rejected nothing is applied. A successful reply is
+    therefore an acknowledgement for every key in the message, which is what
+    the agent's mandatory ordering needs (D-83): authority change ->
+    per-key revision publish ACK -> old Program becomes stale -> new Program
+    publication. Publishing after installing would leave a window in which the
+    old program still looks valid.
 
     Rejections:
-      INVALID_VALUE   - policy count without an array
-      INVALID_VALUE_2 - a revision moves backwards
+      INIT_FAILED     - tables not built yet
+      INVALID_VALUE   - a count without an array
+      INVALID_VALUE_2 - a revision moves backwards for its key
       INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
-      LIMIT_EXCEEDED  - the per-identity revision table is full; the
-                        identities that could not be given a slot punt
+      LIMIT_EXCEEDED  - the ENDPOINT revision table has no room for the new
+                        keys of this message
 
-    @param endpoint_revision - new global endpoint/RemoteEndpoint revision
-    @param path_revision - new global PathCache revision
-    @param n_policy - number of per-identity revisions that follow
-    @param policy - the per-identity revisions
+    @param n_endpoint - number of (destination, revision) pairs that follow
+    @param endpoint - the pairs
 */
-autoendian autoreply define srv6_revision_publish
+autoendian autoreply define srv6_endpoint_revision_publish
 {
   u32 client_index;
   u32 context;
-  u64 endpoint_revision;
-  u64 path_revision;
+  u32 n_endpoint;
+  vl_api_srv6_endpoint_revision_t endpoint[n_endpoint];
+};
+
+/** \brief Publish the PATH revision namespace (IF-2, 02 §8, D-83).
+
+    Per-key semantics, atomicity and ordering are those of
+    srv6_endpoint_revision_publish. The key is a PathCache index, so this
+    message can only be sent after srv6_path_txn_commit has published the
+    indices it names (D-61): a revision for an index that is not published is
+    refused rather than remembered.
+
+    Rejections:
+      INIT_FAILED     - tables not built yet
+      INVALID_VALUE   - a count without an array
+      INVALID_VALUE_2 - a revision moves backwards for its key
+      INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
+      NO_SUCH_ENTRY   - an index that is out of range or not published
+
+    @param n_path - number of (PathCache index, revision) pairs that follow
+    @param path - the pairs
+*/
+autoendian autoreply define srv6_path_revision_publish
+{
+  u32 client_index;
+  u32 context;
+  u32 n_path;
+  vl_api_srv6_path_revision_t path[n_path];
+};
+
+/** \brief Publish the POLICY revision namespace (IF-2, 02 §8, D-30, D-84).
+
+    Per-key semantics, atomicity and ordering are those of
+    srv6_endpoint_revision_publish. The key is a SecurityIdentity.
+
+    D-84 fixes who sends it and when. The revision the compiler quotes in
+    srv6_program_add_del is produced by the agent's policy revision bumper, so
+    the bumper is also the producer here:
+
+      - on startup, and after a plugin instance change (D-72), the agent seeds
+        the current snapshot of every identity it holds a revision for, and
+        does not open ProgramCache publication until this message has been
+        acknowledged;
+      - at runtime it publishes only the identities the bumper reports as
+        changed, in the order revision[X] bump -> publish[X] + ACK ->
+        compilation and publication for X.
+
+    Remote identities are in scope, not only local ones: the reply
+    re-authorisation of 02 §7.2 compares the conntrack entry's stored revision
+    against the revision of the *forward direction source* identity, which on
+    this node is usually a remote one (D-30, D-49).
+
+    Publishing a revision for an identity that has no slot creates one, and
+    the slot is retained afterwards so that the next srv6_program_add_del and
+    the next srv6_ct_verify for that identity have something to compare
+    against.
+
+    Rejections:
+      INIT_FAILED     - tables not built yet
+      INVALID_VALUE   - a count without an array
+      INVALID_VALUE_2 - a revision moves backwards for its key
+      INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
+      LIMIT_EXCEEDED  - the per-identity revision table has no room for the
+                        new identities of this message
+
+    @param n_policy - number of (identity, revision) pairs that follow
+    @param policy - the pairs
+*/
+autoendian autoreply define srv6_policy_revision_publish
+{
+  u32 client_index;
+  u32 context;
   u32 n_policy;
   vl_api_srv6_policy_revision_t policy[n_policy];
 };
@@ -1475,7 +1640,7 @@ autoendian autoreply define srv6_headend_config_set
     left is the table occupancy and slow path state the metrics of 06 §3 need
     (program_cache_entries, program_cache_quota_drops_total,
     program_cache_fair_evictions_total, slowpath_queue_depth,
-    slowpath_drops_total, path_cache_entries, revision).
+    slowpath_drops_total, path_cache_entries, revision_keys).
 */
 autoendian define srv6_headend_status_get
 {
@@ -1494,7 +1659,70 @@ autoendian define srv6_headend_status_get
     @param punt_drops - slowpath_drops_total per queue, all refusal reasons
            summed (the split is in the plugin log and CLI)
     @param punt_no_transport - punts refused because no IF-3 transport is
-           registered; a non-zero value means the slow path is not wired up
+           registered or because it is not connected to the agent; a non-zero
+           value means the slow path is not reaching the agent
+    @param punt_queue_full - punts refused because the IF-3 transport's
+           bounded queue hit its entry cap (4096, 02 §5.2) or its byte cap
+           (00 §2.18.7). It is separate from punt_no_transport because "no
+           agent" and "the agent is not keeping up" call for different action
+    @param punt_write_failed - frames that were being written when the IF-3
+           connection failed. They are never resent (00 §2.18.8): with no ACK
+           on IF-3 a resend risks a second reinject of a packet the agent
+           already had, so the token is released locally and the packet is
+           dropped
+    @param punt_released - punts the agent answered with opRelease instead of
+           a reinject (02 §5.6.3). The 06 §2 reason of each is a
+           cilium-srv6-punt error counter (release_*)
+    @param if3_connected - the transport owner currently holds a connection to
+           the D-27 punt socket
+    @param if3_socket_configured - a `cilium-srv6 { punt-socket <path> }` was
+           given. Without one there is no transport at all, which is a
+           startup configuration gap rather than an agent that is down
+    @param if3_connects - successful connects, i.e. 1 + reconnects
+    @param if3_disconnects - established connections that were lost
+    @param if3_frames_sent - punt frames fully written to the socket
+    @param if3_bytes_sent - bytes written, partial frames included
+    @param if3_frames_received - reinject and release frames read
+    @param if3_message_rejections - framing violations (version / opcode /
+           length / truncated). Each one closed the connection, so this is
+           also how many times IF-3 was torn down for an unusable stream. It
+           is the plugin-side source of ipc_message_rejections_total
+           {interface="if3"} (06 §3)
+    @param if3_frame_drops - semantic violations (a field out of range, or
+           fields that contradict each other) in an otherwise well-framed
+           frame. Exactly one frame was dropped and the connection kept
+           (00 §2.18.9). It is the source of ipc_frame_drops_total
+           {interface="if3"}. A sustained non-zero rate means the two ends
+           disagree about a field's range, not about the protocol version
+    @param if3_unusable_token - reinject or release frames whose token was
+           unknown or already consumed. They change no dataplane state
+           (00 §2.18.6)
+    @param if3_encode_refused - punts the serializer refused before they
+           reached the queue, because a classify result was outside the wire's
+           range (02 §5.6.2). A non-zero value is a plugin bug rather than an
+           agent one: the agent would have dropped such a frame as a field
+           violation and the flow would punt for ever. Expected 0
+    @param if3_queue_entries - punt frames waiting in the transport queue
+    @param if3_queue_bytes - bytes they occupy
+    @param if3_queue_byte_cap - the configured byte budget
+           (`punt-queue-bytes`, default 8 MiB)
+    @param if3_queue_high_water_bytes - the largest occupancy seen since
+           start up, which is what says whether the byte budget is the bound
+           that is actually binding
+    @param program_missing_key_installs - srv6_program_add_del refused because
+           a referenced revision key does not exist at all (D-83). It is
+           separate from program_stale_installs because the two mean different
+           things: a stale install is a lost race a recompile fixes, while a
+           missing key means the mandatory order (publish + ACK, then install)
+           was violated and recompiling alone loops forever. Expected 0.
+    @param n_endpoint_revisions - published keys of the ENDPOINT revision
+           namespace, including the reserved `::` key (D-83)
+    @param n_path_revisions - published keys of the PATH revision namespace
+    @param n_policy_revisions - published keys of the POLICY revision
+           namespace. D-83 removed the two node-global revisions this reply
+           used to carry: there is no such value any more, and a count of
+           published keys per namespace is what 06 §3's
+           `revision_keys{kind}` reads.
     @param conntrack_registered - a C10 conntrack lookup hook is registered;
            while it is not, every packet takes 02 §7.2 branch 3
 */
@@ -1517,13 +1745,15 @@ autoendian define srv6_headend_status_get_reply
   u32 frag_capacity;
   u32 n_frags;
   u32 n_local_endpoints;
-  u64 endpoint_revision;
-  u64 path_revision;
+  u32 n_endpoint_revisions;
+  u32 n_path_revisions;
+  u32 n_policy_revisions;
   u64 program_installs;
   u64 program_deletes;
   u64 program_quota_drops;
   u64 program_fair_evictions;
   u64 program_stale_installs;
+  u64 program_missing_key_installs;
   u64 lease_extends;
   u64 revision_publishes;
   u64 frag_evictions;
@@ -1533,10 +1763,28 @@ autoendian define srv6_headend_status_get_reply
   u64 punt_punted[3];
   u64 punt_drops[3];
   u64 punt_no_transport;
+  u64 punt_queue_full;
+  u64 punt_write_failed;
+  u64 punt_released;
   u64 punt_reinjected;
   u64 punt_reinject_rejected;
+  u64 if3_connects;
+  u64 if3_disconnects;
+  u64 if3_frames_sent;
+  u64 if3_bytes_sent;
+  u64 if3_frames_received;
+  u64 if3_message_rejections;
+  u64 if3_frame_drops;
+  u64 if3_unusable_token;
+  u64 if3_encode_refused;
+  u32 if3_queue_entries;
+  u32 if3_queue_bytes;
+  u32 if3_queue_byte_cap;
+  u32 if3_queue_high_water_bytes;
   bool conntrack_registered;
   bool punt_transport_registered;
+  bool if3_socket_configured;
+  bool if3_connected;
 };
 
 /** \brief Conntrack entry state (02 §7.1, C10).
@@ -1594,9 +1842,12 @@ enum srv6_ct_state : u8
           re-authorisation punt instead of forwarding on a guessed path.
 
     The revision of `remote_identity` must have been published with
-    srv6_revision_publish before this call: a promotion carrying a revision
-    that is not the currently published one is refused, exactly as
-    srv6_program_add_del refuses a stale compile (02 §4.3).
+    srv6_policy_revision_publish before this call: a promotion carrying a
+    revision that is not the currently published one is refused, exactly as
+    srv6_program_add_del refuses a stale compile (02 §4.3). D-84 is what makes
+    that publish exist for a *remote* identity: the reply re-authorisation
+    references the forward-direction source identity's revision, so the policy
+    revision producer publishes remote identities too.
 
     Rejections (all fail-closed, no state change):
       INIT_FAILED         - tables not built yet
@@ -2286,6 +2537,42 @@ counters cilium_srv6_punt {
     type counter64;
     units "packets";
     description "packets handed to the agent's slow path over IF-3 with a one-shot reinject token";
+  };
+  /* The five release reasons of 02 §5.6.3 (00 §2.18.6): the agent answered a
+     punt with opRelease instead of a reinject, so the punted packet is dropped
+     for the 06 §2 reason named here. They are counted on this node because
+     this node is where the packet was punted; the buffer itself is long gone,
+     freed when the transport accepted the frame. 06 §1 forbids an
+     unclassified drop counter, so the reason is never folded away. */
+  release_policy_denied {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_POLICY_DENIED: the agent released the punted packet because the policy engine returned DENY or no rule matched (02 §5.6.3)";
+  };
+  release_slowpath_overflow {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_SLOWPATH_OVERFLOW: the agent released the punted packet because its own queue, quota or rate limit rejected the work (02 §5.2, §5.6.3)";
+  };
+  release_no_remote_endpoint {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_NO_REMOTE_ENDPOINT: the agent released the punted packet because there is no BGP-derived remote endpoint or no usable path to it (D-2, 02 §5.6.3)";
+  };
+  release_identity_unresolved {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_IDENTITY_UNRESOLVED: the agent released the punted packet because the destination is a cluster endpoint whose identity IPCache has not resolved. D-13 forbids evaluating it as world (02 §5.6.3)";
+  };
+  release_fragment_unresolved {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_FRAGMENT_UNRESOLVED: the agent released the punted fragment because it could not resolve a verdict for the datagram (01 §3.1, D-43, 02 §5.6.3)";
   };
 };
 

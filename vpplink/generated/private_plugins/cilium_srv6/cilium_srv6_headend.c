@@ -218,7 +218,7 @@ csh_policy_rev_slot_unref (cilium_srv6_headend_main_t *hm, u32 slot)
 /*
  * C10 needs the slot of an identity it does not hold a ProgramCache entry
  * for (the peer of a reply), so the slot is created on demand and then
- * retained, exactly like the slots srv6_revision_publish creates. Retaining
+ * retained, exactly like the slots srv6_policy_revision_publish creates. Retaining
  * rather than reference counting keeps the conntrack table out of this pool
  * entirely: no worker ever has to release a slot.
  */
@@ -236,6 +236,166 @@ cilium_srv6_policy_rev_slot_pin (u32 identity)
     return slot;
 
   return csh_policy_rev_slot_ref (hm, identity);
+}
+
+/* ------------------------------------------------------------------ */
+/* EndpointRevTable (02 §4.3, D-17 + D-83)                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Slot 0 is the sentinel, exactly as in the policy table: it holds
+ * CILIUM_SRV6_REV_INVALID, so a resolution that failed can never match a
+ * quotation and always punts (fail-closed).
+ */
+#define CSH_ENDPOINT_REV_SENTINEL 0
+
+static u32
+csh_endpoint_rev_slot_find (cilium_srv6_headend_main_t *hm, const ip6_address_t *dst)
+{
+  clib_bihash_kv_16_8_t kv;
+
+  kv.key[0] = dst->as_u64[0];
+  kv.key[1] = dst->as_u64[1];
+  kv.value = 0;
+
+  if (clib_bihash_search_16_8 (&hm->endpoint_rev_by_dst, &kv, &kv))
+    return CSH_ENDPOINT_REV_SENTINEL;
+
+  return (u32) kv.value;
+}
+
+/*
+ * Get, or create, the slot of one destination and take a reference on it.
+ * Returns CSH_ENDPOINT_REV_SENTINEL when the table is exhausted, which makes
+ * the caller's entry permanently stale rather than silently unbound.
+ */
+static u32
+csh_endpoint_rev_slot_ref (cilium_srv6_headend_main_t *hm, const ip6_address_t *dst)
+{
+  clib_bihash_kv_16_8_t kv;
+  cilium_srv6_endpoint_rev_t *r;
+  u32 slot;
+
+  slot = csh_endpoint_rev_slot_find (hm, dst);
+  if (slot != CSH_ENDPOINT_REV_SENTINEL)
+    {
+      hm->endpoint_rev[slot].refcount++;
+      return slot;
+    }
+
+  if (pool_free_elts (hm->endpoint_rev) == 0)
+    return CSH_ENDPOINT_REV_SENTINEL;
+
+  pool_get_zero (hm->endpoint_rev, r);
+  slot = (u32) (r - hm->endpoint_rev);
+
+  r->dst = *dst;
+  r->refcount = 1;
+  /*
+   * A brand new slot exists but publishes nothing: CILIUM_SRV6_REV_ABSENT is
+   * "the key does not exist", so an install quoting any revision for it is
+   * refused until a publish arrives. That is the D-83 fail-closed direction,
+   * and it is why the agent must publish a key before it may install anything
+   * that depends on it.
+   */
+  r->present = 0;
+  r->revision = CILIUM_SRV6_REV_ABSENT;
+  r->hwm = CILIUM_SRV6_REV_ABSENT;
+
+  kv.key[0] = dst->as_u64[0];
+  kv.key[1] = dst->as_u64[1];
+  kv.value = slot;
+  clib_bihash_add_del_16_8 (&hm->endpoint_rev_by_dst, &kv, 1 /* add */);
+
+  return slot;
+}
+
+static void
+csh_endpoint_rev_slot_unref (cilium_srv6_headend_main_t *hm, u32 slot)
+{
+  clib_bihash_kv_16_8_t kv;
+  cilium_srv6_endpoint_rev_t *r;
+
+  if (slot == CSH_ENDPOINT_REV_SENTINEL || slot >= vec_len (hm->endpoint_rev))
+    return;
+
+  if (pool_is_free_index (hm->endpoint_rev, slot))
+    return;
+
+  r = hm->endpoint_rev + slot;
+
+  if (r->refcount > 0)
+    r->refcount--;
+
+  if (r->refcount != 0)
+    return;
+
+  /*
+   * D-83: the high water mark may only be dropped together with the last
+   * reference to the key. A reference is exactly what a ProgramCache entry
+   * that still quotes a revision of this key holds, so once the count reaches
+   * zero there is nothing left that a republished lower revision could
+   * revalidate, and forgetting the mark is safe.
+   */
+  kv.key[0] = r->dst.as_u64[0];
+  kv.key[1] = r->dst.as_u64[1];
+  kv.value = slot;
+  clib_bihash_add_del_16_8 (&hm->endpoint_rev_by_dst, &kv, 0 /* del */);
+
+  /* A reader that still holds this slot index must not match a future key's
+     revision, so the slot is poisoned before it is released. */
+  r->revision = CILIUM_SRV6_REV_INVALID;
+  r->hwm = CILIUM_SRV6_REV_INVALID;
+  r->present = 0;
+  clib_memset (&r->dst, 0, sizeof (r->dst));
+
+  pool_put_index (hm->endpoint_rev, slot);
+}
+
+/*
+ * Resolve the ENDPOINT key of one ProgramCache entry (D-83).
+ *
+ * A destination that is a published endpoint of this node depends on its own
+ * key. A destination that is not depends on the reserved `::` key, which is
+ * the revision of the statement "this destination is not a published
+ * endpoint": without it a negative entry compiled because the destination was
+ * absent would never be invalidated by the destination *appearing*.
+ *
+ * A withdrawn key (present == 0) is not a published endpoint any more, so it
+ * resolves to `::` as well. Its slot is kept — it still holds the high water
+ * mark for the entries that quote it — but it is no longer the key a fresh
+ * compile depends on.
+ *
+ * The key is resolved here rather than quoted by the agent, which is what makes
+ * "a negative Program MUST NOT quote a real destination's positive revision"
+ * unexpressible: an entry for a destination that is not published resolves to
+ * `::` whatever the agent believed, and the exact-match comparison then refuses
+ * a quotation of the destination's own revision.
+ *
+ * `*is_absence_key`, when not NULL, reports whether the answer is the reserved
+ * ENDPOINT_ABSENCE_REVISION key rather than the destination's own key. Callers
+ * use it to refuse a positive Program that resolved to `::`.
+ */
+static u32
+csh_endpoint_rev_resolve (cilium_srv6_headend_main_t *hm, const ip6_address_t *dst,
+			  int *is_absence_key)
+{
+  ip6_address_t absent;
+  u32 slot;
+
+  slot = csh_endpoint_rev_slot_find (hm, dst);
+  if (slot != CSH_ENDPOINT_REV_SENTINEL && hm->endpoint_rev[slot].present)
+    {
+      if (is_absence_key)
+	*is_absence_key = 0;
+      return slot;
+    }
+
+  if (is_absence_key)
+    *is_absence_key = 1;
+
+  clib_memset (&absent, 0, sizeof (absent));
+  return csh_endpoint_rev_slot_find (hm, &absent);
 }
 
 /*
@@ -281,7 +441,7 @@ cilium_srv6_policy_rev_slot_pin (u32 identity)
  *      message, and repeating the comparison here is what makes the rule a
  *      property of the table rather than of three call sites.
  *   4. the lease revision never moves backwards. Rule 3 implies this while
- *      `policy_revision` is monotonic (srv6_revision_publish enforces that),
+ *      `policy_revision` is monotonic (srv6_policy_revision_publish enforces that),
  *      but the invariant is stated as its own rule, so it is checked rather
  *      than assumed: a regression would re-validate decisions taken under a
  *      superseded revision.
@@ -811,6 +971,16 @@ csh_path_entry_retire (cilium_srv6_headend_main_t *hm, u32 index, f64 now)
   csh_path_spec_index_del (hm, csh_path_spec_fingerprint (&cur), index);
 
   p->state = CILIUM_SRV6_PATH_RETIRED;
+
+  /*
+   * D-83: the PATH revision key dies with the entry. Clearing it here rather
+   * than waiting for the reclaim is what makes "the key does not exist" and
+   * "the handle does not resolve" become true at the same instant, so an
+   * install racing the retirement cannot be accepted against a revision whose
+   * handle has already gone.
+   */
+  if (index < vec_len (hm->path_revs))
+    hm->path_revs[index] = CILIUM_SRV6_REV_ABSENT;
 
   /* D-12: the index is not reusable until every worker that could still hold
      it is quiescent. */
@@ -1394,6 +1564,7 @@ csh_program_remove (cilium_srv6_headend_main_t *hm, u32 index)
   csh_count_add (&hm->prog_owner_count, e->owner_quota_class, -1);
   csh_count_add (&hm->prog_identity_count, e->src_identity, -1);
   csh_policy_rev_slot_unref (hm, e->policy_rev_slot);
+  csh_endpoint_rev_slot_unref (hm, e->endpoint_rev_slot);
 
   if (hm->n_programs[budget] > 0)
     hm->n_programs[budget]--;
@@ -1485,13 +1656,20 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
   clib_bihash_kv_24_8_t kv;
   cilium_srv6_program_t *e;
   u64 key[3];
-  u32 index, budget, capacity, slot;
+  u32 index, budget, capacity, slot, endpoint_slot;
   f64 now;
   int taken;
+  int endpoint_key_is_absence = 0;
 
   if (!hm->initialised)
     return VNET_API_ERROR_INIT_FAILED;
 
+  /*
+   * D-83 / errata #34 item 153: `::` MUST NOT represent a real endpoint
+   * revision key and MUST be accepted only as the reserved endpoint-absence
+   * revision key. A ProgramCache entry whose destination is `::` would make it
+   * one, because the ENDPOINT key of an entry is its destination.
+   */
   if (dst == NULL || ip6_address_is_zero (dst))
     return VNET_API_ERROR_INVALID_VALUE;
 
@@ -1528,23 +1706,109 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
    * comparison on its own side, so a revision that moved between the agent's
    * last check and this message can never install an entry that claims a
    * revision the node is not currently publishing.
+   *
+   * D-83 makes that comparison per key. Each quoted revision is resolved in
+   * its own namespace — POLICY by src_identity, ENDPOINT by dst (with the
+   * reserved `::` key standing in for "dst is not a published endpoint") and
+   * PATH by path_cache_index — and the install is accepted only when every
+   * referenced key exists and every quotation matches it exactly.
+   *
+   * "Exists" is checked separately from "matches", and reported separately,
+   * because the two mean different things to the agent: a mismatch is a lost
+   * race that a recompile fixes, while a missing key means the mandatory
+   * order of D-83 was violated (publish + ACK must precede the install) and a
+   * recompile alone will loop forever.
    */
   slot = csh_policy_rev_slot_find (hm, src_identity);
-  if (policy_revision == CILIUM_SRV6_REV_INVALID ||
-      policy_revision != cilium_srv6_policy_revision (hm, slot) ||
-      endpoint_revision != hm->endpoint_revision || path_revision != hm->path_revision)
+  endpoint_slot = csh_endpoint_rev_resolve (hm, dst, &endpoint_key_is_absence);
+
+  /*
+   * D-83 / errata #34 item 153: a positive Program depends on the actual
+   * destination's endpoint revision; only a negative Program may depend on
+   * ENDPOINT_ABSENCE_REVISION. An ALLOW whose ENDPOINT key resolved to the
+   * reserved `::` key is refused.
+   *
+   * This is checked before "does the key exist" and before the revision
+   * comparison because it is neither a race nor a missing publication: this
+   * node does not publish the destination as an endpoint at all, so there is
+   * nothing to forward to, and no republication of any key turns the install
+   * into a legal one. Reporting it as a stale install would make the agent
+   * recompile forever; reporting it as a missing key would make an operator
+   * look for a publication that is not the problem.
+   *
+   * The mirror rule — a negative Program MUST NOT quote a real destination's
+   * positive revision — needs no check of its own: the ENDPOINT key is
+   * resolved here from `dst` rather than quoted, so an entry for a destination
+   * this node does not publish resolves to `::`, and the exact-match
+   * comparison below refuses a quotation of the destination's own revision.
+   */
+  if (verdict == CILIUM_SRV6_VERDICT_ALLOW && endpoint_key_is_absence)
     {
-      /*
-       * An identity the node has never published resolves to the sentinel,
-       * whose revision is CILIUM_SRV6_REV_INVALID, so it is refused here. The
-       * sentinel value is refused explicitly as well, because otherwise a
-       * message carrying it would compare equal to the sentinel slot, install
-       * an entry that can never match a real revision, and take a slot
-       * reference for it.
-       */
-      hm->n_program_stale_installs++;
-      return VNET_API_ERROR_INVALID_VALUE_3;
+      hm->n_program_absence_key_installs++;
+      return VNET_API_ERROR_INVALID_DST_ADDRESS;
     }
+
+  {
+    u64 cur_policy = cilium_srv6_policy_revision (hm, slot);
+    u64 cur_endpoint = cilium_srv6_endpoint_revision (hm, endpoint_slot);
+    u64 cur_path = cilium_srv6_path_revision (hm, path_cache_index);
+
+    /* The sentinel is refused explicitly: without this a message carrying it
+       would compare equal to a sentinel slot, install an entry that can never
+       match a real revision, and take a reference for it. */
+    if (policy_revision == CILIUM_SRV6_REV_INVALID ||
+	endpoint_revision == CILIUM_SRV6_REV_INVALID || path_revision == CILIUM_SRV6_REV_INVALID)
+      {
+	hm->n_program_stale_installs++;
+	return VNET_API_ERROR_INVALID_VALUE_3;
+      }
+
+    /* Missing key: fail-closed, and distinguishable from a stale quotation. A
+       DENY quotes path_revision 0 ("no path dependency"), which is not a
+       reference to a PATH key and is therefore not checked here. */
+    if (cur_policy == CILIUM_SRV6_REV_INVALID || cur_policy == CILIUM_SRV6_REV_ABSENT ||
+	cur_endpoint == CILIUM_SRV6_REV_INVALID || cur_endpoint == CILIUM_SRV6_REV_ABSENT ||
+	(path_revision != CILIUM_SRV6_REV_ABSENT &&
+	 (cur_path == CILIUM_SRV6_REV_INVALID || cur_path == CILIUM_SRV6_REV_ABSENT)))
+      {
+	hm->n_program_missing_key_installs++;
+	return VNET_API_ERROR_INVALID_VALUE_4;
+      }
+
+    if (policy_revision != cur_policy || endpoint_revision != cur_endpoint ||
+	(path_revision != CILIUM_SRV6_REV_ABSENT && path_revision != cur_path))
+      {
+	hm->n_program_stale_installs++;
+	return VNET_API_ERROR_INVALID_VALUE_3;
+      }
+
+    /*
+     * An ALLOW forwards on a path, so it must depend on that path's key; a
+     * DENY must not (02 §4.3: an unrelated route flap may not invalidate it).
+     * 02 §4.3.1 makes the two legal combinations exhaustive:
+     *
+     *   DENY   path_cache_index = CILIUM_SRV6_NO_PATH_INDEX, path_revision = 0
+     *   ALLOW  path_cache_index = a valid PathCache index,   path_revision > 0
+     *
+     * and the cross product is refused here. Refusing it keeps the hot path's
+     * "path_revision == 0 means no path dependency" rule exact, and keeps a
+     * DENY from naming a PathCache index it must not be able to reach.
+     */
+    if (verdict == CILIUM_SRV6_VERDICT_ALLOW &&
+	(path_revision == CILIUM_SRV6_REV_ABSENT ||
+	 path_cache_index == CILIUM_SRV6_NO_PATH_INDEX))
+      {
+	hm->n_program_missing_key_installs++;
+	return VNET_API_ERROR_INVALID_VALUE_4;
+      }
+    if (verdict == CILIUM_SRV6_VERDICT_DENY &&
+	(path_revision != CILIUM_SRV6_REV_ABSENT ||
+	 path_cache_index != CILIUM_SRV6_NO_PATH_INDEX))
+      {
+	hm->n_program_stale_installs++;
+	return VNET_API_ERROR_INVALID_VALUE_3;
+      }
+  }
 
   if (verdict == CILIUM_SRV6_VERDICT_ALLOW)
     {
@@ -1555,8 +1819,11 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
   else
     {
       /* Nothing that could make a DENY entry forward may be carried, so that
-	 a DENY can never be turned into a forwarding decision. */
-      path_cache_index = ~0;
+	 a DENY can never be turned into a forwarding decision. The check above
+	 already refused any DENY that named an index, so this only normalises
+	 `path_generation`; the assignment is kept so that the invariant holds
+	 by construction and not only by that check. */
+      path_cache_index = CILIUM_SRV6_NO_PATH_INDEX;
       path_generation = 0;
     }
 
@@ -1593,12 +1860,22 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
     }
 
   slot = csh_policy_rev_slot_ref (hm, src_identity);
+  /* Re-resolved rather than reusing the index taken above: nothing between
+     the two can change the answer (a present key holds the publication's own
+     reference, so no eviction can free it), and resolving where the reference
+     is taken keeps the two from drifting apart if that ever stops holding.
+     The reference is what pins the key — and with it the D-83 high water mark
+     — for as long as this entry quotes its revision. */
+  endpoint_slot = csh_endpoint_rev_resolve (hm, dst, NULL);
+  if (endpoint_slot != CSH_ENDPOINT_REV_SENTINEL)
+    hm->endpoint_rev[endpoint_slot].refcount++;
 
   pool_get_zero (hm->programs, e);
   index = (u32) (e - hm->programs);
 
   e->src_identity = src_identity;
   e->policy_rev_slot = slot;
+  e->endpoint_rev_slot = endpoint_slot;
   e->path_cache_index = path_cache_index;
   e->path_generation = path_generation;
   e->policy_revision = policy_revision;
@@ -1621,6 +1898,7 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
   if (clib_bihash_add_del_24_8 (&hm->program_table, &kv, 1 /* add */) < 0)
     {
       csh_policy_rev_slot_unref (hm, slot);
+      csh_endpoint_rev_slot_unref (hm, endpoint_slot);
       clib_memset (e, 0, sizeof (*e));
       pool_put_index (hm->programs, index);
       cilium_srv6_barrier_release (vm, taken);
@@ -1667,23 +1945,81 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
 }
 
 /* ------------------------------------------------------------------ */
-/* srv6_revision_publish / srv6_lease_extend (02 §4.3, §8)             */
+/* per-key revision publication / srv6_lease_extend (02 §4.3, §8, D-83) */
 /* ------------------------------------------------------------------ */
 
 /*
- * D-30: the policy revision is per src identity, so a NetworkPolicy change
- * only stales the entries of the identities it actually affects. The whole
- * publish — every per-identity revision plus the two global revisions — is
- * applied inside one barrier section so that a packet never observes a
- * partially applied publish (02 §4.3).
+ * D-83 replaced the single node-global srv6_revision_publish with one typed
+ * message per namespace. The three functions below share one shape, and the
+ * shape is the contract:
+ *
+ *   1. every element is validated first, against the current value of its own
+ *      key. Nothing is written while validating;
+ *   2. if any element is rejected, nothing is applied at all;
+ *   3. otherwise the whole message is applied inside one worker barrier
+ *      section, so a packet never observes a partially applied publish
+ *      (02 §4.3).
+ *
+ * All-or-nothing is what makes a successful reply an acknowledgement for
+ * every key in the message, which is what the mandatory D-83 order needs:
+ * authority change -> per-key revision publish ACK -> old Program becomes
+ * stale -> new Program publication. A partially applied publish would leave
+ * the agent unable to say which keys it may compile against.
+ *
+ * Per key: the same revision again is idempotent, a lower one is refused, a
+ * higher one advances the key. Nothing is walked when a key advances: an
+ * entry that quotes the old revision fails the comparison of 02 §4.2 at its
+ * next packet and punts. That is the whole point of comparing per packet
+ * rather than invalidating eagerly — the cost of a revision bump is
+ * independent of the number of entries that depend on it.
+ *
+ * Revision 0 withdraws a key. It is accepted whatever the current value is
+ * (it is not a backwards move: it is the statement that the key stopped
+ * existing), and every entry quoting the key becomes stale, because 0 never
+ * equals a quotation.
+ */
+
+/* Common per-element validation. Returns 0 when the value may be published. */
+static int
+csh_revision_value_check (u64 revision, u64 current, int *rv)
+{
+  if (revision == CILIUM_SRV6_REV_INVALID)
+    {
+      *rv = VNET_API_ERROR_INVALID_VALUE_3;
+      return -1;
+    }
+
+  /* A withdraw is always legal. */
+  if (revision == CILIUM_SRV6_REV_ABSENT)
+    return 0;
+
+  /* Monotonic per key (02 §4.3): going backwards would let a revoked ALLOW
+     become valid again. `current` is the high water mark rather than the live
+     value, so a withdraw cannot be used to launder a lower revision back in
+     while entries that quote the old one are still resident. */
+  if (current != CILIUM_SRV6_REV_ABSENT && current != CILIUM_SRV6_REV_INVALID && revision < current)
+    {
+      *rv = VNET_API_ERROR_INVALID_VALUE_2;
+      return -1;
+    }
+
+  return 0;
+}
+
+/*
+ * D-30 + D-84: the POLICY namespace, keyed by SecurityIdentity. The producer
+ * is the agent's policy revision bumper, which seeds the whole identity
+ * snapshot before ProgramCache publication opens and then publishes only the
+ * identities it reports as changed. Remote identities are included, because
+ * the reply re-authorisation of 02 §7.2 compares against the revision of the
+ * forward direction's source identity.
  */
 int
-cilium_srv6_revision_publish (const u32 *identities, const u64 *revisions, u32 n_policy,
-			      u64 endpoint_revision, u64 path_revision)
+cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions, u32 n_policy)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   vlib_main_t *vm = vlib_get_main ();
-  u32 i;
+  u32 i, n_new = 0;
   int taken;
   int rv = 0;
 
@@ -1693,55 +2029,237 @@ cilium_srv6_revision_publish (const u32 *identities, const u64 *revisions, u32 n
   if (n_policy != 0 && (identities == NULL || revisions == NULL))
     return VNET_API_ERROR_INVALID_VALUE;
 
-  /* Revisions are monotonic (02 §4.3); going backwards would let a revoked
-     ALLOW become valid again. */
-  if (endpoint_revision < hm->endpoint_revision || path_revision < hm->path_revision)
-    return VNET_API_ERROR_INVALID_VALUE_2;
-
   for (i = 0; i < n_policy; i++)
-    if (revisions[i] == CILIUM_SRV6_REV_INVALID)
-      return VNET_API_ERROR_INVALID_VALUE_3;
+    {
+      u32 slot = csh_policy_rev_slot_find (hm, identities[i]);
+      u64 current = CILIUM_SRV6_REV_ABSENT;
+
+      if (slot == CSH_POLICY_REV_SENTINEL)
+	{
+	  if (revisions[i] != CILIUM_SRV6_REV_ABSENT)
+	    n_new++;
+	}
+      else
+	current = hm->policy_rev[slot].policy_revision;
+
+      if (csh_revision_value_check (revisions[i], current, &rv))
+	return rv;
+    }
+
+  if (n_new > pool_free_elts (hm->policy_rev))
+    return VNET_API_ERROR_LIMIT_EXCEEDED;
 
   taken = cilium_srv6_barrier_acquire (vm);
 
   for (i = 0; i < n_policy; i++)
     {
       u32 slot = csh_policy_rev_slot_find (hm, identities[i]);
-      cilium_srv6_policy_rev_t *r;
 
-      if (slot == CSH_POLICY_REV_SENTINEL)
+      if (revisions[i] == CILIUM_SRV6_REV_ABSENT)
 	{
-	  slot = csh_policy_rev_slot_ref (hm, identities[i]);
-	  if (slot == CSH_POLICY_REV_SENTINEL)
+	  /*
+	   * A withdrawn identity keeps neither a revision nor a lease. The
+	   * slot itself is left alone: it is reference counted by the entries
+	   * and the conntrack pins that still name it, and releasing it here
+	   * would hand its index to another identity while they still read it.
+	   */
+	  if (slot != CSH_POLICY_REV_SENTINEL)
 	    {
-	      rv = VNET_API_ERROR_LIMIT_EXCEEDED;
-	      continue;
+	      hm->policy_rev[slot].policy_revision = CILIUM_SRV6_REV_ABSENT;
+	      hm->policy_rev[slot].lease_revision = CILIUM_SRV6_REV_INVALID;
+	      hm->policy_rev[slot].lease_valid_until = 0.0;
 	    }
-	  /* The reference taken above belongs to the publication itself: a
-	     published identity keeps its slot even with no entries, so that
-	     the next install compares against the revision the agent knows.
-	     The slot is only released when the identity is republished away
-	     by capacity pressure, which is reported as LIMIT_EXCEEDED. */
-	}
-
-      r = hm->policy_rev + slot;
-
-      if (revisions[i] < r->policy_revision)
-	{
-	  rv = VNET_API_ERROR_INVALID_VALUE_2;
 	  continue;
 	}
 
-      r->policy_revision = revisions[i];
+      if (slot == CSH_POLICY_REV_SENTINEL)
+	{
+	  /* The reference taken here belongs to the publication itself: a
+	     published identity keeps its slot even with no entries, so that
+	     the next install compares against the revision the agent knows. */
+	  slot = csh_policy_rev_slot_ref (hm, identities[i]);
+	  if (slot == CSH_POLICY_REV_SENTINEL)
+	    {
+	      /* Cannot happen: capacity was checked above with the barrier not
+		 yet taken and nothing releases slots in between. */
+	      rv = VNET_API_ERROR_LIMIT_EXCEEDED;
+	      continue;
+	    }
+	}
+
+      hm->policy_rev[slot].policy_revision = revisions[i];
     }
 
-  hm->endpoint_revision = endpoint_revision;
-  hm->path_revision = path_revision;
   hm->n_revision_publishes++;
 
   cilium_srv6_barrier_release (vm, taken);
 
   return rv;
+}
+
+/*
+ * D-83: the ENDPOINT namespace, keyed by destination IPv6 address.
+ *
+ * The unspecified address `::` is ENDPOINT_ABSENCE_REVISION, the reserved key
+ * negative entries depend on (02 §4.3.1, errata #34 item 153). It advances like
+ * any other key — the agent moves it when the membership of the published
+ * endpoint key set changes — but it is not a real endpoint key:
+ *
+ *   `::` MUST NOT represent a real endpoint revision key and MUST be accepted
+ *   only as the reserved endpoint-absence revision key.
+ *
+ * The one publication that would treat it as a real key is a withdraw. A real
+ * key is withdrawn when its destination stops being a published endpoint; the
+ * absence key has no destination to stop being one, and withdrawing it would
+ * make every negative install fail the missing-key check — indistinguishable
+ * from a genuine ordering violation — until it was republished. It is refused
+ * here, in the validation pass, so that the message stays all-or-nothing.
+ */
+int
+cilium_srv6_endpoint_revision_publish (const ip6_address_t *dsts, const u64 *revisions,
+				       u32 n_endpoint)
+{
+  cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+  vlib_main_t *vm = vlib_get_main ();
+  u32 i, n_new = 0;
+  int taken;
+  int rv = 0;
+
+  if (!hm->initialised)
+    return VNET_API_ERROR_INIT_FAILED;
+
+  if (n_endpoint != 0 && (dsts == NULL || revisions == NULL))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  for (i = 0; i < n_endpoint; i++)
+    {
+      u32 slot;
+      /* The high water mark, not the live revision: a withdrawn key must not
+	 be revivable at a lower revision while entries still quote the old
+	 one. */
+      u64 current = CILIUM_SRV6_REV_ABSENT;
+
+      /* The reserved absence key may only advance, never be withdrawn. */
+      if (ip6_address_is_zero (dsts + i) && revisions[i] == CILIUM_SRV6_REV_ABSENT)
+	return VNET_API_ERROR_INVALID_DST_ADDRESS;
+
+      slot = csh_endpoint_rev_slot_find (hm, dsts + i);
+
+      if (slot == CSH_ENDPOINT_REV_SENTINEL)
+	{
+	  if (revisions[i] != CILIUM_SRV6_REV_ABSENT)
+	    n_new++;
+	}
+      else
+	current = hm->endpoint_rev[slot].hwm;
+
+      if (csh_revision_value_check (revisions[i], current, &rv))
+	return rv;
+    }
+
+  if (n_new > pool_free_elts (hm->endpoint_rev))
+    return VNET_API_ERROR_LIMIT_EXCEEDED;
+
+  taken = cilium_srv6_barrier_acquire (vm);
+
+  for (i = 0; i < n_endpoint; i++)
+    {
+      u32 slot = csh_endpoint_rev_slot_find (hm, dsts + i);
+
+      if (revisions[i] == CILIUM_SRV6_REV_ABSENT)
+	{
+	  if (slot == CSH_ENDPOINT_REV_SENTINEL)
+	    continue;
+
+	  if (hm->endpoint_rev[slot].present)
+	    {
+	      hm->endpoint_rev[slot].present = 0;
+	      hm->endpoint_rev[slot].revision = CILIUM_SRV6_REV_ABSENT;
+	      /* Drop the publication's own reference. The slot survives while
+		 ProgramCache entries still quote it — that is what keeps the
+		 high water mark alive exactly as long as it protects
+		 something — and is released with the last of them. */
+	      csh_endpoint_rev_slot_unref (hm, slot);
+	    }
+	  continue;
+	}
+
+      if (slot == CSH_ENDPOINT_REV_SENTINEL)
+	{
+	  /* Creating the slot takes the publication's reference. */
+	  slot = csh_endpoint_rev_slot_ref (hm, dsts + i);
+	  if (slot == CSH_ENDPOINT_REV_SENTINEL)
+	    {
+	      rv = VNET_API_ERROR_LIMIT_EXCEEDED;
+	      continue;
+	    }
+	}
+      else if (!hm->endpoint_rev[slot].present)
+	{
+	  /* A withdrawn key coming back: retake the publication reference the
+	     withdraw dropped. */
+	  hm->endpoint_rev[slot].refcount++;
+	}
+
+      hm->endpoint_rev[slot].present = 1;
+      hm->endpoint_rev[slot].revision = revisions[i];
+      if (revisions[i] > hm->endpoint_rev[slot].hwm)
+	hm->endpoint_rev[slot].hwm = revisions[i];
+    }
+
+  hm->n_revision_publishes++;
+
+  cilium_srv6_barrier_release (vm, taken);
+
+  return rv;
+}
+
+/*
+ * D-83: the PATH namespace, keyed by PathCache index. The index must name a
+ * currently published entry (D-61 committed it), because a revision for a
+ * handle that does not resolve could only ever produce an ALLOW that punts.
+ */
+int
+cilium_srv6_path_revision_publish (const u32 *indices, const u64 *revisions, u32 n_path)
+{
+  cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+  vlib_main_t *vm = vlib_get_main ();
+  u32 i;
+  int taken;
+
+  if (!hm->initialised)
+    return VNET_API_ERROR_INIT_FAILED;
+
+  if (n_path != 0 && (indices == NULL || revisions == NULL))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  for (i = 0; i < n_path; i++)
+    {
+      int rv = 0;
+
+      if (indices[i] >= vec_len (hm->path_revs))
+	return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+      /* A withdraw needs no entry: the index may already have been retired. */
+      if (revisions[i] != CILIUM_SRV6_REV_ABSENT &&
+	  (pool_is_free_index (hm->paths, indices[i]) ||
+	   hm->paths[indices[i]].state != CILIUM_SRV6_PATH_PUBLISHED))
+	return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+      if (csh_revision_value_check (revisions[i], hm->path_revs[indices[i]], &rv))
+	return rv;
+    }
+
+  taken = cilium_srv6_barrier_acquire (vm);
+
+  for (i = 0; i < n_path; i++)
+    hm->path_revs[indices[i]] = revisions[i];
+
+  hm->n_revision_publishes++;
+
+  cilium_srv6_barrier_release (vm, taken);
+
+  return 0;
 }
 
 /*
@@ -2245,12 +2763,22 @@ cilium_srv6_frag_record (vlib_main_t *vm, const ip6_address_t *src, const ip6_ad
       tmpl.policy_revision = prog->policy_revision;
       tmpl.endpoint_revision = prog->endpoint_revision;
       tmpl.path_revision = prog->path_revision;
+      /* D-83: the same ENDPOINT key the ProgramCache entry resolved, so the
+	 record is bound to exactly what the decision was bound to (D-20). No
+	 reference is taken on it, for the same reason none is taken on
+	 `policy_rev_slot`: this runs on a worker, and the reference counts of
+	 the revision tables are main-thread state. The binding is safe because
+	 the entry this record was derived from holds the reference, a released
+	 slot is poisoned with the sentinel before its index is reused, and the
+	 record expires within `frag_timeout` regardless. */
+      tmpl.endpoint_rev_slot = prog->endpoint_rev_slot;
     }
   else
     {
       tmpl.policy_revision = CILIUM_SRV6_REV_INVALID;
       tmpl.endpoint_revision = CILIUM_SRV6_REV_INVALID;
       tmpl.path_revision = CILIUM_SRV6_REV_INVALID;
+      tmpl.endpoint_rev_slot = CSH_ENDPOINT_REV_SENTINEL;
     }
 
   tmpl.path_cache_index = path_cache_index;
@@ -2390,6 +2918,7 @@ cilium_srv6_frag_verdict_add (const ip6_address_t *src, const ip6_address_t *dst
   const cilium_srv6_local_ep_t *ep;
   cilium_srv6_frag_entry_t tmpl;
   u64 key[5];
+  u32 endpoint_slot;
   f64 lifetime, now;
   int taken, rv;
 
@@ -2429,12 +2958,30 @@ cilium_srv6_frag_verdict_add (const ip6_address_t *src, const ip6_address_t *dst
 
   /*
    * 02 §4.3, the same comparison srv6_program_add_del makes: nothing decided
-   * under a revision is installed once that revision has moved. It is made
-   * against `ep->policy_rev_slot` because that is the slot the hot path
-   * resolves for a packet from this endpoint.
+   * under a revision is installed once that revision has moved. The POLICY
+   * key is `ep->policy_rev_slot`, because that is the slot the hot path
+   * resolves for a packet from this endpoint; the ENDPOINT key is resolved
+   * from `dst` exactly as an install resolves it (D-83).
    */
-  if (!cilium_srv6_revisions_match (hm, ep->policy_rev_slot, policy_revision, endpoint_revision,
-				    path_revision))
+  {
+    int endpoint_key_is_absence = 0;
+
+    endpoint_slot = csh_endpoint_rev_resolve (hm, dst, &endpoint_key_is_absence);
+
+    /* D-83 / errata #34 item 153, the same rule srv6_program_add_del applies:
+       a positive record depends on the actual destination's endpoint revision,
+       so one whose ENDPOINT key resolved to the reserved `::` absence key is
+       refused. A later fragment of an ALLOW is forwarded on a path towards a
+       destination this node does not publish as an endpoint at all. */
+    if (verdict == CILIUM_SRV6_VERDICT_ALLOW && endpoint_key_is_absence)
+      {
+	hm->n_program_absence_key_installs++;
+	return VNET_API_ERROR_INVALID_DST_ADDRESS;
+      }
+  }
+
+  if (!cilium_srv6_revisions_match (hm, ep->policy_rev_slot, policy_revision, endpoint_slot,
+				    endpoint_revision, path_cache_index, path_revision))
     return VNET_API_ERROR_INVALID_VALUE_4;
 
   if (verdict == CILIUM_SRV6_VERDICT_ALLOW)
@@ -2476,6 +3023,7 @@ cilium_srv6_frag_verdict_add (const ip6_address_t *src, const ip6_address_t *dst
   tmpl.src_identity = ep->identity;
   tmpl.local_context_id = ep->local_context_id;
   tmpl.policy_rev_slot = ep->policy_rev_slot;
+  tmpl.endpoint_rev_slot = endpoint_slot;
   tmpl.owner_quota_class = ep->owner_quota_class;
   tmpl.policy_revision = policy_revision;
   tmpl.endpoint_revision = endpoint_revision;
@@ -2774,6 +3322,8 @@ cilium_srv6_headend_config (vlib_main_t *vm, unformat_input_t *input)
 	hm->frag_timeout = v;
       else if (unformat (input, "policy-revision-capacity %u", &v32) && v32 > 0)
 	hm->policy_rev_capacity = v32;
+      else if (unformat (input, "endpoint-revision-capacity %u", &v32) && v32 > 0)
+	hm->endpoint_rev_capacity = v32;
       else if (unformat (input, "allow-lease-ms %u", &v32) && v32 > 0)
 	hm->allow_lease_ms = v32;
       else if (unformat (input, "grace-period %f", &v) && v > 0.0)
@@ -2861,6 +3411,7 @@ cilium_srv6_headend_init (vlib_main_t *vm)
   hm->frag_capacity = CILIUM_SRV6_FRAG_CAPACITY_DEFAULT;
   hm->frag_timeout = CILIUM_SRV6_FRAG_TIMEOUT_DEFAULT;
   hm->policy_rev_capacity = CILIUM_SRV6_POLICY_REV_CAPACITY_DEFAULT;
+  hm->endpoint_rev_capacity = CILIUM_SRV6_ENDPOINT_REV_CAPACITY_DEFAULT;
   hm->allow_lease_ms = CILIUM_SRV6_ALLOW_LEASE_DEFAULT_MS;
   hm->grace_period = CILIUM_SRV6_HEADEND_GRACE_PERIOD_DEFAULT;
   hm->punt_token_timeout = CILIUM_SRV6_PUNT_TOKEN_TIMEOUT_DEFAULT;
@@ -2918,6 +3469,7 @@ cilium_srv6_headend_main_loop_enter (vlib_main_t *vm)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   cilium_srv6_policy_rev_t *sentinel;
+  cilium_srv6_endpoint_rev_t *ep_sentinel;
   u32 nbuckets;
 
   if (hm->initialised)
@@ -2931,6 +3483,7 @@ cilium_srv6_headend_main_loop_enter (vlib_main_t *vm)
   pool_init_fixed (hm->path_mtus, hm->path_capacity);
   pool_init_fixed (hm->frags, hm->frag_capacity);
   pool_init_fixed (hm->policy_rev, hm->policy_rev_capacity);
+  pool_init_fixed (hm->endpoint_rev, hm->endpoint_rev_capacity);
 
   /* Slot 0 is the permanent sentinel (see CSH_POLICY_REV_SENTINEL). */
   pool_get_zero (hm->policy_rev, sentinel);
@@ -2941,11 +3494,31 @@ cilium_srv6_headend_main_loop_enter (vlib_main_t *vm)
   sentinel->lease_revision = CILIUM_SRV6_REV_INVALID;
   sentinel->lease_valid_until = 0.0;
 
+  /* Slot 0 of the ENDPOINT table is the same kind of permanent sentinel
+     (CSH_ENDPOINT_REV_SENTINEL): it is never in the by-destination index, so
+     nothing resolves to it, and it reads as the ~0 sentinel for a holder that
+     still names it. */
+  pool_get_zero (hm->endpoint_rev, ep_sentinel);
+  ASSERT (ep_sentinel == hm->endpoint_rev);
+  ep_sentinel->refcount = ~0;
+  ep_sentinel->present = 0;
+  ep_sentinel->revision = CILIUM_SRV6_REV_INVALID;
+  ep_sentinel->hwm = CILIUM_SRV6_REV_INVALID;
+
+  /* D-83 PATH keys, dense by PathCache index. Zero is
+     CILIUM_SRV6_REV_ABSENT, i.e. "this index has no published revision",
+     which is the fail-closed starting state. */
+  vec_validate (hm->path_revs, hm->path_capacity - 1);
+
   hm->prog_owner_count = hash_create (0, sizeof (uword));
   hm->prog_identity_count = hash_create (0, sizeof (uword));
   hm->frag_owner_count = hash_create (0, sizeof (uword));
   hm->frag_identity_count = hash_create (0, sizeof (uword));
   hm->policy_rev_by_identity = hash_create (0, sizeof (uword));
+
+  nbuckets = 1 << clib_max (6, max_log2 (hm->endpoint_rev_capacity) - 2);
+  clib_bihash_init_16_8 (&hm->endpoint_rev_by_dst, "cilium-srv6-endpoint-rev", nbuckets,
+			 (uword) hm->endpoint_rev_capacity * 96);
 
   /* PathCache staging transaction (D-61). All main-thread state: no worker
      reads any of it, so a staged entry cannot reach the dataplane before the

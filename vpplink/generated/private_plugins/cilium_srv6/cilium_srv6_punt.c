@@ -26,18 +26,33 @@
  *               record instead of dropping it under D-43.
  *   reinject    validation and re-entry of the packet the agent sends back
  *               (02 §5.1 step 8).
+ *   release     the DENY half of the same protocol (02 §5.6.3): the agent
+ *               hands the token back with a 06 §2 drop reason instead of a
+ *               packet, and the slot is freed immediately rather than at the
+ *               token timeout.
  *
- * The transport itself — the Unix domain socket of 00 §4.1, its peer
- * credential check and its framing — is deliberately *not* implemented here.
- * It is reached through cilium_srv6_punt_tx_register(), so this file fixes the
- * boundary (metadata layout, token semantics, admission rules) without
- * pulling a socket implementation into the graph-node change. With no
- * transport registered every punt fails closed and is counted separately in
- * punt_no_transport, so the missing half is observable rather than silent.
+ * The transport — the Unix domain socket of 00 §4.1, its framing and its
+ * reconnection — lives in cilium_srv6_punt_transport.c and reaches this file
+ * through cilium_srv6_punt_tx_register(). The split is the thread boundary of
+ * 00 §2.18.7: what runs here runs on a worker and does no socket I/O, and the
+ * transport owner is the only thread that connects, writes, reads and
+ * reconnects. With no transport registered, or with one that is not
+ * connected, every punt fails closed and is counted in punt_no_transport, so
+ * a missing agent is observable rather than silent.
+ *
+ * Threading. Everything in this file that touches the token store, the quota
+ * counters or the punt_id sequence runs under `hm->punt_lock`, from any
+ * worker. The two exceptions are stated where they are:
+ *
+ *   - `q->n_punted` is incremented outside the lock (the transport has to be
+ *     called with the lock released) and is therefore an atomic;
+ *   - cilium_srv6_punt_reinject() and cilium_srv6_punt_release() are main
+ *     thread only, because the first enqueues a frame to a graph node.
  */
 
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <vlib/vlib.h>
 #include <vlib/log.h>
@@ -45,9 +60,13 @@
 #include <vnet/vnet.h>
 #include <vnet/api_errno.h>
 #include <vnet/ip/ip6_packet.h>
+#include <vppinfra/atomics.h>
+#include <vppinfra/random_isaac.h>
 
 #include <cilium_srv6/cilium_srv6_guard.h>
 #include <cilium_srv6/cilium_srv6_headend.h>
+#include <cilium_srv6/cilium_srv6_punt_wire.h>
+#include <cilium_srv6/cilium_srv6.api_enum.h>
 
 static cilium_srv6_punt_tx_fn cilium_srv6_punt_tx_hook;
 
@@ -199,13 +218,54 @@ csp_token_release (cilium_srv6_headend_main_t *hm, cilium_srv6_punt_token_t *t)
   t->in_use = 0;
 
   /*
-   * The nonce is bumped on release, not on issue, so a token is one-shot:
-   * once redeemed (or expired) the same value can never validate again, and
-   * the slot has to be re-issued before it means anything.
+   * One-shot (D-76 §2.18.4): the lookup entry goes first and the bytes are
+   * wiped, so the value that was on the wire resolves to nothing from this
+   * moment on. Redeeming, releasing and expiring all come through here, so
+   * there is one place where a token stops being a capability.
+   *
+   * The key the hash holds is `t->token` itself, so it must be unset while
+   * the bytes are still the ones it was inserted under.
    */
-  t->nonce++;
-  if (t->nonce == 0)
-    t->nonce = 1;
+  hash_unset_mem (hm->punt_token_index, t->token);
+  clib_memset (t->token, 0, sizeof (t->token));
+}
+
+/*
+ * Draw a fresh 16-byte token into `t` and index it. punt_lock held.
+ *
+ * The value is opaque: nothing about the slot, the queue or the packet is
+ * derivable from it (D-76 §2.18.4). The all-zero value is rejected because
+ * the wire reserves it — it is what a peer that can write on the socket but
+ * has never seen a punt would send — and a collision with a live token is
+ * rejected because two live tokens with the same bytes would make redemption
+ * ambiguous. Both are re-drawn; both are astronomically unlikely, and the
+ * bounded retry means a broken entropy source fails the punt rather than
+ * looping in a worker.
+ *
+ * Returns 1 on success.
+ */
+static int
+csp_token_draw_locked (cilium_srv6_headend_main_t *hm, cilium_srv6_punt_token_t *t)
+{
+  int attempt;
+
+  for (attempt = 0; attempt < 4; attempt++)
+    {
+      const u8 *r = clib_random_buffer_get_data (&hm->punt_rng, CILIUM_SRV6_IF3_TOKEN_LEN);
+
+      clib_memcpy_fast (t->token, r, CILIUM_SRV6_IF3_TOKEN_LEN);
+
+      if (cilium_srv6_if3_token_is_zero (t->token))
+	continue;
+      if (hash_get_mem (hm->punt_token_index, t->token) != 0)
+	continue;
+
+      hash_set_mem (hm->punt_token_index, t->token, (uword) (t - hm->punt_tokens));
+      return 1;
+    }
+
+  clib_memset (t->token, 0, sizeof (t->token));
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -213,31 +273,115 @@ csp_token_release (cilium_srv6_headend_main_t *hm, cilium_srv6_punt_token_t *t)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Build the plugin-internal punt handoff (D-76, `00` §2.18.2).
+ *
+ * Every value here was produced by the headend graph, not by a second parse:
+ *
+ *   src_identity, l4_discriminator, proto,
+ *   frag_id, the fragment kind          cilium-srv6-classify (02 §3), through
+ *                                       cilium_srv6_headend_meta_t
+ *   sport, dport, frag_next_header      the same bounded parse, through
+ *                                       cilium_srv6_path_meta_t
+ *   rx_sw_if_index, rx_if_incarnation,
+ *   token, punt_id                      the admission decision above
+ *
+ * The two addresses are the only values read from the packet, and they are
+ * read the way every other headend stage reads them — the fixed `src_address`
+ * and `dst_address` fields of the outermost IPv6 header at
+ * vlib_buffer_get_current(), the same header cilium-srv6-classify validated
+ * and cilium-srv6-program keyed its ProgramCache lookup on. That is a
+ * fixed-offset field read, not a parse: there is no header chain to walk, no
+ * length to trust and therefore no second interpretation of the packet for
+ * the agent's key to disagree with, which is what `00` §2.18.2 is protecting.
+ * They are not carried in the buffer metadata for a mundane reason: both vnet
+ * opaque scratch areas are full (24 of 24 bytes, and 20 of 24), and 32 bytes
+ * of address do not fit either.
+ *
+ * The fragment kind comes from the classifier's own classification rather
+ * than being inferred from `frag_id != 0`: Identification 0 and Next Header 0
+ * are both legitimate on a real fragment, so an inference would report NONE
+ * for an atomic fragment and the agent would drop the frame as
+ * self-contradictory (02 §5.6.5).
+ *
+ * Returns 0 if the packet is too short to hold an IPv6 header, which
+ * cilium-srv6-classify already rejects as DROP_MALFORMED_INNER; the check is
+ * repeated because this function dereferences the header.
+ */
+static int
+csp_meta_build (vlib_main_t *vm, vlib_buffer_t *b, const cilium_srv6_punt_token_t *t, u8 queue,
+		u8 reason, cilium_srv6_punt_meta_t *m)
+{
+  const cilium_srv6_headend_meta_t *meta = cilium_srv6_headend_meta (b);
+  const cilium_srv6_path_meta_t *pm = cilium_srv6_path_meta (b);
+  const ip6_header_t *ip;
+
+  if (PREDICT_FALSE (b->current_length < sizeof (ip6_header_t)))
+    return 0;
+
+  ip = (const ip6_header_t *) vlib_buffer_get_current (b);
+
+  clib_memset (m, 0, sizeof (m[0]));
+
+  /* ---- what travels (02 §5.6.2) ---- */
+
+  clib_memcpy_fast (m->w.token, t->token, CILIUM_SRV6_IF3_TOKEN_LEN);
+  /* The punt queue is the opcode; there is no separate `queue` field on the
+     wire, so the queue and the reason cannot disagree there (02 §5.6.1). */
+  m->w.opcode = (u8) (CILIUM_SRV6_IF3_OP_PUNT_COMPILE + queue);
+  m->w.cause = reason;
+  m->w.proto = meta->proto;
+  m->w.frag_kind = cilium_srv6_meta_frag_kind (meta->flags);
+  m->w.frag_next_header = pm->frag_next_header;
+  clib_memcpy_fast (m->w.src_ip, ip->src_address.as_u8, 16);
+  clib_memcpy_fast (m->w.dst_ip, ip->dst_address.as_u8, 16);
+  m->w.l4_discriminator = meta->l4_discriminator;
+  m->w.src_port = pm->sport;
+  m->w.dst_port = pm->dport;
+  m->w.src_identity = meta->src_identity;
+  m->w.rx_sw_if_index = t->rx_sw_if_index;
+  m->w.rx_if_incarnation = t->rx_if_incarnation;
+  /*
+   * `cilium_srv6_hparse_t.frag_id` is the Identification exactly as it sits
+   * in the packet, i.e. in network order. The wire field is a big-endian u32
+   * of the *value*, so the conversion happens once, here, and the serializer
+   * stays a plain "write this number big endian".
+   */
+  m->w.fragment_id = clib_net_to_host_u32 (meta->frag_id);
+  m->w.punt_id = t->punt_id;
+
+  /* ---- plugin internal (02 §5.6.8) ---- */
+
+  m->owner_quota_class = meta->owner_quota_class;
+  m->local_context_id = meta->local_context_id;
+  m->queue = queue;
+  m->packet_length = (u32) vlib_buffer_length_in_chain (vm, b);
+
+  return 1;
+}
+
+/*
  * One packet of 02 §5.1. Returns 1 if the packet was handed to the agent.
  *
  * Called from a worker, so every mutation of the token store and of the
  * per-owner / per-identity counters happens under punt_lock. Nothing here
  * allocates: the token pool is fixed size and the transport hook copies what
- * it needs out of the buffer.
+ * it needs out of the buffer before returning (00 §2.18.7 — the hook is
+ * forbidden from doing socket I/O, so "copies and enqueues" is all it does).
  */
 int
 cilium_srv6_punt_one (vlib_main_t *vm, vlib_buffer_t *b, u8 queue, u8 reason)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   const cilium_srv6_headend_meta_t *meta = cilium_srv6_headend_meta (b);
-  /* The Fragment header's Next Header lives in the second opaque area
-     because the first one is full; cilium-srv6-classify writes both from the
-     same bounded parse. */
-  const cilium_srv6_path_meta_t *pm = cilium_srv6_path_meta (b);
   const cilium_srv6_main_t *cm = &cilium_srv6_main;
   cilium_srv6_punt_tx_fn tx = cilium_srv6_punt_tx_hook;
   cilium_srv6_punt_queue_state_t *q;
   cilium_srv6_punt_token_t *t;
-  cilium_srv6_punt_meta_t wire;
+  cilium_srv6_punt_meta_t handoff;
   u32 sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
   u32 slot;
   u64 owner_key, identity_key;
-  int sent;
+  cilium_srv6_punt_tx_result_t sent;
 
   if (PREDICT_FALSE (queue >= CILIUM_SRV6_PUNT_N_Q || !hm->initialised))
     return 0;
@@ -283,8 +427,14 @@ cilium_srv6_punt_one (vlib_main_t *vm, vlib_buffer_t *b, u8 queue, u8 reason)
   pool_get (hm->punt_tokens, t);
   slot = (u32) (t - hm->punt_tokens);
 
-  if (t->nonce == 0)
-    t->nonce = 1;
+  if (!csp_token_draw_locked (hm, t))
+    {
+      /* The entropy source failed or the index is inconsistent. Fail closed:
+	 a punt with no capability could never be answered. */
+      pool_put_index (hm->punt_tokens, slot);
+      q->n_drop_no_token++;
+      goto refuse;
+    }
 
   t->in_use = 1;
   t->queue = queue;
@@ -302,49 +452,29 @@ cilium_srv6_punt_one (vlib_main_t *vm, vlib_buffer_t *b, u8 queue, u8 reason)
   csp_count_add (&hm->punt_owner_count, owner_key, +1);
   csp_count_add (&hm->punt_identity_count, identity_key, +1);
 
-  /* IF-3 metadata (02 §5.1 "packet 全体 + meta"). */
-  clib_memset (&wire, 0, sizeof (wire));
-  wire.version = CILIUM_SRV6_PUNT_META_VERSION;
-  wire.length = sizeof (wire);
-  wire.token = ((u64) slot << 32) | (u64) t->nonce;
-  wire.reason = reason;
-  wire.queue = queue;
-  wire.src_identity = meta->src_identity;
-  wire.rx_sw_if_index = sw_if_index;
-  wire.rx_if_incarnation = t->rx_if_incarnation;
-  wire.local_context_id = meta->local_context_id;
-  wire.owner_quota_class = meta->owner_quota_class;
-  wire.packet_length = (u32) vlib_buffer_length_in_chain (vm, b);
-  wire.frag_id = meta->frag_id;
-  wire.l4_discriminator = meta->l4_discriminator;
-  wire.proto = meta->proto;
-  wire.frag_kind = meta->flags;
-  /*
-   * 01 §3.1: the FragmentVerdictCache key component is the Fragment header's
-   * Next Header, not the upper layer protocol. The agent cannot re-derive it
-   * — it deliberately does not re-parse the packet — so it is carried here.
-   * It is already what cilium-srv6-classify keyed its own lookup on, so the
-   * entry the agent installs and the lookup the hot path performs use the
-   * same value even when a per-fragment extension header follows.
-   */
-  wire.frag_next_header = pm->frag_next_header;
-  /*
-   * Issue #90. The agent echoes this in srv6_fragment_verdict_add and in the
-   * reinject; the FragmentVerdictCache record it installs is armed with it,
-   * and only the reinject that carries it back may spend the record's one-shot
-   * reinjection capability. Every punt carries one — the field describes the
-   * punt operation, not the queue — even though only the fragment queue has a
-   * record to arm today.
-   */
-  wire.punt_id = t->punt_id;
+  if (!csp_meta_build (vm, b, t, queue, reason, &handoff))
+    {
+      csp_token_release (hm, t);
+      pool_put_index (hm->punt_tokens, slot);
+      q->n_drop_global++;
+      goto refuse;
+    }
 
   clib_spinlock_unlock (&hm->punt_lock);
 
-  sent = (tx != 0) ? tx (vm, b, &wire) : 0;
+  sent = (tx != 0) ? tx (vm, b, &handoff) : CILIUM_SRV6_PUNT_TX_NO_TRANSPORT;
 
-  if (PREDICT_TRUE (sent))
+  if (PREDICT_TRUE (sent == CILIUM_SRV6_PUNT_TX_SENT))
     {
-      q->n_punted++;
+      /*
+       * Outside punt_lock, and reachable from every worker at once. It used
+       * to be a plain `q->n_punted++`, which is a read-modify-write race that
+       * silently under-counts the one number an operator uses to tell "the
+       * slow path is working" from "the slow path is not being reached"
+       * (errata #34 item 152). The rest of this structure is written under
+       * the lock; this one field is not, so it is atomic.
+       */
+      clib_atomic_fetch_add (&q->n_punted, 1);
       return 1;
     }
 
@@ -353,10 +483,10 @@ cilium_srv6_punt_one (vlib_main_t *vm, vlib_buffer_t *b, u8 queue, u8 reason)
   clib_spinlock_lock (&hm->punt_lock);
   csp_token_release (hm, t);
   pool_put_index (hm->punt_tokens, slot);
-  if (tx == 0)
-    q->n_drop_no_transport++;
+  if (sent == CILIUM_SRV6_PUNT_TX_QUEUE_FULL)
+    q->n_drop_ring_full++;
   else
-    q->n_drop_global++;
+    q->n_drop_no_transport++;
   clib_spinlock_unlock (&hm->punt_lock);
 
   return 0;
@@ -367,29 +497,46 @@ refuse:
 }
 
 /* ------------------------------------------------------------------ */
-/* reinject (02 §5.1 step 8, 00 §4.1)                                  */
+/* reinject and release (02 §5.1 step 8, §5.6.3, 00 §4.1)              */
 /* ------------------------------------------------------------------ */
 
 /*
- * Validate a token and consume it. Returns 0 and fills *out on success.
+ * Validate a 16-byte token and consume it. Returns 0 and fills *out on
+ * success.
+ *
+ * The token is opaque (D-76 §2.18.4), so the slot is recovered from the
+ * index rather than decoded out of the value: guessing a slot number is not
+ * the same as guessing a token. The lookup lives in this process's memory
+ * only, which is what makes a token issued by a previous plugin instance
+ * resolve to nothing (D-72).
+ *
+ * One-shot is enforced by csp_token_release(), which removes the index entry
+ * and wipes the bytes: a second presentation of the same value finds nothing.
  */
 static int
-csp_token_redeem (cilium_srv6_headend_main_t *hm, u64 token, cilium_srv6_punt_token_t *out)
+csp_token_redeem (cilium_srv6_headend_main_t *hm, const u8 *token, cilium_srv6_punt_token_t *out)
 {
   cilium_srv6_punt_token_t *t;
-  u32 slot = (u32) (token >> 32);
-  u32 nonce = (u32) token;
+  uword *p;
+  u32 slot;
   int rv = VNET_API_ERROR_INVALID_VALUE;
+
+  if (token == NULL || cilium_srv6_if3_token_is_zero (token))
+    return rv;
 
   clib_spinlock_lock (&hm->punt_lock);
 
+  p = hash_get_mem (hm->punt_token_index, token);
+  if (p == NULL)
+    goto done;
+
+  slot = (u32) p[0];
   if (slot >= hm->punt_token_capacity || pool_is_free_index (hm->punt_tokens, slot))
     goto done;
 
   t = hm->punt_tokens + slot;
 
-  /* One-shot: an already released slot has a different nonce. */
-  if (!t->in_use || t->nonce != nonce)
+  if (!t->in_use)
     goto done;
 
   *out = *t;
@@ -401,6 +548,71 @@ csp_token_redeem (cilium_srv6_headend_main_t *hm, u64 token, cilium_srv6_punt_to
 done:
   clib_spinlock_unlock (&hm->punt_lock);
   return rv;
+}
+
+/*
+ * The 06 §2 reason a release names, as a cilium-srv6-punt error counter.
+ * `06` §1 forbids an unclassified drop counter, so every release is charged
+ * to exactly one reason and the mapping is the wire's (02 §5.6.3, the subset
+ * of 06 §2 that pkg/srv6ec/compiler/reason.go can produce).
+ */
+static u32
+csp_release_error_index (u8 drop_reason)
+{
+  switch (drop_reason)
+    {
+    case CILIUM_SRV6_IF3_DROP_POLICY_DENIED:
+      return CILIUM_SRV6_PUNT_ERROR_RELEASE_POLICY_DENIED;
+    case CILIUM_SRV6_IF3_DROP_SLOWPATH_OVERFLOW:
+      return CILIUM_SRV6_PUNT_ERROR_RELEASE_SLOWPATH_OVERFLOW;
+    case CILIUM_SRV6_IF3_DROP_NO_REMOTE_ENDPOINT:
+      return CILIUM_SRV6_PUNT_ERROR_RELEASE_NO_REMOTE_ENDPOINT;
+    case CILIUM_SRV6_IF3_DROP_IDENTITY_UNRESOLVED:
+      return CILIUM_SRV6_PUNT_ERROR_RELEASE_IDENTITY_UNRESOLVED;
+    default:
+      return CILIUM_SRV6_PUNT_ERROR_RELEASE_FRAGMENT_UNRESOLVED;
+    }
+}
+
+/*
+ * 02 §5.6.3 / 00 §2.18.6: the agent DENYed the punt, so the token — and with
+ * it the D-42 quota slot it holds — comes back immediately with a 06 §2 drop
+ * reason instead of at the punt token timeout. Without this path a burst of
+ * DENY starves the slow path of tenants that are behaving correctly, because
+ * every DENYed punt holds its slot for the full timeout.
+ *
+ * There is no packet to drop here: cilium-srv6-punt freed the buffer when the
+ * transport accepted the frame. What the drop reason attributes is the
+ * datagram the agent decided about, which is why it is counted on the
+ * cilium-srv6-punt node rather than being invented as a new counter space.
+ *
+ * An unknown or already consumed token changes no dataplane state: it is
+ * counted by the caller and refused here.
+ */
+int
+cilium_srv6_punt_release (const u8 *token, u8 drop_reason)
+{
+  cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+  vlib_main_t *vm = vlib_get_main ();
+  cilium_srv6_punt_token_t t;
+  int rv;
+
+  if (!hm->initialised)
+    return VNET_API_ERROR_INIT_FAILED;
+
+  if (drop_reason == CILIUM_SRV6_IF3_DROP_NONE || drop_reason >= CILIUM_SRV6_IF3_N_DROP_REASON)
+    return VNET_API_ERROR_INVALID_VALUE_2;
+
+  rv = csp_token_redeem (hm, token, &t);
+  if (rv != 0)
+    return rv;
+
+  hm->punt_q[t.queue].n_released++;
+
+  vlib_node_increment_counter (vm, cilium_srv6_punt_node.index,
+			       csp_release_error_index (drop_reason), 1);
+
+  return 0;
 }
 
 /*
@@ -427,7 +639,7 @@ done:
  * means cilium-srv6-classify can treat the marking as dataplane-issued.
  */
 int
-cilium_srv6_punt_reinject (u64 token, u64 punt_id, const u8 *data, u32 len)
+cilium_srv6_punt_reinject (const u8 *token, u64 punt_id, const u8 *data, u32 len)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   const cilium_srv6_main_t *cm = &cilium_srv6_main;
@@ -569,6 +781,61 @@ cilium_srv6_punt_expire_tokens (vlib_main_t *vm, f64 now)
 /* init                                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Seed the token generator.
+ *
+ * clib_random_buffer_init() derives both ISAAC contexts from a single uword,
+ * which would put the whole token stream behind 64 bits of seed. The contexts
+ * are seeded here directly instead, with 2 x ISAAC_SIZE words read from
+ * /dev/urandom, so the state is drawn at full width and no part of it is a
+ * function of a value an observer could reconstruct.
+ *
+ * The fallback mixes the cycle counter, the wall clock and the process
+ * identity. It is not unpredictable and is logged as a deployment fault, the
+ * same way csg_draw_instance_id() reports it: a VPP container in which
+ * /dev/urandom is unreadable is worth seeing. It is not a correctness
+ * failure, because unpredictability is defence in depth here — the reinject
+ * is authenticated by the D-27 socket's peer credentials, and D-76 §2.18.4
+ * says so explicitly.
+ */
+static void
+csp_rng_init (cilium_srv6_headend_main_t *hm)
+{
+  uword seed[2][ISAAC_SIZE];
+  FILE *f = fopen ("/dev/urandom", "rb");
+  int have_entropy = 0;
+  uword i, j;
+
+  if (f != NULL)
+    {
+      size_t n = fread (seed, 1, sizeof (seed), f);
+      fclose (f);
+      have_entropy = (n == sizeof (seed));
+    }
+
+  if (!have_entropy)
+    {
+      u64 mix[2];
+
+      mix[0] = clib_cpu_time_now () ^ (u64) unix_time_now_nsec ();
+      mix[1] = ((u64) getpid () << 32) ^ (u64) (uword) hm;
+      for (i = 0; i < ARRAY_LEN (seed); i++)
+	for (j = 0; j < ISAAC_SIZE; j++)
+	  seed[i][j] = (uword) (mix[i] + j * 0x9e3779b97f4a7c15ULL);
+
+      CSP_LOG_ERR ("could not read /dev/urandom: IF-3 punt tokens are seeded "
+		   "from local clock and process state instead. They stay "
+		   "one-shot and lifetime-bounded, but they are predictable to "
+		   "an observer who can reconstruct that state");
+    }
+
+  clib_memset (&hm->punt_rng, 0, sizeof (hm->punt_rng));
+  for (i = 0; i < ARRAY_LEN (hm->punt_rng.ctx); i++)
+    isaac_init (&hm->punt_rng.ctx[i], seed[i]);
+
+  clib_memset (seed, 0, sizeof (seed));
+}
+
 void
 cilium_srv6_punt_init (vlib_main_t *vm)
 {
@@ -588,4 +855,15 @@ cilium_srv6_punt_init (vlib_main_t *vm)
 
   hm->punt_owner_count = hash_create (0, sizeof (uword));
   hm->punt_identity_count = hash_create (0, sizeof (uword));
+  /*
+   * D-76 §2.18.4: the token -> slot map. The key is the 16 token bytes, and
+   * the memory those bytes live in is the token slot itself, which is stable
+   * because the pool is fixed size (pool_init_fixed above never reallocates).
+   * hash_set_mem stores the pointer rather than a copy, so the entry has to
+   * be removed while the bytes still hold the value it was inserted under —
+   * which is what csp_token_release() does, before wiping them.
+   */
+  hm->punt_token_index = hash_create_mem (0, CILIUM_SRV6_IF3_TOKEN_LEN, sizeof (uword));
+
+  csp_rng_init (hm);
 }

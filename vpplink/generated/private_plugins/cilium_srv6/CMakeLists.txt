@@ -26,6 +26,7 @@ add_vpp_plugin(cilium_srv6
   cilium_srv6_headend.c
   cilium_srv6_ct.c
   cilium_srv6_punt.c
+  cilium_srv6_punt_transport.c
   cilium_srv6_classify_node.c
   cilium_srv6_ct_node.c
   cilium_srv6_program_node.c
@@ -63,6 +64,7 @@ add_vpp_plugin(cilium_srv6
   cilium_srv6_parse.h
   cilium_srv6_gparse.h
   cilium_srv6_hparse.h
+  cilium_srv6_punt_wire.h
   cilium_srv6_pmtud.h
   cilium_srv6_pmtud_parse.h
   cilium_srv6_counters.h

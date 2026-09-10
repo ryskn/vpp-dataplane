@@ -59,6 +59,13 @@ features:
     (policy revision split per source identity), PolicyLeaseTable lease
     enforcement, separate ALLOW and negative budgets, and hierarchical owner
     to identity fair eviction"
+  - "Per-key dependency revision namespaces (D-83): ENDPOINT keyed by
+    destination address, PATH keyed by PathCache index and POLICY keyed by
+    security identity, each published by its own typed message so that a key
+    type is never inferred from a discriminator. There is no node-global
+    revision: an endpoint or path change stales the entries that depend on
+    that key and nothing else, and an install whose quoted key does not exist
+    is refused rather than defaulted"
   - "PolicyLeaseTable: one slot per identity holding the published policy
     revision together with the lease granted for it, so that renewing every
     lease on the node is one message proportional to the number of
@@ -79,9 +86,19 @@ features:
     encapsulation with an optional pre-validated SRH, and an inner MTU check
     against min(base MTU, learned MTU) with a hook for ICMPv6 PTB generation"
   - "cilium-srv6-punt: bounded slow path queues (compile, reply
-    re-authorisation, fragment) with hierarchical owner to identity quotas, a
-    one-shot reinject token bound to the receiving interface lifetime, and a
-    pluggable IF-3 transport"
+    re-authorisation, fragment) with hierarchical owner to identity quotas and
+    a one-shot 16-byte reinject capability bound to the receiving interface
+    lifetime, whose value encodes nothing and dies with the plugin instance"
+  - "IF-3 punt transport: worker threads only copy a big-endian wire frame
+    into a queue bounded by both an entry count and a byte budget, and a
+    single owner on the main thread connects to the agent's Unix socket,
+    writes, reads reinject and release frames, and reconnects with backoff. A
+    frame whose write was interrupted is never resent — its token is released
+    locally and the packet dropped — because IF-3 carries no acknowledgement
+    and a resend would risk reinjecting the same packet twice. A violation of
+    the framing closes the connection; a field that is out of range or
+    contradicts another drops one frame and leaves the stream up, so that a
+    single odd frame cannot disable the node's slow path"
   - "Path MTU discovery in both directions: a throttled ICMPv6 Packet Too Big
     towards the source Pod when the inner packet exceeds min(base MTU,
     learned MTU), quoting at most 1232 bytes, and cilium-srv6-ptb, which

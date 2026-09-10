@@ -165,6 +165,15 @@ static const u8 encap_reasons[CILIUM_SRV6_ENCAP_N_ERROR] = {
 static const u8 punt_reasons[CILIUM_SRV6_PUNT_N_ERROR] = {
   [CILIUM_SRV6_PUNT_ERROR_SLOWPATH_OVERFLOW] = CILIUM_SRV6_DROP_SLOWPATH_OVERFLOW,
   [CILIUM_SRV6_PUNT_ERROR_PUNTED] = CILIUM_SRV6_DROP_NOT_A_DROP,
+  /* 02 §5.6.3: the agent answered the punt with opRelease instead of a
+     reinject, and the reason it named is the 06 §2 reason of the packet that
+     was punted. The buffer is already freed, so the drop is attributed here
+     rather than by a graph node. */
+  [CILIUM_SRV6_PUNT_ERROR_RELEASE_POLICY_DENIED] = CILIUM_SRV6_DROP_POLICY_DENIED,
+  [CILIUM_SRV6_PUNT_ERROR_RELEASE_SLOWPATH_OVERFLOW] = CILIUM_SRV6_DROP_SLOWPATH_OVERFLOW,
+  [CILIUM_SRV6_PUNT_ERROR_RELEASE_NO_REMOTE_ENDPOINT] = CILIUM_SRV6_DROP_NO_REMOTE_ENDPOINT,
+  [CILIUM_SRV6_PUNT_ERROR_RELEASE_IDENTITY_UNRESOLVED] = CILIUM_SRV6_DROP_IDENTITY_UNRESOLVED,
+  [CILIUM_SRV6_PUNT_ERROR_RELEASE_FRAGMENT_UNRESOLVED] = CILIUM_SRV6_DROP_FRAGMENT_UNRESOLVED,
 };
 
 /* cilium-srv6-ptb (02 §9, D-36). None of these is a drop: the node

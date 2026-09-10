@@ -180,7 +180,8 @@ cilium_srv6_program_one (const cilium_srv6_headend_main_t *hm, vlib_buffer_t *b,
    * compared, and the policy one is the slot of *this* src identity.
    */
   if (PREDICT_FALSE (!cilium_srv6_revisions_match (hm, e->policy_rev_slot, e->policy_revision,
-						   e->endpoint_revision, e->path_revision)))
+						   e->endpoint_rev_slot, e->endpoint_revision,
+						   e->path_cache_index, e->path_revision)))
     return CILIUM_SRV6_PROGRAM_PUNT_STALE;
 
   /*
@@ -385,8 +386,13 @@ VLIB_NODE_FN (cilium_srv6_program_node)
 	  t->path_cache_index = ~0;
 	  t->verdict = vd[0];
 	  t->current_policy_revision = cilium_srv6_policy_revision (hm, meta->policy_rev_slot);
-	  t->current_endpoint_revision = hm->endpoint_revision;
-	  t->current_path_revision = hm->path_revision;
+	  /* D-83: the "current" value of a dependency is the one of *its key*,
+	     and the entry is what names the key, so both are only known once
+	     the entry has been resolved below. Until then they read as the
+	     sentinel, which is also the honest answer for a miss: there is no
+	     entry, so there is no key. */
+	  t->current_endpoint_revision = CILIUM_SRV6_REV_INVALID;
+	  t->current_path_revision = CILIUM_SRV6_REV_INVALID;
 
 	  if (b[0]->current_length >= sizeof (ip6_header_t))
 	    t->dst = ((const ip6_header_t *) vlib_buffer_get_current (b[0]))->dst_address;
@@ -397,6 +403,11 @@ VLIB_NODE_FN (cilium_srv6_program_node)
 	      t->policy_revision = e->policy_revision;
 	      t->endpoint_revision = e->endpoint_revision;
 	      t->path_revision = e->path_revision;
+	      t->current_endpoint_revision =
+		cilium_srv6_endpoint_revision (hm, e->endpoint_rev_slot);
+	      t->current_path_revision = (e->path_revision == CILIUM_SRV6_REV_ABSENT) ?
+					   CILIUM_SRV6_REV_ABSENT :
+					   cilium_srv6_path_revision (hm, e->path_cache_index);
 	      t->path_cache_index = e->path_cache_index;
 	      t->path_generation = e->path_generation;
 	      t->lease_remaining = cilium_srv6_policy_lease_remaining (

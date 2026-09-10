@@ -234,8 +234,6 @@ cilium_srv6_encap_one (vlib_main_t *vm, const cilium_srv6_headend_main_t *hm, u3
       q.local_context_id = meta->local_context_id;
       q.owner_quota_class = meta->owner_quota_class;
       q.policy_revision = cilium_srv6_policy_revision (hm, meta->policy_rev_slot);
-      q.endpoint_revision = hm->endpoint_revision;
-      q.path_revision = hm->path_revision;
       q.now = now;
 
       ct_hook (vm, thread_index, b, &q);

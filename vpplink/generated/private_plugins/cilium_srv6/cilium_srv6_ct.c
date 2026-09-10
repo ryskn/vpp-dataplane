@@ -912,7 +912,7 @@ cilium_srv6_ct_verify (const ip6_address_t *src, const ip6_address_t *dst, u8 pr
    * D-30 scopes the revision to the source identity of the authorised
    * direction, which for a reply is the peer. The slot of that identity is
    * created if the node does not have one yet and is then retained, exactly
-   * as srv6_revision_publish retains the slots it creates; conntrack takes no
+   * as srv6_policy_revision_publish retains the slots it creates; conntrack takes no
    * per-entry reference, so nothing here has to release one from a worker.
    * The entry stores the peer identity alongside the slot, so a slot that is
    * later reused for a different identity fails the comparison instead of

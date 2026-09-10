@@ -527,6 +527,11 @@ vl_api_srv6_endcilium_status_get_t_handler (vl_api_srv6_endcilium_status_get_t *
 
 /* 00 §4.1: every count is bounded before it is used. */
 #define CILIUM_SRV6_API_MAX_POLICY_REVISIONS 1024
+/* Same bound for the other two D-83 namespaces. A publish that does not fit
+   is split by the agent; the bound is what keeps one message's stack use and
+   its barrier section bounded. */
+#define CILIUM_SRV6_API_MAX_ENDPOINT_REVISIONS 1024
+#define CILIUM_SRV6_API_MAX_PATH_REVISIONS     1024
 
 static int
 cilium_srv6_verdict_decode (vl_api_srv6_program_verdict_t in, u8 *out)
@@ -850,8 +855,9 @@ send_srv6_program_details (u32 index, const cilium_srv6_program_t *e, f64 now,
   dst.as_u64[0] = e->key[0];
   dst.as_u64[1] = e->key[1];
 
-  stale = !cilium_srv6_revisions_match (hm, e->policy_rev_slot, e->policy_revision,
-					e->endpoint_revision, e->path_revision);
+  stale =
+    !cilium_srv6_revisions_match (hm, e->policy_rev_slot, e->policy_revision, e->endpoint_rev_slot,
+				  e->endpoint_revision, e->path_cache_index, e->path_revision);
 
   /* D-51: the lease of the entry's dependency pair, read from the
      PolicyLeaseTable rather than from the entry. */
@@ -916,10 +922,15 @@ vl_api_srv6_program_dump_t_handler (vl_api_srv6_program_dump_t *mp)
     }
 }
 
+/*
+ * D-83: one handler per revision namespace. The key type is explicit on the
+ * wire, so no handler has to disambiguate a union, and each one applies its
+ * whole message or none of it.
+ */
 static void
-vl_api_srv6_revision_publish_t_handler (vl_api_srv6_revision_publish_t *mp)
+vl_api_srv6_policy_revision_publish_t_handler (vl_api_srv6_policy_revision_publish_t *mp)
 {
-  vl_api_srv6_revision_publish_reply_t *rmp;
+  vl_api_srv6_policy_revision_publish_reply_t *rmp;
   u32 identities[CILIUM_SRV6_API_MAX_POLICY_REVISIONS];
   u64 revisions[CILIUM_SRV6_API_MAX_POLICY_REVISIONS];
   u32 i, n;
@@ -940,11 +951,68 @@ vl_api_srv6_revision_publish_t_handler (vl_api_srv6_revision_publish_t *mp)
       revisions[i] = mp->policy[i].revision;
     }
 
-  rv = cilium_srv6_revision_publish (identities, revisions, n, mp->endpoint_revision,
-				     mp->path_revision);
+  rv = cilium_srv6_policy_revision_publish (identities, revisions, n);
 
 reply:
-  REPLY_MACRO_END (VL_API_SRV6_REVISION_PUBLISH_REPLY);
+  REPLY_MACRO_END (VL_API_SRV6_POLICY_REVISION_PUBLISH_REPLY);
+}
+
+static void
+vl_api_srv6_endpoint_revision_publish_t_handler (vl_api_srv6_endpoint_revision_publish_t *mp)
+{
+  vl_api_srv6_endpoint_revision_publish_reply_t *rmp;
+  ip6_address_t dsts[CILIUM_SRV6_API_MAX_ENDPOINT_REVISIONS];
+  u64 revisions[CILIUM_SRV6_API_MAX_ENDPOINT_REVISIONS];
+  u32 i, n;
+  int rv;
+
+  if (mp->n_endpoint > CILIUM_SRV6_API_MAX_ENDPOINT_REVISIONS)
+    {
+      rv = VNET_API_ERROR_LIMIT_EXCEEDED;
+      goto reply;
+    }
+
+  n = mp->n_endpoint;
+
+  for (i = 0; i < n; i++)
+    {
+      ip6_address_decode (mp->endpoint[i].dst, &dsts[i]);
+      revisions[i] = mp->endpoint[i].revision;
+    }
+
+  rv = cilium_srv6_endpoint_revision_publish (dsts, revisions, n);
+
+reply:
+  REPLY_MACRO_END (VL_API_SRV6_ENDPOINT_REVISION_PUBLISH_REPLY);
+}
+
+static void
+vl_api_srv6_path_revision_publish_t_handler (vl_api_srv6_path_revision_publish_t *mp)
+{
+  vl_api_srv6_path_revision_publish_reply_t *rmp;
+  u32 indices[CILIUM_SRV6_API_MAX_PATH_REVISIONS];
+  u64 revisions[CILIUM_SRV6_API_MAX_PATH_REVISIONS];
+  u32 i, n;
+  int rv;
+
+  if (mp->n_path > CILIUM_SRV6_API_MAX_PATH_REVISIONS)
+    {
+      rv = VNET_API_ERROR_LIMIT_EXCEEDED;
+      goto reply;
+    }
+
+  n = mp->n_path;
+
+  for (i = 0; i < n; i++)
+    {
+      indices[i] = mp->path[i].path_index;
+      revisions[i] = mp->path[i].revision;
+    }
+
+  rv = cilium_srv6_path_revision_publish (indices, revisions, n);
+
+reply:
+  REPLY_MACRO_END (VL_API_SRV6_PATH_REVISION_PUBLISH_REPLY);
 }
 
 static void
@@ -958,7 +1026,7 @@ vl_api_srv6_lease_extend_t_handler (vl_api_srv6_lease_extend_t *mp)
   int rv;
 
   /* 00 §4.1: the declared count is validated before it is used. Same bound as
-     srv6_revision_publish: both carry a (identity, revision) vector. */
+     srv6_policy_revision_publish: both carry a (identity, revision) vector. */
   if (mp->n_policy > CILIUM_SRV6_API_MAX_POLICY_REVISIONS)
     {
       rv = VNET_API_ERROR_LIMIT_EXCEEDED;
@@ -1036,7 +1104,9 @@ vl_api_srv6_headend_status_get_t_handler (vl_api_srv6_headend_status_get_t *mp)
 {
   const cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   vl_api_srv6_headend_status_get_reply_t *rmp;
+  cilium_srv6_punt_transport_stats_t tp;
   u32 n_local = 0;
+  u32 n_path_revisions = 0;
   u32 i;
   int rv = 0;
 
@@ -1046,6 +1116,13 @@ vl_api_srv6_headend_status_get_t_handler (vl_api_srv6_headend_status_get_t *mp)
   for (i = 0; i < vec_len (hm->local_eps); i++)
     if (hm->local_eps[i].valid)
       n_local++;
+
+  /* D-83 PATH keys are dense by PathCache index, so the count is a scan of
+     the array rather than a pool occupancy. It is a status message, read at
+     the metrics scrape interval, not per packet. */
+  for (i = 0; i < vec_len (hm->path_revs); i++)
+    if (hm->path_revs[i] != CILIUM_SRV6_REV_ABSENT)
+      n_path_revisions++;
 
   REPLY_MACRO2_END (
     VL_API_SRV6_HEADEND_STATUS_GET_REPLY, ({
@@ -1069,19 +1146,27 @@ vl_api_srv6_headend_status_get_t_handler (vl_api_srv6_headend_status_get_t *mp)
       rmp->frag_capacity = hm->frag_capacity;
       rmp->n_frags = hm->n_frags;
       rmp->n_local_endpoints = n_local;
-      rmp->endpoint_revision = hm->endpoint_revision;
-      rmp->path_revision = hm->path_revision;
+      /* D-83: per-namespace key counts. Slot 0 of the ENDPOINT table is the
+	 permanent sentinel and is not a published key, exactly as in the
+	 POLICY table. */
+      rmp->n_endpoint_revisions = hm->initialised ? (u32) pool_elts (hm->endpoint_rev) - 1 : 0;
+      rmp->n_path_revisions = n_path_revisions;
+      rmp->n_policy_revisions = hm->initialised ? (u32) pool_elts (hm->policy_rev) - 1 : 0;
       rmp->program_installs = hm->n_program_installs;
       rmp->program_deletes = hm->n_program_deletes;
       rmp->program_quota_drops = hm->n_program_quota_drops;
       rmp->program_fair_evictions = hm->n_program_fair_evictions;
       rmp->program_stale_installs = hm->n_program_stale_installs;
+      rmp->program_missing_key_installs = hm->n_program_missing_key_installs;
       rmp->lease_extends = hm->n_lease_extends;
       rmp->revision_publishes = hm->n_revision_publishes;
       rmp->frag_evictions = hm->n_frag_evictions;
       rmp->frag_quota_drops = hm->n_frag_quota_drops;
       rmp->frag_gc = hm->n_frag_gc;
       rmp->punt_no_transport = 0;
+      rmp->punt_queue_full = 0;
+      rmp->punt_write_failed = 0;
+      rmp->punt_released = 0;
       rmp->punt_reinjected = 0;
       rmp->punt_reinject_rejected = 0;
 
@@ -1091,13 +1176,47 @@ vl_api_srv6_headend_status_get_t_handler (vl_api_srv6_headend_status_get_t *mp)
 
 	  rmp->punt_outstanding[qi] = q->n_outstanding;
 	  rmp->punt_punted[qi] = q->n_punted;
-	  rmp->punt_drops[qi] =
-	    q->n_drop_global + q->n_drop_owner + q->n_drop_identity + q->n_drop_no_token +
-	    q->n_drop_no_transport;
+	  /* slowpath_drops_total: every refusal reason of this queue summed.
+	     The split is in the CLI and, for the two transport ones, in the
+	     dedicated fields below. */
+	  rmp->punt_drops[qi] = q->n_drop_global + q->n_drop_owner + q->n_drop_identity +
+				q->n_drop_no_token + q->n_drop_no_transport + q->n_drop_ring_full +
+				q->n_drop_write_failed;
 	  rmp->punt_no_transport += q->n_drop_no_transport;
+	  rmp->punt_queue_full += q->n_drop_ring_full;
+	  rmp->punt_write_failed += q->n_drop_write_failed;
+	  rmp->punt_released += q->n_released;
 	  rmp->punt_reinjected += q->n_reinjected;
 	  rmp->punt_reinject_rejected += q->n_reinject_rejected;
 	}
+
+      /*
+       * 02 §5.6.9 / 06 §3. The two rejection totals stay separate series
+       * because they are not two outcomes of one event: one keeps the
+       * connection and the other ends it, and summing them hides the quantity
+       * an operator actually needs (how often IF-3 was torn down).
+       */
+      cilium_srv6_punt_transport_stats (&tp);
+
+      rmp->if3_socket_configured = tp.configured ? true : false;
+      rmp->if3_connected = tp.connected ? true : false;
+      rmp->if3_connects = tp.n_connects;
+      rmp->if3_disconnects = tp.n_disconnects;
+      rmp->if3_frames_sent = tp.n_frames_sent;
+      rmp->if3_bytes_sent = tp.n_bytes_sent;
+      rmp->if3_frames_received = tp.n_frames_received;
+      rmp->if3_message_rejections = tp.n_rejections[CILIUM_SRV6_IF3_ERR_VERSION] +
+				    tp.n_rejections[CILIUM_SRV6_IF3_ERR_OPCODE] +
+				    tp.n_rejections[CILIUM_SRV6_IF3_ERR_LENGTH] +
+				    tp.n_rejections[CILIUM_SRV6_IF3_ERR_TRUNCATED];
+      rmp->if3_frame_drops =
+	tp.n_rejections[CILIUM_SRV6_IF3_ERR_FIELD] + tp.n_rejections[CILIUM_SRV6_IF3_ERR_TOKEN];
+      rmp->if3_unusable_token = tp.n_unknown_token;
+      rmp->if3_encode_refused = tp.n_encode_refused;
+      rmp->if3_queue_entries = tp.queue_entries;
+      rmp->if3_queue_bytes = tp.queue_bytes;
+      rmp->if3_queue_byte_cap = tp.queue_byte_cap;
+      rmp->if3_queue_high_water_bytes = tp.queue_high_water_bytes;
 
       rmp->conntrack_registered = (cilium_srv6_ct_lookup_hook != 0) ? true : false;
       rmp->punt_transport_registered = cilium_srv6_punt_transport_registered () ? true : false;

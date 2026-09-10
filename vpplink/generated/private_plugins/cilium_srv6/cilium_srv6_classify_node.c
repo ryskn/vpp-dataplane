@@ -153,6 +153,20 @@
 #include <cilium_srv6/cilium_srv6_hparse.h>
 #include <cilium_srv6/cilium_srv6.api_enum.h>
 
+/*
+ * The fragment classification this node records is also an IF-3 wire value
+ * (`02` §5.6.5, D-76 §2.18.5): the punt frame reports what the bounded parser
+ * found, and the validity of `fragment_id` / `frag_next_header` follows from
+ * it. Asserting the equivalence here — in the file that produces the value,
+ * and the one that includes the parser header — makes a renumbering of either
+ * enum a build failure instead of a wrong byte on the wire.
+ */
+STATIC_ASSERT ((int) CILIUM_SRV6_FRAG_NONE == CILIUM_SRV6_IF3_FRAG_NONE &&
+		 (int) CILIUM_SRV6_FRAG_ATOMIC == CILIUM_SRV6_IF3_FRAG_ATOMIC &&
+		 (int) CILIUM_SRV6_FRAG_FIRST == CILIUM_SRV6_IF3_FRAG_FIRST &&
+		 (int) CILIUM_SRV6_FRAG_NON_FIRST == CILIUM_SRV6_IF3_FRAG_NON_FIRST,
+	       "the parser's fragment classification no longer matches the 02 §5.6.5 enum");
+
 typedef enum
 {
   CILIUM_SRV6_CLASSIFY_NEXT_DROP,
@@ -292,7 +306,8 @@ cilium_srv6_frag_entry_usable (const cilium_srv6_headend_main_t *hm,
     return 0;
 
   if (PREDICT_FALSE (!cilium_srv6_revisions_match (hm, f->policy_rev_slot, f->policy_revision,
-						   f->endpoint_revision, f->path_revision)))
+						   f->endpoint_rev_slot, f->endpoint_revision,
+						   f->path_cache_index, f->path_revision)))
     return 0;
 
   return 1;
@@ -598,8 +613,24 @@ cilium_srv6_classify_one (vlib_main_t *vm, const cilium_srv6_headend_main_t *hm,
        */
       break;
 
+    case CILIUM_SRV6_FRAG_ATOMIC:
+      /*
+       * 01 §3.1: an atomic fragment is evaluated as an ordinary packet — no
+       * FragmentVerdictCache entry, no D-43 re-reception rule — so nothing
+       * about *forwarding* changes here.
+       *
+       * The flag is recorded because the IF-3 punt frame reports what the
+       * parser found (02 §5.6.5, D-76 §2.18.2). Without it a punt of this
+       * packet would say frag_kind = NONE while carrying the Fragment
+       * header's Identification and Next Header, which is a frame that
+       * contradicts itself, and the agent drops such a frame as a field
+       * violation — so every atomically fragmented flow would punt for ever.
+       */
+      meta->flags |= CILIUM_SRV6_META_F_FRAG_ATOMIC;
+      break;
+
     default:
-      /* 01 §3.1: an atomic fragment is evaluated as an ordinary packet. */
+      /* No Fragment header. */
       break;
     }
 

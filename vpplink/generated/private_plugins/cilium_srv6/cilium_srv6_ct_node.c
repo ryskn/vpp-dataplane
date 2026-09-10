@@ -141,8 +141,6 @@ VLIB_NODE_FN (cilium_srv6_ct_node)
 	  q.local_context_id = meta->local_context_id;
 	  q.owner_quota_class = meta->owner_quota_class;
 	  q.policy_revision = cilium_srv6_policy_revision (hm, meta->policy_rev_slot);
-	  q.endpoint_revision = hm->endpoint_revision;
-	  q.path_revision = hm->path_revision;
 	  q.now = now;
 
 	  res.path_cache_index = ~0;
