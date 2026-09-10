@@ -45,16 +45,10 @@ func (d *dummy) Attrs() *netlink.LinkAttrs {
 	return &netlink.LinkAttrs{Name: d.name}
 }
 
-func NewMemifPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *MemifPodInterfaceDriver {
-	i := &MemifPodInterfaceDriver{
-		PodInterfaceDriverData: PodInterfaceDriverData{
-			snatPolicy: requireSNATPolicy(snatPolicy, "memif"),
-		},
+func NewMemifPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy, profile PodInterfaceProfile) *MemifPodInterfaceDriver {
+	return &MemifPodInterfaceDriver{
+		PodInterfaceDriverData: newPodInterfaceDriverData(vpp, log, snatPolicy, profile, "memif"),
 	}
-	i.vpp = vpp
-	i.log = log
-	i.Name = "memif"
-	return i
 }
 
 func (i *MemifPodInterfaceDriver) CreateInterface(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack, doHostSideConf bool) (err error) {

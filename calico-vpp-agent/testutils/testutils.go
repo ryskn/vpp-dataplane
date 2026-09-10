@@ -243,7 +243,7 @@ func InterfaceTagForLocalTunTunnel(interfaceName, netns string) string {
 
 // InterfaceTagForLocalMemifTunnel constructs the tag for the VPP side of the memif tunnel the same way as cni server
 func InterfaceTagForLocalMemifTunnel(interfaceName, netns string) string {
-	return InterfaceTagForLocalTunnel(podinterface.NewMemifPodInterfaceDriver(nil, nil, common.NoSNATPolicy{}).Name,
+	return InterfaceTagForLocalTunnel(podinterface.NewMemifPodInterfaceDriver(nil, nil, common.NoSNATPolicy{}, podinterface.CalicoProfile).Name,
 		interfaceName, netns)
 }
 

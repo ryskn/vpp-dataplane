@@ -54,8 +54,6 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/config"
 )
 
-const componentPodInterfaceLifecycle = "podinterface-lifecycle"
-
 var (
 	t   tomb.Tomb
 	log *logrus.Logger
@@ -84,9 +82,14 @@ func main() {
 		log.Fatalf("Error writing pidfile: %v", err)
 	}
 
+	// This entrypoint has three components and no more: VPP, vpp-manager and
+	// the lifecycle service itself. Felix and the Calico agent are not started
+	// here and never will be, so requiring them would keep /readiness at 503
+	// for a service that works (errata #34 item 128).
 	healthServer := health.NewHealthServer(
 		log.WithFields(logrus.Fields{"component": "health"}),
 		*config.GetCalicoVppInitialConfig().HealthCheckPort,
+		health.PodInterfaceLifecycleComponents(),
 	)
 	goRun(healthServer.ServeHealth)
 
@@ -111,7 +114,7 @@ func main() {
 	// vpp is both the dataplane and the IF-4 binding writer: the component that
 	// creates the interface is the one that publishes its binding (D-71).
 	lifecycleServer := cni.NewLifecycleServer(vpp, vpp,
-		log.WithFields(logrus.Fields{"component": componentPodInterfaceLifecycle}))
+		log.WithFields(logrus.Fields{"component": health.ComponentPodInterfaceLifecycle}))
 
 	goRun(lifecycleServer.ServeLifecycle)
 
@@ -131,14 +134,14 @@ func main() {
 				switch {
 				case reason != "" && ready:
 					ready = false
-					healthServer.SetComponentStatus(componentPodInterfaceLifecycle, false, reason)
+					healthServer.SetComponentStatus(health.ComponentPodInterfaceLifecycle, false, reason)
 					healthServer.MarkAsUnhealthy(reason)
 				case reason != "" && !ready:
-					healthServer.SetComponentStatus(componentPodInterfaceLifecycle, false, reason)
+					healthServer.SetComponentStatus(health.ComponentPodInterfaceLifecycle, false, reason)
 					healthServer.MarkAsUnhealthy(reason)
 				case reason == "" && !ready:
 					ready = true
-					healthServer.SetComponentStatus(componentPodInterfaceLifecycle, true,
+					healthServer.SetComponentStatus(health.ComponentPodInterfaceLifecycle, true,
 						"pod interface lifecycle service ready")
 					healthServer.MarkAsHealthy("pod interface lifecycle service ready")
 				}

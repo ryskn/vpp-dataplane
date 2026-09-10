@@ -360,11 +360,18 @@ spec:
           resources:
             requests:
               cpu: 100m
-          # Readiness follows the durable lifecycle state: a state file whose
-          # exact ownership cannot be recovered leaves the service unready and
-          # requires an explicit dataplane reset (Issue #135 ruling 4). Do not
-          # add a liveness probe on the same condition — restarting the process
-          # does not recover an incompatible state, it only hides it.
+          # /readiness answers 200 once VPP, vpp-manager and the lifecycle
+          # service itself have reported initialized. Felix and the Calico agent
+          # are not in that required set (health.PodInterfaceLifecycleComponents):
+          # this entrypoint never starts them, so requiring them kept the probe
+          # at 503 for a working service (errata #34 item 128).
+          #
+          # Beyond that, readiness follows the durable lifecycle state: a state
+          # file whose exact ownership cannot be recovered leaves the service
+          # unready and requires an explicit dataplane reset (Issue #135
+          # ruling 4). Do not add a liveness probe on the same condition —
+          # restarting the process does not recover an incompatible state, it
+          # only hides it.
           startupProbe:
             failureThreshold: 30
             httpGet:

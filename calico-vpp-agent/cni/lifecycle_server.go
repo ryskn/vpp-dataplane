@@ -74,10 +74,15 @@ func NewLifecycleServer(vpp *vpplink.VppLink, ifBinding IfBindingWriter, log *lo
 		dsrVIPs:         make(map[string]*dsrVIPState),
 		dsrDesired:      make(map[string]*common.DSRService),
 
+		// Every driver is built for the lifecycle profile, not the tun
+		// driver alone: the loopback and memif drivers apply the same CNAT
+		// configuration, and this profile programs none of it. Calico's CNAT
+		// is not deployed here at all — Cilium owns NAT, policy and services
+		// (Issue #135 ruling 3).
 		tuntapDriver:   podinterface.NewTunTapPodInterfaceDriver(vpp, log, snatPolicy, podinterface.LifecycleProfile),
-		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, snatPolicy),
-		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, snatPolicy),
-		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, snatPolicy),
+		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, snatPolicy, podinterface.LifecycleProfile),
+		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, snatPolicy, podinterface.LifecycleProfile),
+		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, snatPolicy, podinterface.LifecycleProfile),
 
 		cniEventChan:         make(chan common.CalicoVppEvent, common.ChanSize),
 		cniMultinetEventChan: make(chan common.CalicoVppEvent, common.ChanSize),

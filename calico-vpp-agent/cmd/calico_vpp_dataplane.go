@@ -103,6 +103,7 @@ func main() {
 	healthServer := health.NewHealthServer(
 		log.WithFields(logrus.Fields{"component": "health"}),
 		*config.GetCalicoVppInitialConfig().HealthCheckPort,
+		health.CalicoAgentComponents(),
 	)
 	Go(healthServer.ServeHealth)
 

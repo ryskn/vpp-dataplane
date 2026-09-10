@@ -66,6 +66,62 @@ reaches the Felix configuration barrier and never constructs the Calico v3
 client, the BGP server, the Felix server, the connectivity/routing/service
 servers, the watchers, or multinet.
 
+### 2.1 What the lifecycle service programs, and what it does not
+
+The pod interface drivers are shared with the Calico CNI backend, but the
+*policy* — which steps run, in which order, and which subsystems are touched —
+is chosen once, when the server is built, by `podinterface.LifecycleProfile`
+against `podinterface.CalicoProfile`. Nothing is inferred at run time from the
+pod spec or the interface name.
+
+On a `CreatePodInterface`, in this order (Issue #135 ruling 8):
+
+| step | side |
+|---|---|
+| per-pod IPv4/IPv6 VRFs, with their default route via the pod VRF | VPP |
+| the per-pod loopback, in those VRFs, carrying the container addresses | VPP |
+| the TUN, in those VRFs: MTU, admin up, rx mode, unnumbered to the loopback | VPP |
+| `accept_ra=0`, `addr_gen_mode=none` (L3 only), addresses (`/128`), device routes, MTU, forwarding sysctls | Pod netns |
+| the `/128` route to the TUN inside the pod VRF | VPP |
+| strict uRPF: the RPF VRF, its routes, and the uRPF binding on the TUN | VPP |
+| the IF-4 `(attachment_id, sw_if_index, if_incarnation)` binding | `cilium_srv6` |
+
+Only then does the RPC reply — the publication barrier of D-71. Any failure
+above rolls the whole thing back through the cleanup stack and fails the CNI
+ADD; a Pod-side sysctl or a device route that cannot be installed is a failure,
+not a warning.
+
+What it deliberately does **not** program, because Cilium owns NAT, policy and
+services in this profile and Calico's CNAT is not deployed at all:
+
+| not programmed | why |
+|---|---|
+| `cnat_snat_policy_add_del_if`: both the SNAT policy and the `CNAT_POLICY_POD` registration | Calico's NAT dataplane. Under `LifecycleProfile` the driver holds a CNAT policy object that has no VPP handle, so the call does not exist to be made — it is not made and then tolerated |
+| `cnat_enable_disable_feature`: the NAT feature arcs on the pod interface | same |
+| host port CNAT translations | Calico's service dataplane; host ports are out of the v1 scope (Issue #135 ruling 2) |
+| redirect-to-host classify tables | Calico punt configuration. This profile never installs it on the ADD side, so the DEL side must not detach it either |
+| Calico policy, workload endpoints, BGP or route announcements | there is no Calico control plane here; the pod events the shared code publishes have no subscriber |
+
+Before this was gated, every `CreatePodInterface` on the Stage 0 node failed
+with `cnatSnatPolicyAddDelIf … VPPApiError: Feature disabled by configuration
+(-30)` (Issue #21, BLOCKER-7). The SNAT enable was already skipped through
+`common.NoSNATPolicy`, but the CNAT registration and the feature arcs still ran
+unconditionally. The rollback was correct — no interface and no binding leaked —
+so the failure was clean, but the ADD never succeeded.
+
+### 2.2 Readiness
+
+The `podinterface-lifecycle` container reports ready on `/readiness` once VPP,
+`vpp-manager` and the lifecycle service itself have reported initialized
+(`health.PodInterfaceLifecycleComponents`). Felix and the Calico agent are not
+in that set: this entrypoint never starts them, and requiring them kept the
+probe at 503 for a service that works (errata #34 item 128). The
+`calico-vpp-agent` entrypoint keeps its four-component set unchanged.
+
+The lifecycle component reports itself *not* initialized, and the container
+reports unhealthy, when the durable lifecycle state cannot be interpreted
+exactly (Issue #135 ruling 4). See section 3.
+
 ## 3. Sockets, host paths and state
 
 | path | kind | producer | consumer |

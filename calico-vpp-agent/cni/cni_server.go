@@ -389,12 +389,12 @@ func NewCNIServer(vpp *vpplink.VppLink, felixServerIpam common.FelixServerIpam, 
 		podInterfaceMap: make(map[string]model.LocalPodSpec),
 		dsrVIPs:         make(map[string]*dsrVIPState),
 		dsrDesired:      make(map[string]*common.DSRService),
-		// The Calico CNI backend keeps the Pod-side configuration it
-		// has always applied (Issue #135 pre-merge item 4).
+		// The Calico CNI backend keeps the configuration it has always
+		// applied, inside the Pod and in VPP (Issue #135 pre-merge item 4).
 		tuntapDriver:   podinterface.NewTunTapPodInterfaceDriver(vpp, log, felixServerIpam, podinterface.CalicoProfile),
-		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, felixServerIpam),
-		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, felixServerIpam),
-		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, felixServerIpam),
+		memifDriver:    podinterface.NewMemifPodInterfaceDriver(vpp, log, felixServerIpam, podinterface.CalicoProfile),
+		vclDriver:      podinterface.NewVclPodInterfaceDriver(vpp, log, felixServerIpam, podinterface.CalicoProfile),
+		loopbackDriver: podinterface.NewLoopbackPodInterfaceDriver(vpp, log, felixServerIpam, podinterface.CalicoProfile),
 
 		cniMultinetEventChan: make(chan common.CalicoVppEvent, common.ChanSize),
 	}

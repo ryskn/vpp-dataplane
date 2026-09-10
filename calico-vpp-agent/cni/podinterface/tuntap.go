@@ -35,58 +35,17 @@ import (
 	"github.com/projectcalico/vpp-dataplane/v3/vpplink/types"
 )
 
-// PodInterfaceProfile selects which Pod-side configuration policy a pod
-// interface driver applies.
-//
-// It is chosen explicitly when the server is built, by the entry point that
-// knows which product it is running (Issue #135 pre-merge item 4). It is never
-// inferred from the interface name, the pod spec or anything else observable at
-// run time: two profiles that differ in what they configure inside the Pod must
-// differ by a decision someone made, not by a guess.
-type PodInterfaceProfile int
-
-const (
-	// CalicoProfile is the Calico CNI backend. Its Pod-side configuration is
-	// the one Calico has always applied, and it stays that way: the strict
-	// ordering below is a property of the SRv6 endpoint context contract, not
-	// a bug fix that Calico deployments are owed. Tightening it there is a
-	// separate change with its own reasons.
-	CalicoProfile PodInterfaceProfile = iota
-	// LifecycleProfile is the Pod interface lifecycle service, whose Pod-side
-	// configuration follows the fixed ADD order of D-50 and Issue #135
-	// ruling 8.
-	LifecycleProfile
-)
-
-func (p PodInterfaceProfile) String() string {
-	if p == LifecycleProfile {
-		return "lifecycle"
-	}
-	return "calico"
-}
-
 type TunTapPodInterfaceDriver struct {
 	PodInterfaceDriverData
-	// profile decides the Pod-side configuration policy: which steps run and
-	// in which order. The code that performs each step is shared between the
-	// profiles; the policy is not.
-	profile             PodInterfaceProfile
 	felixConfig         *felixConfig.Config
 	ipipEncapRefCounts  int /* how many ippools with IPIP */
 	vxlanEncapRefCounts int /* how many ippools with VXLAN */
 }
 
 func NewTunTapPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy, profile PodInterfaceProfile) *TunTapPodInterfaceDriver {
-	i := &TunTapPodInterfaceDriver{
-		PodInterfaceDriverData: PodInterfaceDriverData{
-			snatPolicy: requireSNATPolicy(snatPolicy, "tun"),
-		},
-		profile: profile,
+	return &TunTapPodInterfaceDriver{
+		PodInterfaceDriverData: newPodInterfaceDriverData(vpp, log, snatPolicy, profile, "tun"),
 	}
-	i.vpp = vpp
-	i.log = log
-	i.Name = "tun"
-	return i
 }
 
 func reduceMtuIf(podMtu *int, tunnelMtu int, tunnelEnabled bool) {

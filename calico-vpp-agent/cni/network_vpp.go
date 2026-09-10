@@ -364,10 +364,20 @@ func (s *Server) realizePodInterfaces(podSpec *model.LocalPodSpec, stack *vpplin
 		})
 	}
 
-	s.log.Infof("pod(add) HostPorts")
-	err = s.AddHostPort(podSpec, stack)
-	if err != nil {
-		goto err
+	// Host ports are CNAT translations, which is Calico's service dataplane.
+	// The lifecycle profile programs none of it: Cilium owns NAT, policy and
+	// services there, Calico's CNAT is not deployed, and host ports are out of
+	// the v1 scope for exactly that reason (Issue #135 rulings 2 and 3). The
+	// request this profile serves carries no host port, so this is a statement
+	// of what the profile programs rather than a change of behaviour — which is
+	// the point: not programming CNAT must be a decision, not a consequence of
+	// an empty list.
+	if !s.lifecycleProfile {
+		s.log.Infof("pod(add) HostPorts")
+		err = s.AddHostPort(podSpec, stack)
+		if err != nil {
+			goto err
+		}
 	}
 	common.SendEvent(common.CalicoVppEvent{
 		Type: common.PodAdded,
@@ -416,7 +426,15 @@ func (s *Server) DelVppInterface(podSpec *model.LocalPodSpec) {
 	// and a handle, neither of which lives in the Pod netns.
 	s.revokeIfAttachment(podSpec)
 
-	if len(config.GetCalicoVppInitialConfig().RedirectToHostRules) != 0 && podSpec.NetworkName == "" {
+	// Redirect-to-host is Calico's punt classifier: the ADD side of it lives in
+	// the Calico CNI backend (Server.Add and its rescanState), never in this
+	// profile, so there is nothing here for the DEL side to remove. Removing it
+	// anyway would detach classify table index 0 — the zero value of
+	// RedirectToHostClassifyTableIndex, which this profile never fills in —
+	// from the interface, on nothing more than a configuration key being
+	// present in a ConfigMap this container shares with vpp-manager.
+	if !s.lifecycleProfile &&
+		len(config.GetCalicoVppInitialConfig().RedirectToHostRules) != 0 && podSpec.NetworkName == "" {
 		err := s.DelRedirectToHostOnInterface(podSpec.TunTapSwIfIndex)
 		if err != nil {
 			s.log.Error(err)
@@ -437,7 +455,11 @@ func (s *Server) DelVppInterface(podSpec *model.LocalPodSpec) {
 		return
 	}
 
-	s.DelHostPort(podSpec)
+	// The counterpart of the ADD-side gate: this profile published no CNAT
+	// translation, so there is none to withdraw.
+	if !s.lifecycleProfile {
+		s.DelHostPort(podSpec)
+	}
 
 	var vni uint32
 	deleteLocalPodAddress := true

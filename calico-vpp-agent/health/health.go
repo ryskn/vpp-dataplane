@@ -45,11 +45,17 @@ type ComponentStatus struct {
 
 // HealthServer provides HTTP health check endpoints
 type HealthServer struct {
-	log         *logrus.Entry
-	port        uint32
-	status      HealthStatus
-	statusMutex sync.RWMutex
-	server      *http.Server
+	log  *logrus.Entry
+	port uint32
+	// requiredComponents are the components that must all have reported
+	// themselves initialized before /readiness answers 200. It is a parameter
+	// of the server because the answer differs per entrypoint: which components
+	// exist at all is a property of the process that was started, not of this
+	// package.
+	requiredComponents []string
+	status             HealthStatus
+	statusMutex        sync.RWMutex
+	server             *http.Server
 }
 
 const (
@@ -57,13 +63,62 @@ const (
 	ComponentVPPManager = "vpp-manager"
 	ComponentFelix      = "felix"
 	ComponentAgent      = "agent"
+	// ComponentPodInterfaceLifecycle is the VPP Pod interface lifecycle
+	// service. Besides VPP and vpp-manager it is the only component of its
+	// entrypoint: that service has no Calico control plane behind it, so
+	// neither Felix nor the Calico agent will ever report in there
+	// (Issue #135 ruling 3).
+	ComponentPodInterfaceLifecycle = "podinterface-lifecycle"
 )
 
-// NewHealthServer creates a new health check server
-func NewHealthServer(log *logrus.Entry, port uint32) *HealthServer {
+// CalicoAgentComponents is the required component set of the calico-vpp-agent
+// entrypoint: VPP, vpp-manager, Felix and the agent itself.
+func CalicoAgentComponents() []string {
+	return []string{
+		ComponentVPP,
+		ComponentVPPManager,
+		ComponentFelix,
+		ComponentAgent,
+	}
+}
+
+// PodInterfaceLifecycleComponents is the required component set of the
+// podinterface-lifecycle entrypoint.
+//
+// Felix and the Calico agent are absent because that entrypoint never starts
+// them: it is the VPP interface lifecycle authority for an external CNI, and
+// making its readiness wait for a second network control plane it does not use
+// is the coupling Issue #135 ruling 3 rejects. With the Calico set it would
+// never answer 200 although it is fully functional (errata #34 item 128).
+func PodInterfaceLifecycleComponents() []string {
+	return []string{
+		ComponentVPP,
+		ComponentVPPManager,
+		ComponentPodInterfaceLifecycle,
+	}
+}
+
+// NewHealthServer creates a new health check server.
+//
+// requiredComponents is what /readiness is about: the server reports ready once
+// every one of them has reported itself initialized. The caller states it,
+// rather than this package fixing it, because each entrypoint starts different
+// components.
+func NewHealthServer(log *logrus.Entry, port uint32, requiredComponents []string) *HealthServer {
+	if len(requiredComponents) == 0 {
+		// A server with no required components would report ready before
+		// anything had initialized. That is worse than an entrypoint that never
+		// reports ready: it would answer 200 for a process that has done
+		// nothing yet.
+		panic("cannot build a health server without a required component set: " +
+			"readiness is the initialization of named components, not the absence of any")
+	}
+	required := make([]string, len(requiredComponents))
+	copy(required, requiredComponents)
 	return &HealthServer{
-		log:  log,
-		port: port,
+		log:                log,
+		port:               port,
+		requiredComponents: required,
 		status: HealthStatus{
 			Healthy:    true,
 			Ready:      false,
@@ -97,16 +152,8 @@ func (hs *HealthServer) SetComponentStatus(component string, initialized bool, m
 
 // updateReadiness determines overall readiness based on component status
 func (hs *HealthServer) updateReadiness() {
-	// Required components for readiness
-	requiredComponents := []string{
-		ComponentVPP,
-		ComponentVPPManager,
-		ComponentFelix,
-		ComponentAgent,
-	}
-
 	allReady := true
-	for _, comp := range requiredComponents {
+	for _, comp := range hs.requiredComponents {
 		status, exists := hs.status.Components[comp]
 		if !exists || !status.Initialized {
 			allReady = false

@@ -28,16 +28,10 @@ type LoopbackPodInterfaceDriver struct {
 	PodInterfaceDriverData
 }
 
-func NewLoopbackPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy) *LoopbackPodInterfaceDriver {
-	i := &LoopbackPodInterfaceDriver{
-		PodInterfaceDriverData: PodInterfaceDriverData{
-			snatPolicy: requireSNATPolicy(snatPolicy, "loopback"),
-		},
+func NewLoopbackPodInterfaceDriver(vpp *vpplink.VppLink, log *logrus.Entry, snatPolicy common.SNATPolicy, profile PodInterfaceProfile) *LoopbackPodInterfaceDriver {
+	return &LoopbackPodInterfaceDriver{
+		PodInterfaceDriverData: newPodInterfaceDriverData(vpp, log, snatPolicy, profile, "loopback"),
 	}
-	i.vpp = vpp
-	i.log = log
-	i.Name = "loopback"
-	return i
 }
 
 func (i *LoopbackPodInterfaceDriver) CreateInterface(podSpec *model.LocalPodSpec, stack *vpplink.CleanupStack) (err error) {
