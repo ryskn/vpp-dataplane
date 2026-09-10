@@ -298,7 +298,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          # The native virtio uplink driver needs hugepage-backed physmem
+          # (docs/config/README.md). kubelet sets hugetlb.<size>.max to 0 in
+          # the Pod cgroup for every hugepage size the Pod does not request,
+          # so without this limit VPP's mmap of the virtio queues fails with
+          # ENOMEM ("virtio: error in rxq-queue (0) initialization") even on
+          # a host with free hugepages. Same value as the upstream profile
+          # (yaml/generated/calico-vpp.yaml).
           resources:
+            limits:
+              hugepages-2Mi: 512Mi
             requests:
               cpu: 500m
               memory: 512Mi
