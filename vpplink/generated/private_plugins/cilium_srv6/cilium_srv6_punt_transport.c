@@ -1100,7 +1100,7 @@ cilium_srv6_punt_transport_stats (cilium_srv6_punt_transport_stats_t *out)
 }
 
 /* ------------------------------------------------------------------ */
-/* init                                                                */
+/* init and start                                                      */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -1108,13 +1108,21 @@ cilium_srv6_punt_transport_stats (cilium_srv6_punt_transport_stats_t *out)
  * the queue counters that cilium_srv6_punt_init() sets up. Until the hook is
  * registered every punt is a fail-closed drop counted in punt_no_transport,
  * which is also what happens for good when no socket path is configured.
+ *
+ * What this function must *not* do is look at the startup stanza. vlib runs
+ * every init function before it parses the configuration file:
+ * vlib_main() calls vlib_call_all_init_functions() at vlib/main.c:1966 and
+ * only then vlib_call_all_config_functions(.., is_early = 0) at
+ * vlib/main.c:1986. `cilium-srv6` is a regular (not early) VLIB_CONFIG_FUNCTION
+ * in cilium_srv6_guard.c, so at VLIB_INIT time `cm->punt_socket_path` is still
+ * 0 on every node, whether or not the operator configured one. Reading it here
+ * left a correctly configured node with the transport permanently unstarted.
+ * The path and the queue budget are read in cspt_start() below.
  */
 static clib_error_t *
 cspt_init (vlib_main_t *vm)
 {
   cspt_main_t *t = &cspt_main;
-  cilium_srv6_main_t *cm = &cilium_srv6_main;
-  u32 cap;
 
   cspt_log_class = vlib_log_register_class ("cilium-srv6", "if3");
 
@@ -1123,6 +1131,38 @@ cspt_init (vlib_main_t *vm)
   t->state = CSPT_DISCONNECTED;
   t->process_node_index = cilium_srv6_punt_transport_process_node.index;
   t->entry_cap = CILIUM_SRV6_IF3_QUEUE_ENTRIES;
+
+  (void) vm;
+
+  return 0;
+}
+
+VLIB_INIT_FUNCTION (cspt_init) = {
+  .runs_after = VLIB_INITS ("cilium_srv6_headend_init"),
+};
+
+/*
+ * Start of the transport from the startup configuration.
+ *
+ * A main loop enter function is the earliest point at which
+ * `cm->punt_socket_path` carries the operator's answer: vlib_main() has run
+ * vlib_call_all_config_functions() (vlib/main.c:1986) by the time it calls
+ * vlib_call_all_main_loop_enter_functions() (vlib/main.c:2005), and both of
+ * those happen before the graph starts.
+ *
+ * It runs before start_workers (the vlib/threads.c:873 main loop enter
+ * function that creates the worker threads), so the tx hook is in place before
+ * any worker can execute the punt node — the same ordering cspt_init()
+ * provided when it registered the hook. Missing constraint names are tolerated
+ * by vlib's topological sort (vlib/init.c:164), so a rename upstream degrades
+ * to a warning and a short window of fail-closed punts, not a failure to boot.
+ */
+static clib_error_t *
+cspt_start (vlib_main_t *vm)
+{
+  cspt_main_t *t = &cspt_main;
+  cilium_srv6_main_t *cm = &cilium_srv6_main;
+  u32 cap;
 
   if (cm->punt_socket_path == 0)
     {
@@ -1159,15 +1199,15 @@ cspt_init (vlib_main_t *vm)
 		   (char *) cm->punt_socket_path, t->entry_cap, t->cap);
 
   /*
-   * No wake-up from here: a process node's runtime does not exist yet at
-   * VLIB_INIT time. `next_connect` is 0, so the first scheduled run — one
-   * backoff period, 200 ms, after the graph starts — dials the socket.
+   * No wake-up from here: the graph has not started, so there is no process
+   * runtime to signal yet. `next_connect` is 0, so the first scheduled run —
+   * one backoff period, 200 ms, after the graph starts — dials the socket.
    */
   (void) vm;
 
   return 0;
 }
 
-VLIB_INIT_FUNCTION (cspt_init) = {
-  .runs_after = VLIB_INITS ("cilium_srv6_headend_init"),
+VLIB_MAIN_LOOP_ENTER_FUNCTION (cspt_start) = {
+  .runs_before = VLIB_INITS ("start_workers"),
 };
