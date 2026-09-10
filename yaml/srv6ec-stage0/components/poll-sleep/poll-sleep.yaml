@@ -1,0 +1,47 @@
+# Add `poll-sleep-usec` to the VPP `unix` stanza.
+#
+# Why: VPP's main loop polls. On the test bed host (6 cores, no SMT, shared
+# with the other test bed VMs — Issue #21 §1) a permanently spinning VPP main
+# thread per node VM leaves no headroom. `poll-sleep-usec 100` makes the main
+# loop sleep 100 us when it finds no work.
+#
+# What it costs: added forwarding latency of up to the sleep interval on an
+# idle dataplane, and it is incompatible with multiple VPP workers, so it rules
+# out the multi-worker cases (TC-603). Do not enable it for anything that
+# measures throughput or latency.
+#
+# The whole template is restated because a ConfigMap value is one string; only
+# the `unix` stanza differs from the base.
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: srv6ec-stage0-config
+  namespace: srv6ec-stage0
+data:
+  CALICOVPP_CONFIG_TEMPLATE: |-
+    unix {
+      nodaemon
+      full-coredump
+      cli-listen /var/run/vpp/cli.sock
+      pidfile /run/vpp/vpp.pid
+      exec /etc/vpp/startup.exec
+      poll-sleep-usec 100
+    }
+    api-trace { on }
+    cpu {
+        workers 0
+    }
+    socksvr {
+        socket-name /var/run/vpp/vpp-api.sock
+    }
+    plugins {
+        plugin default { enable }
+        plugin dpdk_plugin.so { disable }
+        plugin ping_plugin.so { disable }
+        plugin bpf_trace_filter.so { enable }
+        plugin dispatch_trace_plugin.so { enable }
+        plugin cilium_srv6_plugin.so { enable }
+    }
+    buffers {
+      buffers-per-numa 131072
+    }

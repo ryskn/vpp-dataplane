@@ -1,0 +1,475 @@
+---
+# SRv6 Endpoint Context — Stage 0 lifecycle profile.
+#
+# What this deploys, and what it deliberately does not:
+#
+#   deployed:     vpp-manager (the `vpp` container, which owns the uplink and
+#                 vpptap0), the Pod interface lifecycle service, and a proxy in
+#                 front of the VPP binary API socket.
+#   NOT deployed: calico-node, Felix, Typha, the Calico CNI installer, the
+#                 calico-vpp-agent, GoBGP. In this profile Cilium is the CNI
+#                 and owns attachment identity, IPAM and endpoint lifecycle;
+#                 this DaemonSet owns only the VPP Pod interface lifecycle
+#                 (Issue #135 ruling 3).
+#
+# The manifest is applied through scripts/srv6ec-stage0-deploy.sh, which
+# replaces the two REPLACE-ME image references with digest-pinned ones. Applying
+# it directly leaves images that cannot be pulled; that is intentional, because
+# a mutable tag is not an acceptable identity for these images (Issue #135
+# ruling 6).
+#
+# See docs/srv6ec-stage0.md.
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: srv6ec-stage0
+
+---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: srv6ec-stage0-sa
+  namespace: srv6ec-stage0
+
+---
+# Verbatim copy of the rules of calico-vpp-node-role.
+#
+# It is a copy rather than a narrowed set because vpp-manager is unmodified in
+# this profile and still runs updateCalicoNode() against the Calico datastore
+# before it declares itself ready (vpp-manager/vpp_runner.go:1135). Which of
+# these rules that path actually needs has not been established, and guessing
+# would turn a startup failure into an unexplained one. Narrowing this belongs
+# with the decision on vpp-manager's Calico datastore dependency, recorded in
+# docs/srv6ec-stage0.md.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: srv6ec-stage0-node-role
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+      - namespaces
+    verbs:
+      - get
+  - apiGroups: [""]
+    resources:
+      - endpoints
+      - services
+    verbs:
+      - watch
+      - list
+      - get
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs:
+      - watch
+      - list
+      - get
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs:
+      - get
+  - apiGroups: [""]
+    resources:
+      - nodes/status
+    verbs:
+      - patch
+      - update
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - networkpolicies
+    verbs:
+      - watch
+      - list
+  - apiGroups: [""]
+    resources:
+      - pods
+      - namespaces
+      - serviceaccounts
+    verbs:
+      - list
+      - watch
+  - apiGroups: [""]
+    resources:
+      - pods/status
+    verbs:
+      - patch
+  - apiGroups: ["crd.projectcalico.org"]
+    resources:
+      - globalfelixconfigs
+      - felixconfigurations
+      - bgppeers
+      - bgpfilters
+      - globalbgpconfigs
+      - bgpconfigurations
+      - ippools
+      - ipamblocks
+      - globalnetworkpolicies
+      - globalnetworksets
+      - networkpolicies
+      - networksets
+      - clusterinformations
+      - hostendpoints
+      - blockaffinities
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups: [""]
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups: ["crd.projectcalico.org"]
+    resources:
+      - blockaffinities
+      - ipamblocks
+      - ipamhandles
+    verbs:
+      - get
+      - list
+      - create
+      - update
+      - delete
+  - apiGroups: ["crd.projectcalico.org"]
+    resources:
+      - ipamconfigs
+    verbs:
+      - get
+  - apiGroups: ["crd.projectcalico.org"]
+    resources:
+      - blockaffinities
+    verbs:
+      - watch
+
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: srv6ec-stage0-node
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: srv6ec-stage0-node-role
+subjects:
+  - kind: ServiceAccount
+    name: srv6ec-stage0-sa
+    namespace: srv6ec-stage0
+
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: srv6ec-stage0-config
+  namespace: srv6ec-stage0
+data:
+  # Service CIDR of the test bed cluster (kubeadm serviceSubnet). vpp-manager
+  # installs host routes towards it, so it has to match the cluster.
+  SERVICE_PREFIX: fd30::/108
+
+  # Uplink driver. Stage 0 and Stage 1 run `virtio`, which is what the test bed
+  # VMs present, and do not need the uplink to be promotable to TRUSTED_FABRIC:
+  # the profile runs with FabricAuthority = none and expects no cross-node SRv6
+  # forwarding (Issue #21, Stage 1). Stage 2 needs an uplink the cilium_srv6
+  # plugin can classify as fabric, which virtio is not; use the uplink-af-xdp
+  # component then. Note that `interfaceName` is the host's NIC name and
+  # differs per cluster.
+  CALICOVPP_INTERFACES: |-
+    {
+      "maxPodIfSpec": {
+        "rx": 10, "tx": 10, "rxqsz": 1024, "txqsz": 1024
+      },
+      "defaultPodIfSpec": {
+        "rx": 1, "tx": 1, "isl3": true
+      },
+      "vppHostTapSpec": {
+        "rx": 1, "tx": 1, "rxqsz": 1024, "txqsz": 1024, "isl3": false
+      },
+      "uplinkInterfaces": [
+        {
+          "interfaceName": "eth0",
+          "vppDriver": "virtio"
+        }
+      ]
+    }
+
+  CALICOVPP_INITIAL_CONFIG: |-
+    {
+      "vppStartupSleepSeconds": 1,
+      "corePattern": "/var/lib/vpp/vppcore.%e.%p"
+    }
+
+  # VPP startup configuration.
+  #
+  # `cpu { workers 0 }` keeps VPP on the main thread only. The poll-sleep
+  # component adds `poll-sleep-usec` to the `unix` stanza; see that component
+  # for what it costs.
+  CALICOVPP_CONFIG_TEMPLATE: |-
+    unix {
+      nodaemon
+      full-coredump
+      cli-listen /var/run/vpp/cli.sock
+      pidfile /run/vpp/vpp.pid
+      exec /etc/vpp/startup.exec
+    }
+    api-trace { on }
+    cpu {
+        workers 0
+    }
+    socksvr {
+        socket-name /var/run/vpp/vpp-api.sock
+    }
+    plugins {
+        plugin default { enable }
+        plugin dpdk_plugin.so { disable }
+        plugin ping_plugin.so { disable }
+        plugin bpf_trace_filter.so { enable }
+        plugin dispatch_trace_plugin.so { enable }
+        plugin cilium_srv6_plugin.so { enable }
+    }
+    buffers {
+      buffers-per-numa 131072
+    }
+
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: srv6ec-vpp-node
+  namespace: srv6ec-stage0
+  labels:
+    k8s-app: srv6ec-vpp-node
+spec:
+  selector:
+    matchLabels:
+      k8s-app: srv6ec-vpp-node
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        k8s-app: srv6ec-vpp-node
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      hostNetwork: true
+      # VPP and the lifecycle service reach Pod network namespaces through
+      # /proc/<pid>/ns/net.
+      hostPID: true
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+      serviceAccountName: srv6ec-stage0-sa
+      terminationGracePeriodSeconds: 10
+      priorityClassName: system-node-critical
+      containers:
+        # vpp-manager: owns the uplink and vpptap0, starts VPP, and is the only
+        # datapath owner of the interfaces it creates (Issue #135 ruling 5 —
+        # Cilium's base datapath must be kept off vpptap0 and off the uplink
+        # with --devices on the Cilium side).
+        - name: vpp
+          image: ghcr.io/ryskn/calicovpp/vpp:REPLACE-ME
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          envFrom:
+            - configMapRef:
+                name: srv6ec-stage0-config
+          env:
+            - name: DATASTORE_TYPE
+              value: "kubernetes"
+            - name: WAIT_FOR_DATASTORE
+              value: "true"
+            - name: NODENAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: lib-firmware
+              mountPath: /lib/firmware
+            - name: vpp-rundir
+              mountPath: /var/run/vpp
+            - name: vpp-data
+              mountPath: /var/lib/vpp
+            - name: vpp-config
+              mountPath: /etc/vpp
+            - name: devices
+              mountPath: /dev
+            - name: hostsys
+              mountPath: /sys
+            - name: netns
+              mountPath: /run/netns/
+              mountPropagation: Bidirectional
+            - name: host-root
+              mountPath: /host
+
+        # The Pod interface lifecycle service. Cilium's CNI calls
+        # CreatePodInterface / DeletePodInterface on its socket; the service
+        # creates the VPP TUN, publishes the exact (sw_if_index,
+        # if_incarnation) binding over IF-4 and only then acknowledges, which is
+        # the publication barrier of D-71.
+        - name: podinterface-lifecycle
+          image: ghcr.io/ryskn/calicovpp/agent:REPLACE-ME
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/podinterface-lifecycle"]
+          securityContext:
+            privileged: true
+          envFrom:
+            - configMapRef:
+                name: srv6ec-stage0-config
+          env:
+            - name: DATASTORE_TYPE
+              value: "kubernetes"
+            - name: WAIT_FOR_DATASTORE
+              value: "true"
+            - name: NODENAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 100m
+          # Readiness follows the durable lifecycle state: a state file whose
+          # exact ownership cannot be recovered leaves the service unready and
+          # requires an explicit dataplane reset (Issue #135 ruling 4). Do not
+          # add a liveness probe on the same condition — restarting the process
+          # does not recover an incompatible state, it only hides it.
+          startupProbe:
+            failureThreshold: 30
+            httpGet:
+              path: /liveness
+              port: 9090
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /readiness
+              port: 9090
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: vpp-rundir
+              mountPath: /var/run/vpp
+            - name: netns
+              mountPath: /run/netns/
+              mountPropagation: Bidirectional
+
+        # IF-2 socket proxy.
+        #
+        # pkg/srv6ec/vppapi.VerifySocketPath requires the VPP binary API socket
+        # to be a Unix socket owned by an accepted UID with no access for group
+        # or other, inside a directory with the same ownership rule and mode
+        # 0700 (00 §4.1 / D-27). VPP creates its socket 0660 in /var/run/vpp,
+        # which is 0755, so the Cilium agent refuses it.
+        #
+        # chmod-ing VPP's own socket is not a fix: VPP recreates it on every
+        # restart, and E2E 6 restarts VPP on purpose. A forwarding proxy in a
+        # directory this profile owns is stable across VPP restarts, and it is
+        # also the fault-injection point E2E 5 needs (killing this container
+        # breaks the IF-2 transport without touching VPP, which is exactly the
+        # "transport reconnect, same plugin_instance_id" case).
+        #
+        # This is a byte-forwarding proxy and nothing more. govpp's
+        # socketclient — the adapter the Cilium agent dials with — carries the
+        # whole binary API as a length-prefixed message stream over the socket
+        # and passes no file descriptors, so forwarding the bytes preserves the
+        # protocol. (Checked against vendor/go.fd.io/govpp/adapter/socketclient:
+        # no SCM_RIGHTS, no shared-memory segment handshake.)
+        #
+        # The trust delta this introduces, stated rather than hidden: the peer
+        # credential the agent reads is socat's, not VPP's. transport.go already
+        # says the peer credential proves only the UID of the process on the
+        # other end and never that it is VPP, so the check keeps exactly the
+        # meaning it claims — but the process at the far end of the accepted
+        # connection is now one hop away. That is acceptable for a test bed
+        # where both processes are root in the same Pod; it is not a production
+        # answer to the socket mode question, which is open in Issue #60.
+        - name: vppapi-proxy
+          image: ghcr.io/ryskn/calicovpp/agent:REPLACE-ME
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /var/run/vpp-srv6ec
+              chown 0:0 /var/run/vpp-srv6ec
+              chmod 0700 /var/run/vpp-srv6ec
+              while [ ! -S /var/run/vpp/vpp-api.sock ]; do
+                echo "waiting for /var/run/vpp/vpp-api.sock"
+                sleep 1
+              done
+              exec socat -d \
+                UNIX-LISTEN:/var/run/vpp-srv6ec/vpp-api.sock,fork,perm=0600,unlink-early,backlog=16 \
+                UNIX-CONNECT:/var/run/vpp/vpp-api.sock
+          securityContext:
+            # root, so that the socket and its directory are owned by uid 0,
+            # which is the UID the agent is configured to accept.
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: 50m
+          volumeMounts:
+            - name: vpp-rundir
+              mountPath: /var/run/vpp
+            - name: srv6ec-if2-rundir
+              mountPath: /var/run/vpp-srv6ec
+
+      volumes:
+        - name: lib-firmware
+          hostPath:
+            path: /lib/firmware
+        - name: vpp-rundir
+          hostPath:
+            path: /var/run/vpp
+        - name: vpp-data
+          hostPath:
+            type: DirectoryOrCreate
+            path: /var/lib/vpp
+        - name: vpp-config
+          hostPath:
+            path: /etc/vpp
+        - name: devices
+          hostPath:
+            path: /dev
+        - name: hostsys
+          hostPath:
+            path: /sys
+        - name: netns
+          hostPath:
+            path: /run/netns
+        # The directory the IF-2 proxy owns. It is a hostPath because the
+        # Cilium agent Pod has to mount the same directory to reach the socket;
+        # an emptyDir would be private to this Pod.
+        - name: srv6ec-if2-rundir
+          hostPath:
+            type: DirectoryOrCreate
+            path: /var/run/vpp-srv6ec
+        - name: host-root
+          hostPath:
+            path: /

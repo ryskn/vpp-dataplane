@@ -1,0 +1,39 @@
+# Stage 2 uplink driver.
+#
+# Stage 2 needs the uplink to be classifiable as TRUSTED_FABRIC by the
+# cilium_srv6 plugin, which the VPP native virtio-pci driver is not: its device
+# class name is also "virtio" (virtio/device.c:1136), so the plugin's
+# non-promotable list — written for tap/tun — covers the VM's real NIC as well
+# (errata 114). The ruling on that errata is that widening the promotable list
+# to "virtio" is forbidden, so Stage 2 changes the driver instead.
+#
+# This component only changes the driver. It does NOT do the rest of what an
+# AF_XDP uplink needs, and none of that has been established here:
+#   - the kernel and NIC support AF_XDP zero-copy or the fallback is acceptable;
+#   - hugepages, memory limits and CPU requests for the Pod;
+#   - the vpp container's securityContext / rlimits for BPF map creation.
+# Treat this as the starting point of Stage 2, not as a working configuration.
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: srv6ec-stage0-config
+  namespace: srv6ec-stage0
+data:
+  CALICOVPP_INTERFACES: |-
+    {
+      "maxPodIfSpec": {
+        "rx": 10, "tx": 10, "rxqsz": 1024, "txqsz": 1024
+      },
+      "defaultPodIfSpec": {
+        "rx": 1, "tx": 1, "isl3": true
+      },
+      "vppHostTapSpec": {
+        "rx": 1, "tx": 1, "rxqsz": 1024, "txqsz": 1024, "isl3": false
+      },
+      "uplinkInterfaces": [
+        {
+          "interfaceName": "eth0",
+          "vppDriver": "af_xdp"
+        }
+      ]
+    }

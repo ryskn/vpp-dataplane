@@ -1,0 +1,16 @@
+# SRv6 Endpoint Context Stage 0 lifecycle profile.
+#
+# Render with `kubectl kustomize yaml/srv6ec-stage0`, but deploy through
+# scripts/srv6ec-stage0-deploy.sh: the image references here are placeholders
+# that the helper replaces with digest-pinned ones, because a mutable tag is
+# not an acceptable identity for these images (Issue #135 ruling 6).
+#
+# Optional components:
+#   components/poll-sleep     — trade VPP forwarding latency for CPU on a host
+#                               that does not have a core to spare per worker.
+#   components/uplink-af-xdp  — Stage 2 uplink driver.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - srv6ec-stage0-daemonset.yaml
