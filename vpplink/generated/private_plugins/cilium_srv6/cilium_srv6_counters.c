@@ -148,6 +148,15 @@ static const u8 program_reasons[CILIUM_SRV6_PROGRAM_N_ERROR] = {
   [CILIUM_SRV6_PROGRAM_ERROR_PUNT_STALE] = CILIUM_SRV6_DROP_NOT_A_DROP,
   [CILIUM_SRV6_PROGRAM_ERROR_PUNT_LEASE_EXPIRED] = CILIUM_SRV6_DROP_NOT_A_DROP,
   [CILIUM_SRV6_PROGRAM_ERROR_PUNT_STALE_PATH] = CILIUM_SRV6_DROP_NOT_A_DROP,
+  [CILIUM_SRV6_PROGRAM_ERROR_LOCAL_DELIVER] = CILIUM_SRV6_DROP_NOT_A_DROP,
+};
+
+/* cilium-srv6-local-deliver (D-80, 00 §2.20). punt_stale_target is not a
+   drop: the packet goes to cilium-srv6-punt, which decides. */
+static const u8 local_deliver_reasons[CILIUM_SRV6_LOCAL_DELIVER_N_ERROR] = {
+  [CILIUM_SRV6_LOCAL_DELIVER_ERROR_MALFORMED_INNER] = CILIUM_SRV6_DROP_MALFORMED_INNER,
+  [CILIUM_SRV6_LOCAL_DELIVER_ERROR_DELIVERED] = CILIUM_SRV6_DROP_NOT_A_DROP,
+  [CILIUM_SRV6_LOCAL_DELIVER_ERROR_PUNT_STALE_TARGET] = CILIUM_SRV6_DROP_NOT_A_DROP,
 };
 
 /* cilium-srv6-encap (02 §6, §9). stale_path and no_headroom are the two
@@ -209,6 +218,8 @@ static cilium_srv6_counter_node_t cilium_srv6_counter_nodes[] = {
   CILIUM_SRV6_COUNTER_NODE ("cilium-srv6-ct", ct_reasons, cilium_srv6_ct_error_counters),
   CILIUM_SRV6_COUNTER_NODE ("cilium-srv6-program", program_reasons,
 			    cilium_srv6_program_error_counters),
+  CILIUM_SRV6_COUNTER_NODE ("cilium-srv6-local-deliver", local_deliver_reasons,
+			    cilium_srv6_local_deliver_error_counters),
   CILIUM_SRV6_COUNTER_NODE ("cilium-srv6-encap", encap_reasons, cilium_srv6_encap_error_counters),
   CILIUM_SRV6_COUNTER_NODE ("cilium-srv6-punt", punt_reasons, cilium_srv6_punt_error_counters),
   CILIUM_SRV6_COUNTER_NODE ("cilium-srv6-ptb", ptb_reasons, cilium_srv6_ptb_error_counters),

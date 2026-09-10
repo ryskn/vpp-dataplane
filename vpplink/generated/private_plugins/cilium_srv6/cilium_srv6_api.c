@@ -556,6 +556,36 @@ cilium_srv6_verdict_encode (u8 in)
 					     SRV6_PROGRAM_VERDICT_API_DENY;
 }
 
+/*
+ * D-80: the forwarding action of an ALLOW. It is decoded the same way as the
+ * verdict — an unknown value is refused rather than defaulted. Defaulting to
+ * ENCAP would turn a local delivery the agent asked for into an encapsulation
+ * on a path the message does not carry, and defaulting to LOCAL_DELIVER would
+ * deliver to interface 0.
+ */
+static int
+cilium_srv6_action_decode (vl_api_srv6_program_action_t in, u8 *out)
+{
+  switch (in)
+    {
+    case SRV6_PROGRAM_ACTION_API_ENCAP:
+      *out = CILIUM_SRV6_ACTION_ENCAP;
+      return 0;
+    case SRV6_PROGRAM_ACTION_API_LOCAL_DELIVER:
+      *out = CILIUM_SRV6_ACTION_LOCAL_DELIVER;
+      return 0;
+    default:
+      return -1;
+    }
+}
+
+static vl_api_srv6_program_action_t
+cilium_srv6_action_encode (u8 in)
+{
+  return (in == CILIUM_SRV6_ACTION_LOCAL_DELIVER) ? SRV6_PROGRAM_ACTION_API_LOCAL_DELIVER :
+						    SRV6_PROGRAM_ACTION_API_ENCAP;
+}
+
 static void
 vl_api_srv6_local_ep_add_del_t_handler (vl_api_srv6_local_ep_add_del_t *mp)
 {
@@ -822,7 +852,7 @@ vl_api_srv6_program_add_del_t_handler (vl_api_srv6_program_add_del_t *mp)
 {
   vl_api_srv6_program_add_del_reply_t *rmp;
   ip6_address_t dst;
-  u8 verdict;
+  u8 verdict, action;
   int rv;
 
   if (cilium_srv6_verdict_decode (mp->verdict, &verdict))
@@ -831,12 +861,19 @@ vl_api_srv6_program_add_del_t_handler (vl_api_srv6_program_add_del_t *mp)
       goto reply;
     }
 
+  if (cilium_srv6_action_decode (mp->action, &action))
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE_2;
+      goto reply;
+    }
+
   ip6_address_decode (mp->dst, &dst);
 
   rv = cilium_srv6_program_add_del (mp->src_identity, &dst, mp->proto, mp->l4_discriminator,
-				    verdict, mp->policy_revision, mp->endpoint_revision,
+				    verdict, action, mp->policy_revision, mp->endpoint_revision,
 				    mp->path_revision, mp->path_cache_index, mp->path_generation,
-				    mp->owner_quota_class, mp->is_add ? 1 : 0);
+				    mp->target_sw_if_index, mp->target_if_incarnation,
+				    mp->target_identity, mp->owner_quota_class, mp->is_add ? 1 : 0);
 
 reply:
   REPLY_MACRO_END (VL_API_SRV6_PROGRAM_ADD_DEL_REPLY);
@@ -873,6 +910,10 @@ send_srv6_program_details (u32 index, const cilium_srv6_program_t *e, f64 now,
 			      rmp->proto = (u8) ((e->key[2] >> 16) & 0xff);
 			      rmp->l4_discriminator = (u16) (e->key[2] & 0xffff);
 			      rmp->verdict = cilium_srv6_verdict_encode (e->verdict);
+			      rmp->action = cilium_srv6_action_encode (e->action);
+			      rmp->target_sw_if_index = e->target_sw_if_index;
+			      rmp->target_if_incarnation = e->target_if_incarnation;
+			      rmp->target_identity = e->target_identity;
 			      rmp->policy_revision = e->policy_revision;
 			      rmp->endpoint_revision = e->endpoint_revision;
 			      rmp->path_revision = e->path_revision;

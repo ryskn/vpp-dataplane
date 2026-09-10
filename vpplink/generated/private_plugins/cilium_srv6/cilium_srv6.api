@@ -721,6 +721,34 @@ enum srv6_program_verdict : u8
   SRV6_PROGRAM_VERDICT_API_ALLOW = 1,
 };
 
+/** \brief Forwarding action of an ALLOW ProgramCache entry (D-80, 02 §4.3.1).
+
+    D-80 (errata #34 item 149, 00 §2.20) makes same-node Pod-to-Pod traffic a
+    forwarding *action* rather than a bypass: the packet takes the same guard,
+    classify, conntrack and ProgramCache chain, the same NetworkPolicy
+    evaluation and the same revision and lease rules a remote destination
+    takes, and only what an ALLOW then does with the packet differs.
+
+    ENCAP is value 0 so that zero-initialised state is the remote action, which
+    cannot deliver into a local interface by accident.
+
+    LOCAL_DELIVER names the exact destination interface *lifetime*
+    (target_sw_if_index, target_if_incarnation) plus the destination endpoint's
+    Security Identity, and transmits on it. It never encapsulates and never
+    sends the packet to this node's own Service SID: 00 §2.20 rules
+    self-encapsulation out, because that would add SRH construction and a
+    second lookup to a path that needs neither and would present local
+    reachability as a BGP/SR-Policy-derived path.
+
+    A DENY has no action of its own — a DENY for a local destination is an
+    ordinary DENY — so a DENY must carry ENCAP and no target.
+*/
+enum srv6_program_action : u8
+{
+  SRV6_PROGRAM_ACTION_API_ENCAP = 0,
+  SRV6_PROGRAM_ACTION_API_LOCAL_DELIVER = 1,
+};
+
 /** \brief Install or remove one LocalEndpointTable entry (IF-2, 02 §8).
 
     Idempotent. The key is (sw_if_index, if_incarnation) per D-31: an
@@ -1163,19 +1191,47 @@ autoendian autoreply define srv6_path_txn_abort
     established flows, and eviction inside a budget prefers entries whose
     owner and identity are over their soft quota.
 
+    D-80 adds the forwarding action, and with it a third legal combination.
+    The three are exhaustive and the cross product is refused
+    (INVALID_ARGUMENT, counted in `program_illegal_action_installs`):
+
+      verdict  action         path_cache_index  path_revision  target
+      DENY     ENCAP          ~0                0              none
+      ALLOW    ENCAP          a valid index     current (>0)   none
+      ALLOW    LOCAL_DELIVER  ~0                0              a live lifetime
+
+    A LOCAL_DELIVER entry depends on the destination's own ENDPOINT key like
+    any other positive Program — never on the reserved `::` key — because the
+    destination is a published endpoint of this node. It has no PATH
+    dependency, because it resolves no path.
+
+    The target is validated against the LocalEndpointTable and is not taken on
+    the caller's word (D-80: the local destination resolution authority is the
+    LocalEndpoint state). (target_sw_if_index, target_if_incarnation) must be a
+    live interface lifetime (D-31/D-68), the endpoint it carries must be `dst`,
+    and its identity must be `target_identity` — the identity the policy
+    decision was taken against (D-69).
+
     Rejections (all fail-closed, no state change):
-      INVALID_VALUE   - dst is the unspecified address
-      INVALID_VALUE_2 - unknown verdict
-      INVALID_VALUE_3 - one of the three revisions is not the one currently
-                        published for its key (stale compile, 02 §4.3)
-      INVALID_VALUE_4 - a referenced revision key does not exist: the
-                        identity, the destination (with no `::` fallback
-                        published) or the PathCache index has no published
-                        revision (fail-closed, D-83)
-      NO_SUCH_ENTRY   - ALLOW whose path handle does not resolve, or a delete
-                        of a key that is not installed
-      LIMIT_EXCEEDED  - the budget is full and fair eviction found nothing to
-                        evict (counted in program_cache_quota_drops_total)
+      INVALID_VALUE     - dst is the unspecified address
+      INVALID_VALUE_2   - unknown verdict or unknown action
+      INVALID_VALUE_3   - one of the three revisions is not the one currently
+                          published for its key (stale compile, 02 §4.3)
+      INVALID_VALUE_4   - a referenced revision key does not exist: the
+                          identity, the destination (with no `::` fallback
+                          published) or the PathCache index has no published
+                          revision (fail-closed, D-83)
+      INVALID_ARGUMENT  - the {verdict, action, path, target} combination is
+                          not one of the three above (D-80, counted in
+                          `program_illegal_action_installs`)
+      INVALID_INTERFACE - LOCAL_DELIVER whose target is not a live interface
+                          lifetime (`program_local_target_unbound`), or whose
+                          live entry does not carry this destination address or
+                          identity (`program_local_target_mismatch`)
+      NO_SUCH_ENTRY     - ALLOW+ENCAP whose path handle does not resolve, or a
+                          delete of a key that is not installed
+      LIMIT_EXCEEDED    - the budget is full and fair eviction found nothing to
+                          evict (counted in program_cache_quota_drops_total)
 
     @param src_identity - key: source identity
     @param dst - key: destination address
@@ -1183,13 +1239,20 @@ autoendian autoreply define srv6_path_txn_abort
     @param l4_discriminator - key: TCP/UDP destination port, ICMPv6
            (type << 8) | code, 0 otherwise (D-41)
     @param verdict - ALLOW or DENY
+    @param action - ENCAP or LOCAL_DELIVER (D-80); ENCAP for every DENY
     @param policy_revision - POLICY key src_identity (D-30)
     @param endpoint_revision - ENDPOINT key dst, or the reserved `::` key when
            dst is not a published endpoint (D-83)
-    @param path_revision - PATH key path_cache_index; 0 for a DENY, which has
-           no path dependency
-    @param path_cache_index - versioned handle, ALLOW only
-    @param path_generation - versioned handle, ALLOW only
+    @param path_revision - PATH key path_cache_index; 0 for a DENY and for a
+           LOCAL_DELIVER, neither of which has a path dependency
+    @param path_cache_index - versioned handle, ALLOW+ENCAP only
+    @param path_generation - versioned handle, ALLOW+ENCAP only
+    @param target_sw_if_index - LOCAL_DELIVER only: the destination endpoint's
+           VPP interface; 0 otherwise
+    @param target_if_incarnation - LOCAL_DELIVER only: the incarnation of that
+           interface lifetime (D-31); 0 otherwise
+    @param target_identity - LOCAL_DELIVER only: the destination endpoint's
+           Security Identity, re-checked at delivery time (D-69); 0 otherwise
     @param owner_quota_class - owner(namespace) quota class (D-42)
 
     D-51: there is no lease field. The lease belongs to the dependency
@@ -1208,11 +1271,15 @@ autoendian autoreply define srv6_program_add_del
   u8 proto;
   u16 l4_discriminator;
   vl_api_srv6_program_verdict_t verdict;
+  vl_api_srv6_program_action_t action;
   u64 policy_revision;
   u64 endpoint_revision;
   u64 path_revision;
   u32 path_cache_index;
   u32 path_generation;
+  u32 target_sw_if_index;
+  u32 target_if_incarnation;
+  u32 target_identity;
   u32 owner_quota_class;
   bool is_add;
 };
@@ -1242,6 +1309,15 @@ autoendian define srv6_program_dump
            revision, and for an expired one.
     @param stale - the entry's dependency revisions no longer match what the
            node publishes, so the next packet punts (02 §4.2)
+    @param action - the forwarding action of an ALLOW (D-80). It is reported
+           because an operator reading `cilium-dbg srv6 program-cache` cannot
+           otherwise tell a same-node delivery from an encapsulation: a
+           LOCAL_DELIVER entry has no path handle, which without this field is
+           indistinguishable from a DENY's absent one.
+    @param target_sw_if_index - LOCAL_DELIVER only: the delivery interface
+    @param target_if_incarnation - LOCAL_DELIVER only: its incarnation (D-31)
+    @param target_identity - LOCAL_DELIVER only: the destination endpoint's
+           Security Identity the decision was taken against (D-69)
 */
 autoendian define srv6_program_details
 {
@@ -1252,11 +1328,15 @@ autoendian define srv6_program_details
   u8 proto;
   u16 l4_discriminator;
   vl_api_srv6_program_verdict_t verdict;
+  vl_api_srv6_program_action_t action;
   u64 policy_revision;
   u64 endpoint_revision;
   u64 path_revision;
   u32 path_cache_index;
   u32 path_generation;
+  u32 target_sw_if_index;
+  u32 target_if_incarnation;
+  u32 target_identity;
   u32 lease_remaining_ms;
   u32 owner_quota_class;
   bool stale;
@@ -2485,6 +2565,36 @@ counters cilium_srv6_program {
     type counter64;
     units "packets";
     description "the entry's versioned path handle no longer resolves; the PathCache entry was retired (D-12)";
+  };
+  local_deliver {
+    severity info;
+    type counter64;
+    units "packets";
+    description "ProgramCache hit with verdict ALLOW and action LOCAL_DELIVER: the destination is a Pod on this node, so the packet goes to cilium-srv6-local-deliver instead of cilium-srv6-encap (D-80)";
+  };
+};
+
+/* Counters of cilium-srv6-local-deliver (06 §2, D-80, 00 §2.20). The generated
+   symbols are CILIUM_SRV6_LOCAL_DELIVER_ERROR_<NAME> /
+   cilium_srv6_local_deliver_error_counters. */
+counters cilium_srv6_local_deliver {
+  malformed_inner {
+    severity error;
+    type counter64;
+    units "packets";
+    description "DROP_MALFORMED_INNER: defensive check, the IPv6 header is no longer readable after cilium-srv6-program accepted it";
+  };
+  delivered {
+    severity info;
+    type counter64;
+    units "packets";
+    description "packets transmitted to a Pod on this node through the LOCAL_DELIVER target interface (D-80)";
+  };
+  punt_stale_target {
+    severity info;
+    type counter64;
+    units "packets";
+    description "the LOCAL_DELIVER entry's target is no longer the live (sw_if_index, if_incarnation) lifetime carrying this destination and identity, so the packet punts for recompilation instead of being delivered to a reused index (D-31/D-68/D-69)";
   };
 };
 

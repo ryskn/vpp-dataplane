@@ -414,6 +414,32 @@ typedef enum
 } cilium_srv6_verdict_t;
 
 /*
+ * The forwarding action of an ALLOW ProgramCache entry (D-80, 02 §4.3.1,
+ * 00 §2.20).
+ *
+ * D-80 answers "what happens when the destination is a Pod on this node" with
+ * "the same semantic compiler, a different forwarding action". The verdict is
+ * still the NetworkPolicy answer and is produced by exactly the evaluation a
+ * remote destination gets; only what an ALLOW does with the packet differs.
+ * Making it an action rather than a third verdict is what keeps that true: a
+ * DENY for a local destination is an ordinary DENY, and every revision and
+ * lease rule of 02 §4 applies unchanged to both actions.
+ *
+ * ENCAP is value 0 so that a zero-initialised or older-agent install is the
+ * remote action, which cannot deliver to a local interface by accident.
+ *
+ * LOCAL_DELIVER carries the exact `(target_sw_if_index, target_if_incarnation)`
+ * of the destination endpoint plus the identity the policy decision was taken
+ * against. It never encapsulates, never builds an SRH and never loops the
+ * packet back through a local SID: 00 §2.20 rules self-encapsulation out.
+ */
+typedef enum
+{
+  CILIUM_SRV6_ACTION_ENCAP = 0,
+  CILIUM_SRV6_ACTION_LOCAL_DELIVER = 1,
+} cilium_srv6_program_action_t;
+
+/*
  * 02 §4.1 value. Two cache lines: the first holds everything 02 §4.2 reads
  * per packet, the second the statistics and the eviction bookkeeping.
  *
@@ -436,7 +462,8 @@ typedef struct
   u64 path_revision;
   u8 verdict; /* cilium_srv6_verdict_t */
   u8 in_use;
-  u16 pad0;
+  u8 action; /* cilium_srv6_program_action_t (D-80) */
+  u8 pad0;
   u32 owner_quota_class; /* D-42 */
   /* D-83: ENDPOINT key slot this entry's `dst` resolved to at install time,
      or the slot of the reserved `::` key when `dst` was not a published
@@ -445,7 +472,20 @@ typedef struct
      per packet (the ProgramCache one), and the revision comparison is three
      indexed loads. */
   u32 endpoint_rev_slot;
-  u32 pad1;
+  /* D-80: the LOCAL_DELIVER target. It is an interface *lifetime*
+     (D-31/D-68), never a bare index: an sw_if_index is reused the moment the
+     interface is deleted, so an entry holding only the index would deliver a
+     Pod's traffic into whatever Pod inherited the number. All three are 0 for
+     CILIUM_SRV6_ACTION_ENCAP, and srv6_program_add_del refuses an ENCAP entry
+     that carries any of them. */
+  u32 target_sw_if_index;
+  u32 target_if_incarnation;
+  /* The Security Identity the destination endpoint had when the policy
+     decision was taken (D-69). The delivery node compares it against the live
+     LocalEndpointTable entry, so an identity change closes the program on the
+     very next packet rather than waiting for the ENDPOINT revision publish to
+     land. */
+  u32 target_identity;
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
 
@@ -456,6 +496,14 @@ typedef struct
   u32 age_prev;
   u32 age_next;
 } cilium_srv6_program_t;
+
+/* 02 §4.1 keeps everything the hot path reads per packet in the first cache
+   line and the statistics in the second. The D-80 target fields were placed in
+   the padding the first line already had, so the entry did not grow; asserting
+   it here makes a future field that would have spilled a build failure rather
+   than a silent second cache miss per packet. */
+STATIC_ASSERT (sizeof (cilium_srv6_program_t) <= 2 * CLIB_CACHE_LINE_BYTES,
+	       "a ProgramCache entry must fit in two cache lines (02 §4.1)");
 
 /* ------------------------------------------------------------------ */
 /* FragmentVerdictCache (01 §3.1, D-20, D-43)                          */
@@ -1394,6 +1442,29 @@ typedef struct
      (VNET_API_ERROR_INVALID_DST_ADDRESS) already tells the agent which of the
      three refusals it hit. */
   u64 n_program_absence_key_installs;
+  /* D-80 / 02 §4.3.1: srv6_program_add_del refused because the
+     {verdict, action, path, target} combination is not one of the three legal
+     ones. It is its own counter for the same reason
+     n_program_absence_key_installs is: it is a wiring error in the compiler,
+     not a lost race and not a missing publication, so neither a recompile nor
+     a republication makes the install legal. CLI only (adding a field to
+     srv6_headend_status_reply would change that message's CRC); the retval
+     VNET_API_ERROR_INVALID_ARGUMENT is what the agent sees. */
+  u64 n_program_illegal_action_installs;
+  /* D-80: a LOCAL_DELIVER install whose (target_sw_if_index,
+     target_if_incarnation) is not a live LocalEndpointTable lifetime. The
+     target is not something the caller may assert: an index alone is reused
+     (D-31), so an entry installed for a lifetime that has already ended would
+     deliver into whatever Pod inherited the number. CLI only; the retval is
+     VNET_API_ERROR_INVALID_INTERFACE. */
+  u64 n_program_local_target_unbound;
+  /* D-80: a LOCAL_DELIVER install whose target lifetime is live but does not
+     carry this destination — the endpoint's address is not `dst`, or its
+     identity is not the one the decision was taken against. Counted apart
+     from `unbound` because the two point at different faults: unbound is a
+     stale handle, a mismatch is a compiler that resolved the destination to
+     the wrong endpoint. Same retval. */
+  u64 n_program_local_target_mismatch;
   u64 n_lease_extends;
   u64 n_revision_publishes;
   u64 n_frag_evictions;
@@ -1423,6 +1494,7 @@ extern cilium_srv6_headend_main_t cilium_srv6_headend_main;
 extern vlib_node_registration_t cilium_srv6_classify_node;
 extern vlib_node_registration_t cilium_srv6_ct_node;
 extern vlib_node_registration_t cilium_srv6_program_node;
+extern vlib_node_registration_t cilium_srv6_local_deliver_node;
 extern vlib_node_registration_t cilium_srv6_encap_node;
 extern vlib_node_registration_t cilium_srv6_punt_node;
 
@@ -1833,9 +1905,11 @@ int cilium_srv6_path_txn_abort (u64 txn_id);
  * srv6_lease_extend.
  */
 int cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 proto,
-				 u16 l4_discriminator, u8 verdict, u64 policy_revision,
+				 u16 l4_discriminator, u8 verdict, u8 action, u64 policy_revision,
 				 u64 endpoint_revision, u64 path_revision, u32 path_cache_index,
-				 u32 path_generation, u32 owner_quota_class, u8 is_add);
+				 u32 path_generation, u32 target_sw_if_index,
+				 u32 target_if_incarnation, u32 target_identity,
+				 u32 owner_quota_class, u8 is_add);
 
 int cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions,
 					 u32 n_policy);

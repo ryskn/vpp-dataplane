@@ -569,12 +569,14 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   "ProgramCache: %u/%u ALLOW, %u/%u negative "
 		   "(installs %llu, deletes %llu, quota drops %llu, fair evictions %llu, "
 		   "stale installs %llu, missing-key installs %llu, "
-		   "absence-key ALLOW installs %llu)",
+		   "absence-key ALLOW installs %llu, illegal-action installs %llu, "
+		   "local-target unbound %llu, local-target mismatch %llu)",
 		   hm->n_programs[1], hm->program_capacity - hm->program_negative_capacity,
 		   hm->n_programs[0], hm->program_negative_capacity, hm->n_program_installs,
 		   hm->n_program_deletes, hm->n_program_quota_drops, hm->n_program_fair_evictions,
 		   hm->n_program_stale_installs, hm->n_program_missing_key_installs,
-		   hm->n_program_absence_key_installs);
+		   hm->n_program_absence_key_installs, hm->n_program_illegal_action_installs,
+		   hm->n_program_local_target_unbound, hm->n_program_local_target_mismatch);
 
   /* D-61: the reservations of an open staging transaction hold pool slots but
      are not entries of the PathCache, so they are reported separately rather
@@ -841,6 +843,7 @@ cilium_srv6_show_program_cache_command_fn (vlib_main_t *vm, unformat_input_t *in
       const cilium_srv6_program_t *e;
       ip6_address_t dst;
       f64 lease_left;
+      u8 *target = 0;
       int stale;
 
       if (pool_is_free_index (hm->programs, index))
@@ -868,17 +871,25 @@ cilium_srv6_show_program_cache_command_fn (vlib_main_t *vm, unformat_input_t *in
 							 e->policy_revision, now) :
 		     0.0;
 
+      /* D-80: a LOCAL_DELIVER entry has no path handle, so without the target
+	 line an operator cannot tell it from a DENY's absent one. */
+      if (e->action == CILIUM_SRV6_ACTION_LOCAL_DELIVER)
+	target = format (0, "\n  local target sw_if_index %u incarnation %u identity %u",
+			 e->target_sw_if_index, e->target_if_incarnation, e->target_identity);
+
       vlib_cli_output (
 	vm,
-	"[%u] identity %u -> %U proto %u l4-disc %u: %U%s\n"
+	"[%u] identity %u -> %U proto %u l4-disc %u: %U%s%s\n"
 	"  revisions policy %llu endpoint %llu path %llu%s\n"
-	"  path %d gen %u, lease %.1f s, owner %u, %llu pkts %llu bytes",
+	"  path %d gen %u, lease %.1f s, owner %u, %llu pkts %llu bytes%v",
 	index, e->src_identity, format_ip6_address, &dst, (u32) ((e->key[2] >> 16) & 0xff),
 	(u32) (e->key[2] & 0xffff), format_cilium_srv6_verdict, (u32) e->verdict,
+	(e->action == CILIUM_SRV6_ACTION_LOCAL_DELIVER) ? " LOCAL_DELIVER" : "",
 	(e->verdict == CILIUM_SRV6_VERDICT_ALLOW && lease_left == 0.0) ? " (NO VALID LEASE)" : "",
 	e->policy_revision, e->endpoint_revision, e->path_revision, stale ? " STALE" : "",
 	(e->path_cache_index == (u32) ~0) ? -1 : (int) e->path_cache_index, e->path_generation,
-	lease_left, e->owner_quota_class, e->packets, e->bytes);
+	lease_left, e->owner_quota_class, e->packets, e->bytes, target);
+      vec_free (target);
       n++;
     }
 

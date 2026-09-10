@@ -59,6 +59,16 @@ features:
     (policy revision split per source identity), PolicyLeaseTable lease
     enforcement, separate ALLOW and negative budgets, and hierarchical owner
     to identity fair eviction"
+  - "cilium-srv6-local-deliver (D-80): the LOCAL_DELIVER forwarding action of
+    an ALLOW whose destination is a Pod on this node. The packet takes the
+    same guard, classify, conntrack and program chain a remote destination
+    takes and the same NetworkPolicy decision, revision and lease rules apply
+    to it; only what the ALLOW does with the packet differs. The program
+    carries the destination's exact (sw_if_index, if_incarnation) and its
+    security identity, all three are re-checked against the live local
+    endpoint table before every transmission, and a mismatch punts rather
+    than delivering to a reused index. Nothing is encapsulated and the packet
+    is never sent to this node's own Service SID"
   - "Per-key dependency revision namespaces (D-83): ENDPOINT keyed by
     destination address, PATH keyed by PathCache index and POLICY keyed by
     security identity, each published by its own typed message so that a key

@@ -47,6 +47,11 @@ typedef enum
   CILIUM_SRV6_PROGRAM_NEXT_DROP,
   CILIUM_SRV6_PROGRAM_NEXT_ENCAP,
   CILIUM_SRV6_PROGRAM_NEXT_PUNT,
+  /* D-80: an ALLOW whose action is LOCAL_DELIVER. The graph forks here and
+     nowhere earlier, which is what "same semantic compiler, different
+     forwarding action" means in the graph: guard, classify, conntrack and the
+     ProgramCache lookup are identical for both actions (00 §2.20). */
+  CILIUM_SRV6_PROGRAM_NEXT_LOCAL_DELIVER,
   CILIUM_SRV6_PROGRAM_N_NEXT,
 } cilium_srv6_program_next_t;
 
@@ -60,6 +65,8 @@ typedef enum
   CILIUM_SRV6_PROGRAM_PUNT_PATH,
   /* defensive: the header disappeared between classify and here */
   CILIUM_SRV6_PROGRAM_MALFORMED,
+  /* D-80: hit(ALLOW) with action LOCAL_DELIVER. */
+  CILIUM_SRV6_PROGRAM_LOCAL_DELIVER,
   CILIUM_SRV6_PROGRAM_N_VERDICT,
 } cilium_srv6_program_verdict_t;
 
@@ -106,6 +113,8 @@ format_cilium_srv6_program_verdict (u8 *s, va_list *args)
     {
     case CILIUM_SRV6_PROGRAM_ALLOW:
       return format (s, "hit(ALLOW)");
+    case CILIUM_SRV6_PROGRAM_LOCAL_DELIVER:
+      return format (s, "hit(ALLOW, LOCAL_DELIVER)");
     case CILIUM_SRV6_PROGRAM_DENY:
       return format (s, "hit(DENY) -> drop (DROP_POLICY_DENIED)");
     case CILIUM_SRV6_PROGRAM_PUNT_MISS:
@@ -205,6 +214,25 @@ cilium_srv6_program_one (const cilium_srv6_headend_main_t *hm, vlib_buffer_t *b,
   if (PREDICT_FALSE (e->verdict != CILIUM_SRV6_VERDICT_ALLOW))
     return CILIUM_SRV6_PROGRAM_DENY;
 
+  /*
+   * D-80: an ALLOW whose action is LOCAL_DELIVER resolves no path — the
+   * destination is a Pod on this node, so there is nothing to encapsulate on
+   * — and it is dispatched to cilium-srv6-local-deliver, which re-resolves the
+   * target interface lifetime before it transmits. Everything above this line
+   * (the revision comparison and the lease check) ran identically for both
+   * actions, which is the point of D-80: the forwarding action is the only
+   * thing that differs.
+   */
+  if (PREDICT_FALSE (e->action == CILIUM_SRV6_ACTION_LOCAL_DELIVER))
+    {
+      pm->path_cache_index = CILIUM_SRV6_NO_PATH_INDEX;
+      pm->path_generation = 0;
+      pm->program_index = index;
+      e->packets += 1;
+      e->last_used = now;
+      return CILIUM_SRV6_PROGRAM_LOCAL_DELIVER;
+    }
+
   /* D-12: the handle must still resolve to the generation it was compiled
      with, otherwise the path was retired underneath this packet. */
   if (PREDICT_FALSE (cilium_srv6_path_get (hm, e->path_cache_index, e->path_generation) == NULL))
@@ -232,6 +260,8 @@ cilium_srv6_program_error_of_verdict (cilium_srv6_program_verdict_t v)
     {
     case CILIUM_SRV6_PROGRAM_ALLOW:
       return CILIUM_SRV6_PROGRAM_ERROR_ALLOWED;
+    case CILIUM_SRV6_PROGRAM_LOCAL_DELIVER:
+      return CILIUM_SRV6_PROGRAM_ERROR_LOCAL_DELIVER;
     case CILIUM_SRV6_PROGRAM_DENY:
       return CILIUM_SRV6_PROGRAM_ERROR_POLICY_DENIED;
     case CILIUM_SRV6_PROGRAM_PUNT_STALE:
@@ -306,6 +336,16 @@ VLIB_NODE_FN (cilium_srv6_program_node)
        * handle of the entry that produced it, so that the later fragments of
        * the same datagram are forwarded on exactly that decision and nothing
        * broader.
+       *
+       * D-80 deliberately does not extend this to LOCAL_DELIVER. A
+       * FragmentVerdictCache record carries a verdict and a path handle and no
+       * forwarding action, so a record written for a locally delivered first
+       * fragment would send the non-first fragments of that datagram to
+       * cilium-srv6-encap — the one thing the action exists to avoid. Writing
+       * nothing makes those fragments DROP_FRAGMENT_UNRESOLVED, which is the
+       * fail-closed direction. Fragmented same-node datagrams are therefore not
+       * forwarded; extending D-20's binding with the action is a design change
+       * and is reported rather than made here.
        */
       if (PREDICT_FALSE ((meta->flags & CILIUM_SRV6_META_F_FRAG_FIRST) != 0 &&
 			 (v == CILIUM_SRV6_PROGRAM_ALLOW || v == CILIUM_SRV6_PROGRAM_DENY)))
@@ -323,6 +363,10 @@ VLIB_NODE_FN (cilium_srv6_program_node)
 	{
 	case CILIUM_SRV6_PROGRAM_ALLOW:
 	  next[0] = CILIUM_SRV6_PROGRAM_NEXT_ENCAP;
+	  break;
+
+	case CILIUM_SRV6_PROGRAM_LOCAL_DELIVER:
+	  next[0] = CILIUM_SRV6_PROGRAM_NEXT_LOCAL_DELIVER;
 	  break;
 
 	case CILIUM_SRV6_PROGRAM_DENY:
@@ -434,5 +478,6 @@ VLIB_REGISTER_NODE (cilium_srv6_program_node) = {
     [CILIUM_SRV6_PROGRAM_NEXT_DROP] = "ip6-drop",
     [CILIUM_SRV6_PROGRAM_NEXT_ENCAP] = "cilium-srv6-encap",
     [CILIUM_SRV6_PROGRAM_NEXT_PUNT] = "cilium-srv6-punt",
+    [CILIUM_SRV6_PROGRAM_NEXT_LOCAL_DELIVER] = "cilium-srv6-local-deliver",
   },
 };

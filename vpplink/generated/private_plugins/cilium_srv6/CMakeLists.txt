@@ -30,6 +30,7 @@ add_vpp_plugin(cilium_srv6
   cilium_srv6_classify_node.c
   cilium_srv6_ct_node.c
   cilium_srv6_program_node.c
+  cilium_srv6_local_deliver_node.c
   cilium_srv6_encap_node.c
   cilium_srv6_punt_node.c
   cilium_srv6_pmtud.c
@@ -45,6 +46,7 @@ add_vpp_plugin(cilium_srv6
   cilium_srv6_classify_node.c
   cilium_srv6_ct_node.c
   cilium_srv6_program_node.c
+  cilium_srv6_local_deliver_node.c
   cilium_srv6_encap_node.c
   cilium_srv6_punt_node.c
   cilium_srv6_pmtud_node.c

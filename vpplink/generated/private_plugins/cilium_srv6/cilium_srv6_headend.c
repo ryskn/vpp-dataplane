@@ -1647,11 +1647,13 @@ csh_program_evict_one (cilium_srv6_headend_main_t *hm, u32 budget)
 
 int
 cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 proto,
-			     u16 l4_discriminator, u8 verdict, u64 policy_revision,
+			     u16 l4_discriminator, u8 verdict, u8 action, u64 policy_revision,
 			     u64 endpoint_revision, u64 path_revision, u32 path_cache_index,
-			     u32 path_generation, u32 owner_quota_class, u8 is_add)
+			     u32 path_generation, u32 target_sw_if_index, u32 target_if_incarnation,
+			     u32 target_identity, u32 owner_quota_class, u8 is_add)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+  const cilium_srv6_main_t *gm = &cilium_srv6_main;
   vlib_main_t *vm = vlib_get_main ();
   clib_bihash_kv_24_8_t kv;
   cilium_srv6_program_t *e;
@@ -1674,6 +1676,9 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
     return VNET_API_ERROR_INVALID_VALUE;
 
   if (verdict != CILIUM_SRV6_VERDICT_ALLOW && verdict != CILIUM_SRV6_VERDICT_DENY)
+    return VNET_API_ERROR_INVALID_VALUE_2;
+
+  if (action != CILIUM_SRV6_ACTION_ENCAP && action != CILIUM_SRV6_ACTION_LOCAL_DELIVER)
     return VNET_API_ERROR_INVALID_VALUE_2;
 
   cilium_srv6_program_key (key, src_identity, dst, proto, l4_discriminator);
@@ -1748,6 +1753,78 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
       return VNET_API_ERROR_INVALID_DST_ADDRESS;
     }
 
+  /*
+   * D-80 / 00 §2.20 / 02 §4.3.1: the legal {verdict, action, path, target}
+   * combinations are exhaustive, and the cross product is refused here.
+   *
+   *   DENY           ENCAP          NoPathIndex / 0    no target
+   *   ALLOW          ENCAP          valid index / >0   no target
+   *   ALLOW          LOCAL_DELIVER  NoPathIndex / 0    live (index, incarnation)
+   *
+   * A DENY for a local destination is an *ordinary* DENY: the ruling says the
+   * verdict semantics of a local destination are identical to a remote one, so
+   * there is no LOCAL_DELIVER DENY to express — the packet is dropped, and
+   * nothing about the drop depends on which interface would have received it.
+   * A LOCAL_DELIVER carrying a path would mean the entry both encapsulates and
+   * delivers; an ENCAP carrying a target would mean an entry the delivery node
+   * could act on if it were ever reached with the wrong action. Neither is a
+   * race, so both are their own counter rather than a stale or missing-key
+   * report.
+   */
+  {
+    int has_target =
+      (target_sw_if_index != 0 || target_if_incarnation != 0 || target_identity != 0);
+    int illegal = 0;
+
+    if (action == CILIUM_SRV6_ACTION_LOCAL_DELIVER)
+      illegal = (verdict != CILIUM_SRV6_VERDICT_ALLOW || path_revision != CILIUM_SRV6_REV_ABSENT ||
+		 path_cache_index != CILIUM_SRV6_NO_PATH_INDEX || path_generation != 0);
+    else
+      illegal = has_target;
+
+    if (illegal)
+      {
+	hm->n_program_illegal_action_installs++;
+	return VNET_API_ERROR_INVALID_ARGUMENT;
+      }
+  }
+
+  /*
+   * D-80: the local destination resolution authority is the LocalEndpoint
+   * state, and this is where the plugin refuses to take the agent's word for
+   * it. The target must name a *live* interface lifetime (D-31/D-68) that
+   * currently carries exactly this destination:
+   *
+   *   - `cilium_srv6_local_ep_lookup` already fails when the stored
+   *     incarnation is not the live one, so a reused sw_if_index resolves to
+   *     nothing rather than to the new Pod;
+   *   - the incarnation the caller quoted must be the one the table holds, so
+   *     an install for a lifetime that ended is refused rather than aimed at
+   *     whatever now holds the index;
+   *   - the endpoint's address must be `dst`, which is the same check
+   *     cilium_srv6_ct_deliver makes before creating delivery-side conntrack
+   *     state (03 §6): an entry that would deliver a destination to an
+   *     interface that does not hold it is a misdelivery, not a stale entry;
+   *   - the identity must be the one the decision was taken against (D-69), so
+   *     an identity change refuses the install instead of installing an
+   *     authorisation for the previous identity.
+   */
+  if (action == CILIUM_SRV6_ACTION_LOCAL_DELIVER)
+    {
+      const cilium_srv6_local_ep_t *ep = cilium_srv6_local_ep_lookup (hm, gm, target_sw_if_index);
+
+      if (ep == NULL || ep->if_incarnation != target_if_incarnation)
+	{
+	  hm->n_program_local_target_unbound++;
+	  return VNET_API_ERROR_INVALID_INTERFACE;
+	}
+      if (!ip6_address_is_equal (&ep->ip, dst) || ep->identity != target_identity)
+	{
+	  hm->n_program_local_target_mismatch++;
+	  return VNET_API_ERROR_INVALID_INTERFACE;
+	}
+    }
+
   {
     u64 cur_policy = cilium_srv6_policy_revision (hm, slot);
     u64 cur_endpoint = cilium_srv6_endpoint_revision (hm, endpoint_slot);
@@ -1783,20 +1860,23 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
       }
 
     /*
-     * An ALLOW forwards on a path, so it must depend on that path's key; a
-     * DENY must not (02 §4.3: an unrelated route flap may not invalidate it).
-     * 02 §4.3.1 makes the two legal combinations exhaustive:
+     * An ALLOW that *encapsulates* forwards on a path, so it must depend on
+     * that path's key; a DENY must not (02 §4.3: an unrelated route flap may
+     * not invalidate it), and neither must an ALLOW that delivers locally,
+     * because it never resolves a PathCache entry at all (D-80). 02 §4.3.1
+     * makes the legal combinations exhaustive:
      *
-     *   DENY   path_cache_index = CILIUM_SRV6_NO_PATH_INDEX, path_revision = 0
-     *   ALLOW  path_cache_index = a valid PathCache index,   path_revision > 0
+     *   DENY                   path_cache_index = NO_PATH_INDEX, path_revision = 0
+     *   ALLOW + ENCAP          path_cache_index = a valid index, path_revision > 0
+     *   ALLOW + LOCAL_DELIVER  path_cache_index = NO_PATH_INDEX, path_revision = 0
      *
-     * and the cross product is refused here. Refusing it keeps the hot path's
-     * "path_revision == 0 means no path dependency" rule exact, and keeps a
-     * DENY from naming a PathCache index it must not be able to reach.
+     * and the cross product is refused here (the LOCAL_DELIVER row was already
+     * enforced above, together with its target rules). Refusing it keeps the
+     * hot path's "path_revision == 0 means no path dependency" rule exact, and
+     * keeps an entry that must not reach the PathCache from naming an index.
      */
-    if (verdict == CILIUM_SRV6_VERDICT_ALLOW &&
-	(path_revision == CILIUM_SRV6_REV_ABSENT ||
-	 path_cache_index == CILIUM_SRV6_NO_PATH_INDEX))
+    if (verdict == CILIUM_SRV6_VERDICT_ALLOW && action == CILIUM_SRV6_ACTION_ENCAP &&
+	(path_revision == CILIUM_SRV6_REV_ABSENT || path_cache_index == CILIUM_SRV6_NO_PATH_INDEX))
       {
 	hm->n_program_missing_key_installs++;
 	return VNET_API_ERROR_INVALID_VALUE_4;
@@ -1810,7 +1890,7 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
       }
   }
 
-  if (verdict == CILIUM_SRV6_VERDICT_ALLOW)
+  if (verdict == CILIUM_SRV6_VERDICT_ALLOW && action == CILIUM_SRV6_ACTION_ENCAP)
     {
       /* An ALLOW without a resolvable path would encapsulate nowhere. */
       if (cilium_srv6_path_get (hm, path_cache_index, path_generation) == NULL)
@@ -1818,13 +1898,24 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
     }
   else
     {
-      /* Nothing that could make a DENY entry forward may be carried, so that
-	 a DENY can never be turned into a forwarding decision. The check above
-	 already refused any DENY that named an index, so this only normalises
-	 `path_generation`; the assignment is kept so that the invariant holds
-	 by construction and not only by that check. */
+      /* Nothing that could make a DENY — or a LOCAL_DELIVER, which resolves no
+	 path either — forward through the encapsulation may be carried, so that
+	 neither can be turned into an encapsulating decision. The checks above
+	 already refused such an entry if it named an index, so this only
+	 normalises `path_generation`; the assignment is kept so that the
+	 invariant holds by construction and not only by those checks. */
       path_cache_index = CILIUM_SRV6_NO_PATH_INDEX;
       path_generation = 0;
+    }
+
+  /* Same normalisation on the other side: an ENCAP entry holds no target, so
+     the delivery node can never act on one even if it were reached with a
+     buffer whose action byte was wrong. */
+  if (action != CILIUM_SRV6_ACTION_LOCAL_DELIVER)
+    {
+      target_sw_if_index = 0;
+      target_if_incarnation = 0;
+      target_identity = 0;
     }
 
   budget = csh_budget_of (verdict);
@@ -1882,6 +1973,10 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
   e->endpoint_revision = endpoint_revision;
   e->path_revision = path_revision;
   e->verdict = verdict;
+  e->action = action;
+  e->target_sw_if_index = target_sw_if_index;
+  e->target_if_incarnation = target_if_incarnation;
+  e->target_identity = target_identity;
   e->owner_quota_class = owner_quota_class;
   e->last_used = now;
   e->key[0] = key[0];
