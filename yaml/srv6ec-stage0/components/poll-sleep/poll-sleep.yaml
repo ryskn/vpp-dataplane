@@ -11,7 +11,9 @@
 # measures throughput or latency.
 #
 # The whole template is restated because a ConfigMap value is one string; only
-# the `unix` stanza differs from the base.
+# the `unix` stanza differs from the base. Every other stanza — including
+# `cilium-srv6 { punt-socket ... }`, which IF-3 does not come up without — has
+# to be kept identical to the base by hand.
 kind: ConfigMap
 apiVersion: v1
 metadata:
@@ -41,6 +43,9 @@ data:
         plugin bpf_trace_filter.so { enable }
         plugin dispatch_trace_plugin.so { enable }
         plugin cilium_srv6_plugin.so { enable }
+    }
+    cilium-srv6 {
+        punt-socket /run/cilium/srv6ec/punt.sock
     }
     buffers {
       buffers-per-numa 131072

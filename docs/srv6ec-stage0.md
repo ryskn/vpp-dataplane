@@ -42,19 +42,25 @@ That is the designed behaviour, not a defect of this deployment.
   |  |  uplink (virtio)   vpptap0   Pod TUNs                              |  |
   |  +--------------------------------------------------------------------+  |
   +--------------------------------------------------------------------------+
-                              ^
-                              |  IF-2, via the proxy socket
+                     ^                             ^
+                     |  IF-2, via the proxy socket |  IF-3, plugin connects out
+                     |  /var/run/vpp-srv6ec/       |  /run/cilium/srv6ec/
+                     |  vpp-api.sock               |  punt.sock
                         Cilium agent (srv6ec)
 ```
 
-The Cilium agent reaches VPP through the proxy socket, not through VPP's own;
-section 4 explains why.
+The two directions are not symmetric. On IF-2 the Cilium agent is the client and
+connects to a socket inside this DaemonSet — through the proxy socket rather
+than VPP's own, for the reason section 4.2 gives. On IF-3 it is the other way
+round: the Cilium agent binds `/run/cilium/srv6ec/punt.sock` and the
+`cilium_srv6` plugin, inside the `vpp` container, connects out to it. Section
+4.1 covers what that costs this manifest.
 
 ## 2. Containers
 
 | container | image | entrypoint | what it owns |
 |---|---|---|---|
-| `vpp` | `calicovpp/vpp` (with `cilium_srv6_plugin.so`) | `/usr/bin/vpp-manager` | the uplink, `vpptap0`, the VPP process |
+| `vpp` | `calicovpp/vpp` (with `cilium_srv6_plugin.so`) | `/usr/bin/vpp-manager` | the uplink, `vpptap0`, the VPP process, the IF-3 client end |
 | `podinterface-lifecycle` | `calicovpp/agent` | `/bin/podinterface-lifecycle` | Pod TUN creation and deletion, the IF-4 attachment binding, the durable lifecycle state |
 | `vppapi-proxy` | `calicovpp/agent` | `socat` | the IF-2 socket the Cilium agent connects to |
 
@@ -128,6 +134,7 @@ exactly (Issue #135 ruling 4). See section 3.
 |---|---|---|---|
 | `/var/run/vpp/vpp-api.sock` | unix socket, VPP-created (0660 in a 0755 dir) | VPP `socksvr` | `podinterface-lifecycle`, `vppapi-proxy` |
 | `/var/run/vpp-srv6ec/vpp-api.sock` | unix socket, 0600 in a 0700 dir | `vppapi-proxy` | Cilium agent (IF-2) |
+| `/run/cilium/srv6ec/punt.sock` | unix socket, 0600 in a 0700 dir | Cilium agent (IF-3 listener) | the `cilium_srv6` plugin in the `vpp` container |
 | `/var/run/vpp/podinterface-lifecycle.sock` | unix socket, gRPC | `podinterface-lifecycle` | Cilium CNI plugin |
 | `/var/run/vpp/vppmanagerinfofile` | file | `vpp-manager` | `podinterface-lifecycle` (uplink MTU) |
 | `/var/run/vpp/calicovpp_state.v12.json` | file | `podinterface-lifecycle` | itself, across restarts |
@@ -139,6 +146,7 @@ hostPath volumes of the DaemonSet:
 |---|---|---|
 | `vpp-rundir` | `/var/run/vpp` | the sockets and the durable lifecycle state above |
 | `srv6ec-if2-rundir` | `/var/run/vpp-srv6ec` | the proxied IF-2 socket; a hostPath because the Cilium agent Pod mounts the same directory |
+| `cilium-run` | `/run/cilium` | the parent of the IF-3 punt socket the Cilium agent binds, mounted into the `vpp` container only. `DirectoryOrCreate`, and deliberately not the socket's own directory — section 4.1 |
 | `vpp-data` | `/var/lib/vpp` | VPP core files |
 | `vpp-config` | `/etc/vpp` | generated `startup.conf` / `startup.exec` |
 | `netns` | `/run/netns` | Pod network namespaces, mounted `Bidirectional` |
@@ -152,7 +160,105 @@ not a node reboot. A node reboot is a clean dataplane reset in this profile
 expects state to survive a reboot is testing something this profile does not
 provide.
 
-## 4. The IF-2 socket proxy
+## 4. The sockets between the Cilium agent and VPP
+
+Two of the interfaces of the design cross the boundary between the Cilium agent
+Pod and this DaemonSet, in opposite directions. IF-3 (4.1) is the punt/reinject
+transport, where the plugin dials the agent. IF-2 (4.2) is the VPP binary API,
+where the agent dials VPP.
+
+### 4.1 The IF-3 punt socket and the `/run/cilium` mount
+
+The `cilium_srv6` plugin is the **client** on IF-3. The Cilium agent binds
+`/run/cilium/srv6ec/punt.sock` (`pkg/srv6ec/cell.DefaultPuntSocket`, the default
+of `--srv6-punt-socket`), creating the `srv6ec` directory 0700 root and the
+socket 0600 root, and authorises every accepted connection by `SO_PEERCRED`
+against `--srv6-punt-allowed-uids`. In the Stage 0 profile that list is `[0]`.
+The plugin reads the path it dials from its own startup stanza:
+
+```
+cilium-srv6 {
+    punt-socket /run/cilium/srv6ec/punt.sock
+}
+```
+
+`cilium-srv6` is the stanza the plugin registers with
+`VLIB_CONFIG_FUNCTION (cilium_srv6_config, "cilium-srv6")` in
+`cilium_srv6_guard.c`; the value has to equal the agent's
+`--srv6-punt-socket`. This kit creates no state for IF-3 and starts no process
+for it: the connection is opened by the plugin from inside VPP, it is one-way
+client-connect with reconnect (the plugin retries; nothing here supervises it),
+and a socket that is not there yet is not an error for this DaemonSet.
+
+**Peer credential.** What the agent authenticates on IF-3 is the UID of the VPP
+process itself — not a proxy's, as it is on IF-2. The `vpp` container sets no
+`runAsUser`, `vpp-manager/images/ubuntu/Dockerfile` sets no `USER`, and the VPP
+startup configuration sets no `unix { uid ... }`, so VPP runs as UID 0 and
+matches the `[0]` in `--srv6-punt-allowed-uids`. Adding any of those three would
+break IF-3 at accept time, which is why the manifest says so at the
+`securityContext`. UID 0 is required twice over, in fact: the socket's
+directory is 0700 root, so only root can traverse it to reach the socket at
+all, and the peer credential check then decides whether the connection is
+served. The directory mode is a layer; the credential check is the authority.
+
+**Which directory is mounted, and why not the obvious one.** The plugin needs
+`/run/cilium/srv6ec/punt.sock` to resolve inside the `vpp` container. The
+manifest mounts the **parent**, `/run/cilium`, with `type: DirectoryOrCreate`.
+The two narrower alternatives were rejected for concrete reasons:
+
+* **`hostPath: /run/cilium/srv6ec`, `type: DirectoryOrCreate`** — the kubelet
+  would create that directory 0755 root before the agent ever looks at it. The
+  agent's `compiler.secureSocketDir` only chmods a directory *it* created; a
+  pre-existing one is left exactly as it is and merely produces a warning, by
+  the ruling of Issue #21 decision 6 (errata #34 item 121: the agent must not
+  narrow directories it does not own). So the kit would silently downgrade the
+  0700 contract of the dedicated runtime directory to 0755 — a change to a
+  security property, made invisibly, by a deployment kit. The socket's 0600 mode
+  and the peer-credential check would still hold, but the directory layer of
+  00 §4.1 would be gone and nothing would fail to announce it.
+* **`hostPath: /run/cilium/srv6ec`, `type: Directory`** — correct on mode, wrong
+  on ordering. This DaemonSet has to be able to start before the Cilium agent,
+  because the agent Pod mounts the IF-2 proxy directory that this DaemonSet's
+  `vppapi-proxy` container creates, and it mounts it with `type: Directory`
+  (section 7). Requiring here a directory that only exists once the agent has
+  run would put the two Pods on either side of each other's precondition.
+
+Mounting the parent avoids both. It does not weaken anything either, because
+`/run/cilium` on a Cilium node is already created by the kubelet and not by the
+agent: Cilium's own `cilium-run` volume is `hostPath: /var/run/cilium`,
+`type: DirectoryOrCreate`, and the daemon's `os.MkdirAll(RunDir,
+defaults.RuntimePathRights)` is a no-op on a directory that exists. Whichever of
+the two Pods lands on the node first, `/run/cilium` ends up 0755 root. The agent
+never changes that parent's mode, deliberately: `secureSocketDir` creates
+parents only when they are missing and chmods none of them, which is the same
+errata 121 rule seen from the other side. `/run/cilium` and
+`/var/run/cilium` (Cilium's `daemon.runPath` default) are the same directory:
+`/var/run` is a symlink to `/run` on systemd hosts. The manifest uses the
+`/run/cilium` spelling on both sides of the mount so that the container path is
+the socket path the plugin is configured with, with no symlink hop.
+
+Two consequences worth stating rather than discovering:
+
+1. **No mount propagation is needed.** The agent creates `srv6ec` as a plain
+   subdirectory inside a directory the bind mount already shares, not as a new
+   mount point, so it appears in the container as soon as it exists on the host.
+   `mountPropagation` would only matter if the agent mounted something there.
+2. **The mount is read-write and grants nothing new.** The `vpp` container is
+   `privileged` and already mounts the host root at `/host`; `/run/cilium` is
+   reachable from there whether or not this volume exists. The volume exists so
+   the configured path resolves, not to grant access. The plugin only ever
+   `connect(2)`s; it creates nothing under this mount.
+
+**Version coupling.** The `punt-socket` key exists only in a `cilium_srv6`
+snapshot that implements the IF-3 transport. An older snapshot's config parser
+answers ``unknown input `punt-socket ...'``, which is a `clib_error` from a
+`VLIB_CONFIG_FUNCTION` and therefore aborts VPP startup, and the DaemonSet
+crash-loops. That is fail-closed and loud, but it means the ConfigMap and the
+digest-pinned VPP image have to move together — the pin in
+`vpplink/generated/private_plugins/CILIUM_SRV6_SOURCE_COMMIT` is what says
+which plugin tree an image was built from.
+
+### 4.2 The IF-2 socket proxy
 
 `pkg/srv6ec/vppapi.VerifySocketPath` in the Cilium fork requires the VPP binary
 API socket to be a Unix domain socket owned by an accepted UID, with no access
@@ -302,6 +408,12 @@ the first apply: `SERVICE_PREFIX` (the kubeadm `serviceSubnet`), and
 `uplinkInterfaces[0].interfaceName` (the host NIC name, which differs per
 cluster).
 
+`components/poll-sleep` restates the whole `CALICOVPP_CONFIG_TEMPLATE`, because
+a ConfigMap value is one string and there is no way to patch a line of it. Any
+edit to that template in the base has to be repeated there — including the
+`cilium-srv6 { punt-socket ... }` stanza, without which the plugin has no IF-3
+socket to dial and punted packets are dropped rather than resolved.
+
 ### Why the uplink stays `virtio` in Stage 0 and Stage 1
 
 The plugin cannot classify a VPP native virtio-pci uplink as `TRUSTED_FABRIC`:
@@ -319,7 +431,16 @@ Not part of this repository, listed because Stage 0 does not come up without it:
 
 * `--srv6-vpp-api-socket=/var/run/vpp-srv6ec/vpp-api.sock`, and the hostPath
   `/var/run/vpp-srv6ec` mounted into the Cilium agent Pod. Root must be an
-  accepted UID, since the proxy runs as root.
+  accepted UID, since the proxy runs as root. The chart mounts it with
+  `type: Directory` on purpose — a kubelet-created directory would not satisfy
+  the 0700 check — which is also why this DaemonSet has to start first.
+* the IF-3 punt socket left at its defaults: `--srv6-punt-socket` at
+  `/run/cilium/srv6ec/punt.sock` and `--srv6-punt-allowed-uids=0`. The agent
+  binds it; the plugin dials it from the `vpp` container as UID 0. If the flag
+  is moved, `punt-socket` in `CALICOVPP_CONFIG_TEMPLATE` has to move with it.
+  Nothing has to be mounted into the Cilium agent Pod for IF-3 — the socket is
+  inside the agent's own runtime directory — and nothing has to be created on
+  the host: `/run/cilium/srv6ec` is the agent's to create, at 0700.
 * a hostPath for `/var/lib/cilium` so that the srv6ec durable state survives an
   agent restart. The Helm chart mounts only a `subPath` of it, which loses the
   state and makes E2E 6 and E2E 7 unmeasurable (errata 117).
@@ -347,6 +468,13 @@ Not part of this repository, listed because Stage 0 does not come up without it:
 5. **`SRV6_BLOCK` must not overlap node addresses or any PodCIDR** (D-60). The
    test bed value is `fdbb:bb00::/32`, which is a test-only value, not a
    production default.
+6. **The `cilium-srv6 { punt-socket ... }` stanza needs a VPP image that knows
+   the key.** The plugin's startup config parser rejects an unknown key with a
+   `clib_error`, which aborts VPP startup, so pairing this manifest with an
+   image built from a `cilium_srv6` snapshot older than the IF-3 transport
+   crash-loops the DaemonSet. Check
+   `vpplink/generated/private_plugins/CILIUM_SRV6_SOURCE_COMMIT` against the
+   image being deployed (section 4.1).
 
 ## 9. Open items
 

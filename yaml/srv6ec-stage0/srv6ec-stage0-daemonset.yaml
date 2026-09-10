@@ -209,7 +209,22 @@ data:
   #
   # `cpu { workers 0 }` keeps VPP on the main thread only. The poll-sleep
   # component adds `poll-sleep-usec` to the `unix` stanza; see that component
-  # for what it costs.
+  # for what it costs. That component restates this whole value, because a
+  # ConfigMap value is one string — any change here has to be made there too.
+  #
+  # The `cilium-srv6` stanza is the plugin's own startup configuration
+  # (`VLIB_CONFIG_FUNCTION (cilium_srv6_config, "cilium-srv6")` in
+  # cilium_srv6_guard.c). `punt-socket` names the IF-3 punt socket the plugin
+  # connects to as a client; the Cilium agent binds it. The value must equal
+  # the agent's `--srv6-punt-socket`, whose default is
+  # /run/cilium/srv6ec/punt.sock (pkg/srv6ec/cell.DefaultPuntSocket).
+  #
+  # This stanza requires a VPP image whose vendored cilium_srv6 snapshot knows
+  # the `punt-socket` key. An older snapshot's config parser returns
+  # "unknown input `punt-socket ...'" and VPP exits during startup, so the
+  # DaemonSet crash-loops. The failure is loud and fail-closed rather than
+  # silent, but it means this ConfigMap and the pinned VPP image digest have to
+  # move together: see docs/srv6ec-stage0.md §4.1.
   CALICOVPP_CONFIG_TEMPLATE: |-
     unix {
       nodaemon
@@ -232,6 +247,9 @@ data:
         plugin bpf_trace_filter.so { enable }
         plugin dispatch_trace_plugin.so { enable }
         plugin cilium_srv6_plugin.so { enable }
+    }
+    cilium-srv6 {
+        punt-socket /run/cilium/srv6ec/punt.sock
     }
     buffers {
       buffers-per-numa 131072
@@ -283,6 +301,14 @@ spec:
           image: ghcr.io/ryskn/calicovpp/vpp:REPLACE-ME
           imagePullPolicy: IfNotPresent
           securityContext:
+            # No runAsUser here and no USER in vpp-manager/images/ubuntu/
+            # Dockerfile, so VPP and vpp-manager run as UID 0, and the VPP
+            # startup configuration sets no `unix { uid ... }`. That is load
+            # bearing for IF-3: the cilium_srv6 plugin connects to the Cilium
+            # agent's punt socket from inside this process, and the agent
+            # checks SO_PEERCRED against --srv6-punt-allowed-uids, which is
+            # [0] in the Stage 0 profile. Adding runAsUser here, or a `uid`
+            # to the `unix` stanza, breaks the IF-3 connection at accept time.
             privileged: true
           envFrom:
             - configMapRef:
@@ -327,6 +353,15 @@ spec:
             - name: netns
               mountPath: /run/netns/
               mountPropagation: Bidirectional
+            # IF-3. The cilium_srv6 plugin is the client: it connects to
+            # /run/cilium/srv6ec/punt.sock, which the Cilium agent binds. The
+            # mount is the parent directory rather than the socket's own
+            # directory; docs/srv6ec-stage0.md §4.1 has the reasoning. No
+            # mountPropagation is needed: the agent creates a plain
+            # subdirectory inside a directory this bind mount already shares,
+            # not a new mount point.
+            - name: cilium-run
+              mountPath: /run/cilium
             - name: host-root
               mountPath: /host
 
@@ -488,6 +523,36 @@ spec:
           hostPath:
             type: DirectoryOrCreate
             path: /var/run/vpp-srv6ec
+        # Cilium's own runtime directory, so that the cilium_srv6 plugin can
+        # connect to the IF-3 punt socket the Cilium agent binds at
+        # /run/cilium/srv6ec/punt.sock.
+        #
+        # Why the parent and not /run/cilium/srv6ec itself: the agent owns that
+        # subdirectory and creates it 0700 root, with the socket 0600 root
+        # (Issue #21 decision 6). compiler.secureSocketDir only chmods a
+        # directory it created itself — a pre-existing one is left alone and
+        # merely warned about — so a `srv6ec` directory the kubelet had created
+        # first would stay 0755 root and the 0700 contract would be silently
+        # lost. Not `type: Directory` on that path either: this DaemonSet has
+        # to start before the Cilium agent (the agent Pod mounts the IF-2 proxy
+        # directory this DaemonSet's vppapi-proxy container creates, with
+        # `type: Directory`), so requiring a directory the agent has not
+        # created yet would make the two Pods wait on each other.
+        #
+        # DirectoryOrCreate on the parent adds no outcome that a Cilium node
+        # does not already have: Cilium's own `cilium-run` volume is
+        # DirectoryOrCreate on the same directory, so the kubelet — not the
+        # agent — creates it, 0755 root, whichever of the two Pods lands first.
+        # The agent never changes the mode of this parent by design.
+        #
+        # /run/cilium and /var/run/cilium (Cilium's `daemon.runPath` default)
+        # are the same directory: /var/run is a symlink to /run on systemd
+        # hosts. The name used here matches the socket path the plugin is
+        # configured with, so it needs no symlink hop inside the container.
+        - name: cilium-run
+          hostPath:
+            type: DirectoryOrCreate
+            path: /run/cilium
         - name: host-root
           hostPath:
             path: /
