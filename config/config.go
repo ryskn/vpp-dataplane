@@ -45,7 +45,12 @@ const (
 	// it serves a different contract (PodInterfaceLifecycle rather than the
 	// Calico CNI backend) to a different caller, and the two profiles are
 	// never both active on a node.
-	PodInterfaceLifecycleSocket = "/var/run/vpp/podinterface-lifecycle.sock"
+	//
+	// The path is the one the CNI NetConf default names
+	// (cniDatapathProvider.socket, detail/00 §2.17.3): the CNI plugin is the
+	// only caller, so the two have to agree. /run/vpp and /var/run/vpp are the
+	// same directory; the design spelling is used here.
+	PodInterfaceLifecycleSocket = "/run/vpp/pod-interface-lifecycle.sock"
 	FelixDataplaneSocket        = "/var/run/calico/felix-dataplane.sock"
 	VppAPISocket                = "/var/run/vpp/vpp-api.sock"
 	VppManagerInfoFile          = "/var/run/vpp/vppmanagerinfofile"
