@@ -53,6 +53,11 @@ jobs:
           go build -ldflags="-s -w" -o ./bin/felix-api-proxy   ./cmd/api-proxy
           go build -ldflags="-s -w" -o ./bin/calico-vpp-agent  ./cmd
           go build -ldflags="-s -w" -o ./bin/gobgp             github.com/osrg/gobgp/v3/cmd/gobgp/
+          # Second entrypoint, not a mode of the agent: the Pod interface
+          # lifecycle service of the SRv6 Endpoint Context Stage 0 profile
+          # (Issue #135 ruling 3). It ships in the same image because both
+          # entrypoints are built from the same cni/vpplink tree.
+          go build -ldflags="-s -w" -o ./bin/podinterface-lifecycle ./cmd/podinterface-lifecycle
           ls -lh bin/
 
       - name: Generate version file
