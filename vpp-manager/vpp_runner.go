@@ -845,12 +845,33 @@ func (v *VppRunner) doVppGlobalConfiguration() (err error) {
 	return nil
 }
 
+/* newCalicoClient is the only place where a Calico datastore client is built.
+ * It is a variable so that tests can observe whether a client was constructed;
+ * production code must only reach it from a caller gated on the calico
+ * deployment profile. */
+var newCalicoClient = calicov3cli.NewFromEnv
+
+/* updateNodeAddresses publishes the addresses VPP configured on the uplink to
+ * the cluster control plane.
+ *
+ * This is a Calico datastore write, so it only runs in the calico deployment
+ * profile. In the external profile no Calico client is constructed and no
+ * Calico resource is read or written, so readiness does not depend on a Calico
+ * node resource being present in the cluster. */
+func (v *VppRunner) updateNodeAddresses(ifState *config.LinuxInterfaceState) error {
+	if !config.GetDeploymentProfile().UsesCalicoDatastore() {
+		log.Infof("Deployment profile %s: not updating the Calico node", config.GetDeploymentProfile())
+		return nil
+	}
+	return v.updateCalicoNode(ifState)
+}
+
 func (v *VppRunner) updateCalicoNode(ifState *config.LinuxInterfaceState) (err error) {
 	var node, updated *internalapi.Node
 	var client calicov3cli.Interface
 	// TODO create if doesn't exist? need to be careful to do it atomically... and everyone else must as well.
 	for i := 0; i < 10; i++ {
-		client, err = calicov3cli.NewFromEnv()
+		client, err = newCalicoClient()
 		if err != nil {
 			return errors.Wrap(err, "Error creating calico client")
 		}
@@ -1132,7 +1153,8 @@ func (v *VppRunner) runVpp() (err error) {
 	}
 
 	// Update the Calico node with the IP address actually configured on VPP
-	err = v.updateCalicoNode(v.conf[0])
+	// (calico deployment profile only)
+	err = v.updateNodeAddresses(v.conf[0])
 	if err != nil {
 		terminateVpp("Error updating Calico node (SIGINT %d): %v", vppProcess.Pid, err)
 		<-vppDeadChan

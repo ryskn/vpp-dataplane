@@ -96,4 +96,35 @@ var _ = Describe("Test Common Config", func() {
 		Expect(errs[0]).To(HaveOccurred())
 
 	})
+
+	It("Test Deployment Profile parsing", func() {
+		defer func() {
+			Expect(os.Unsetenv(DeploymentProfileEnvVarName)).ToNot(HaveOccurred())
+			Expect(ParseEnvVars(DeploymentProfileEnvVarName)).To(BeEmpty())
+		}()
+
+		/* unset defaults to the calico profile, preserving the existing behaviour */
+		Expect(os.Unsetenv(DeploymentProfileEnvVarName)).ToNot(HaveOccurred())
+		Expect(ParseEnvVars(DeploymentProfileEnvVarName)).To(BeEmpty())
+		Expect(GetDeploymentProfile()).To(Equal(DeploymentProfileCalico))
+		Expect(GetDeploymentProfile().UsesCalicoDatastore()).To(BeTrue())
+
+		Expect(os.Setenv(DeploymentProfileEnvVarName, "calico")).ToNot(HaveOccurred())
+		Expect(ParseEnvVars(DeploymentProfileEnvVarName)).To(BeEmpty())
+		Expect(GetDeploymentProfile()).To(Equal(DeploymentProfileCalico))
+		Expect(GetDeploymentProfile().UsesCalicoDatastore()).To(BeTrue())
+
+		Expect(os.Setenv(DeploymentProfileEnvVarName, "external")).ToNot(HaveOccurred())
+		Expect(ParseEnvVars(DeploymentProfileEnvVarName)).To(BeEmpty())
+		Expect(GetDeploymentProfile()).To(Equal(DeploymentProfileExternal))
+		Expect(GetDeploymentProfile().UsesCalicoDatastore()).To(BeFalse())
+
+		/* an unknown value is a configuration error, never a fallback */
+		for _, unknown := range []string{"cilium", "Calico", "EXTERNAL", "none", "auto"} {
+			Expect(os.Setenv(DeploymentProfileEnvVarName, unknown)).ToNot(HaveOccurred())
+			errs := ParseEnvVars(DeploymentProfileEnvVarName)
+			Expect(len(errs)).To(Equal(1), "value %s should not be a valid profile", unknown)
+			Expect(errs[0]).To(HaveOccurred())
+		}
+	})
 })

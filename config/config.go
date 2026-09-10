@@ -109,6 +109,35 @@ const (
 	BGPServerModeV4Only    BGPServerModeType = "v4Only"
 )
 
+// DeploymentProfileType selects which cluster control plane this deployment
+// runs against. It is always specified explicitly: the absence of the Calico
+// API is never used to infer a profile, so a misconfigured cluster fails at
+// startup instead of silently degrading to a different behaviour.
+type DeploymentProfileType string
+
+// DeploymentProfileEnvVarName is the environment variable carrying the
+// deployment profile.
+const DeploymentProfileEnvVarName = "CALICOVPP_DEPLOYMENT_PROFILE"
+
+const (
+	// DeploymentProfileCalico is the default profile. vpp-manager owns the
+	// Calico datastore state that describes this node (the BGP addresses of
+	// the node resource) and reports Ready only once that write succeeded.
+	DeploymentProfileCalico DeploymentProfileType = "calico"
+	// DeploymentProfileExternal runs VPP under a control plane that is not
+	// Calico. In this profile vpp-manager performs no Calico datastore access
+	// at all: the Calico client is never constructed, no Calico resource is
+	// read or written, and readiness (info file, health) does not depend on a
+	// Calico node resource existing.
+	DeploymentProfileExternal DeploymentProfileType = "external"
+)
+
+// UsesCalicoDatastore reports whether the profile allows vpp-manager to read
+// or write the Calico datastore.
+func (p DeploymentProfileType) UsesCalicoDatastore() bool {
+	return p == DeploymentProfileCalico
+}
+
 // IPFamilyConfig declares which IP families are expected to be present on an uplink interface.
 type IPFamilyConfig string
 
@@ -148,10 +177,14 @@ var (
 	True  = true
 	False = false
 
-	NodeName      = RequiredStringEnvVar("NODENAME")
-	LogLevel      = EnvVar("CALICOVPP_LOG_LEVEL", logrus.InfoLevel, logrus.ParseLevel)
-	BGPLogLevel   = EnvVar("CALICOVPP_BGP_LOG_LEVEL", apipb.SetLogLevelRequest_INFO, BGPLogLevelParse)
-	BGPServerMode = EnvVar("CALICOVPP_BGP_SERVER_MODE", BGPServerModeDualStack, BGPServerModeParse)
+	NodeName = RequiredStringEnvVar("NODENAME")
+	/* Which control plane this deployment runs against. Must be given
+	 * explicitly; an unknown value is a startup error, and no automatic
+	 * detection of the Calico API is performed. */
+	DeploymentProfile = EnvVar(DeploymentProfileEnvVarName, DeploymentProfileCalico, DeploymentProfileParse)
+	LogLevel          = EnvVar("CALICOVPP_LOG_LEVEL", logrus.InfoLevel, logrus.ParseLevel)
+	BGPLogLevel       = EnvVar("CALICOVPP_BGP_LOG_LEVEL", apipb.SetLogLevelRequest_INFO, BGPLogLevelParse)
+	BGPServerMode     = EnvVar("CALICOVPP_BGP_SERVER_MODE", BGPServerModeDualStack, BGPServerModeParse)
 
 	ServiceCIDRs                     = PrefixListEnvVar("SERVICE_PREFIX")
 	IPSecIkev2Psk                    = StringEnvVar("CALICOVPP_IPSEC_IKEV2_PSK", "")
@@ -250,6 +283,9 @@ func GetCalicoVppFeatureGates() *CalicoVppFeatureGatesConfigType   { return *Cal
 func GetCalicoVppIpsec() *CalicoVppIpsecConfigType                 { return *CalicoVppIpsec }
 func GetCalicoVppSrv6() *CalicoVppSrv6ConfigType                   { return *CalicoVppSrv6 }
 func GetCalicoVppInitialConfig() *CalicoVppInitialConfigConfigType { return *CalicoVppInitialConfig }
+
+// GetDeploymentProfile returns the explicitly configured deployment profile.
+func GetDeploymentProfile() DeploymentProfileType { return *DeploymentProfile }
 
 type InterfaceSpec struct {
 	NumRxQueues int   `json:"rx"`

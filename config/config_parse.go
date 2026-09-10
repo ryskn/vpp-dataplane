@@ -269,6 +269,22 @@ func BGPLogLevelParse(lvl string) (apipb.SetLogLevelRequest_Level, error) {
 	return l, fmt.Errorf("not a valid logrus Level: %q", lvl)
 }
 
+// DeploymentProfileParse parses the deployment profile. Only the exact known
+// profile names are accepted: an unknown value is an error, which makes the
+// process fail when the configuration is loaded, rather than a silent fallback
+// to a default profile. The Calico API is never probed to guess the profile.
+func DeploymentProfileParse(profile string) (DeploymentProfileType, error) {
+	switch DeploymentProfileType(profile) {
+	case DeploymentProfileCalico:
+		return DeploymentProfileCalico, nil
+	case DeploymentProfileExternal:
+		return DeploymentProfileExternal, nil
+	}
+
+	return DeploymentProfileCalico, fmt.Errorf("not a valid deployment profile: %q (expected %q or %q)",
+		profile, DeploymentProfileCalico, DeploymentProfileExternal)
+}
+
 func BGPServerModeParse(mode string) (BGPServerModeType, error) {
 	switch strings.ToLower(mode) {
 	case strings.ToLower(string(BGPServerModeDualStack)):
