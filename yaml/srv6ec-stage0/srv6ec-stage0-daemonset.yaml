@@ -288,10 +288,12 @@ spec:
             - configMapRef:
                 name: srv6ec-stage0-config
           env:
-            - name: DATASTORE_TYPE
-              value: "kubernetes"
-            - name: WAIT_FOR_DATASTORE
-              value: "true"
+            # Explicit deployment profile (ryskn/cilium-private #21 ruling 1,
+            # vpp-dataplane PR #47): vpp-manager must not construct or consult
+            # the Calico datastore, and its readiness must not depend on a
+            # Calico Node object. There is no auto-detection fallback.
+            - name: CALICOVPP_DEPLOYMENT_PROFILE
+              value: "external"
             - name: NODENAME
               valueFrom:
                 fieldRef:
