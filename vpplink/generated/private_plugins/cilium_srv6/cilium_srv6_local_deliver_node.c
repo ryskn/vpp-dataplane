@@ -15,6 +15,10 @@
  * (02 §4.2). Only what an ALLOW then does with the packet differs, and this
  * node is that difference:
  *
+ *   0. re-resolve the ProgramCache entry and re-check the decision it carries —
+ *      its three dependency revisions, including the D-85 agent incarnation
+ *      fence, and its D-51 lease — because an index is not a decision and the
+ *      entry can be replaced or staled between the two nodes;
  *   1. re-resolve the target interface lifetime and re-check that it still
  *      carries this destination (D-31 / D-68 / D-69);
  *   2. the headend egress conntrack step of 02 §6 step 1, i.e. the same hook
@@ -181,6 +185,34 @@ cilium_srv6_local_deliver_one (vlib_main_t *vm, const cilium_srv6_headend_main_t
   e = (pm->program_index == (u32) ~0) ? NULL : cilium_srv6_program_at (hm, pm->program_index);
   if (PREDICT_FALSE (e == NULL || !e->in_use || e->verdict != CILIUM_SRV6_VERDICT_ALLOW ||
 		     e->action != CILIUM_SRV6_ACTION_LOCAL_DELIVER))
+    return CILIUM_SRV6_LOCAL_DELIVER_STALE_TARGET;
+
+  /*
+   * The re-resolution above admits an entry that is *an* ALLOW LOCAL_DELIVER,
+   * not necessarily the one cilium-srv6-program judged: the pool slot can have
+   * been replaced between the two nodes, and a revision publish that arrives in
+   * that window (a control-plane call runs under the worker barrier, which this
+   * node's frame is either side of) can stale the very entry the previous node
+   * accepted. Delivery is a forwarding decision, so it re-checks the decision's
+   * dependencies with exactly the predicate the ProgramCache hit used, rather
+   * than trusting an index across a node boundary — the same reason
+   * cilium-srv6-encap re-resolves the path handle instead of carrying a pointer
+   * (D-12). D-85 makes this concrete: a delivery must never run on an entry
+   * quoting an agent incarnation that is no longer the authority, whatever the
+   * forwarding action (00 §2.23.5, errata #34 item 176).
+   *
+   * Cost: the three indexed loads of 02 §4.2, no hash lookup.
+   */
+  if (PREDICT_FALSE (!cilium_srv6_revisions_match (hm, e->policy_rev_slot, e->policy_revision,
+						   e->endpoint_rev_slot, e->endpoint_revision,
+						   e->path_cache_index, e->path_revision)))
+    return CILIUM_SRV6_LOCAL_DELIVER_STALE_TARGET;
+
+  /* D-51: and the lease that vouches for that revision must still be usable.
+     `now` is this node's, so an entry whose lease expired between the two nodes
+     is punted here rather than delivered. */
+  if (PREDICT_FALSE (!cilium_srv6_policy_lease_valid (hm, e->policy_rev_slot, e->src_identity,
+						      e->policy_revision, now)))
     return CILIUM_SRV6_LOCAL_DELIVER_STALE_TARGET;
 
   /*

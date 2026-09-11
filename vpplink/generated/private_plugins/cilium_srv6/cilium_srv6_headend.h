@@ -68,6 +68,10 @@
    one place its fragment enum has to agree with the wire is asserted in
    cilium_srv6_classify_node.c, where that value is produced. */
 #include <cilium_srv6/cilium_srv6_punt_wire.h>
+/* The revision value type and the D-85 fence. Like the serializer above it
+   carries no vlib/vnet dependency, which is what lets test/hotpath/ check the
+   fence on the host. */
+#include <cilium_srv6/cilium_srv6_revision.h>
 
 /* ------------------------------------------------------------------ */
 /* capacities and defaults                                             */
@@ -195,68 +199,17 @@
 #define CILIUM_SRV6_HEADEND_FRAG_GC_PER_TICK	 4096
 
 /*
- * Sentinel revision. Slot 0 of the policy and endpoint revision tables is the
- * "key has no slot" slot and holds this value, which no published revision can
- * take, so an entry that depends on an unknown key never matches and punts
- * (fail-closed).
+ * The revision value type — the two reserved values, the D-85 incarnation
+ * layout and the fence — lives in cilium_srv6_revision.h, which depends on
+ * nothing but <vppinfra/clib.h> so that the fence can be checked host-side
+ * (test/hotpath/). It is included above with the other plugin headers.
+ *
+ *   CILIUM_SRV6_REV_INVALID        the "no such key" sentinel
+ *   CILIUM_SRV6_REV_ABSENT         0, "this key does not exist"
+ *   CILIUM_SRV6_REV_INCARNATION()  the agent process generation of a revision
+ *   cilium_srv6_revision_is_current()  the D-85 fence
+ *   cilium_srv6_revision_matches()     fence + per-key equality
  */
-#define CILIUM_SRV6_REV_INVALID ((u64) ~0)
-
-/*
- * D-83 value range, shared by the three revision namespaces (ENDPOINT keyed by
- * destination IPv6, PATH keyed by PathCache index, POLICY keyed by
- * SecurityIdentity):
- *
- *   0                        the key does not exist. A publish of 0 withdraws
- *                            the key; no install may quote it; a slot whose
- *                            revision reads 0 never matches a quotation.
- *   1 .. CILIUM_SRV6_REV_INVALID-1
- *                            a real revision. Same value again = idempotent,
- *                            lower = refused, higher = advance.
- *   CILIUM_SRV6_REV_INVALID  reserved sentinel, always refused on publish.
- *
- * 0 is deliberately not "revision zero": the agent's revision counters start
- * at 1, so making 0 mean absence removes the case in which a freshly created
- * slot compares equal to a quotation that was made before it existed.
- *
- * The one place a quoted 0 is legal is `path_revision` of a DENY ProgramCache
- * entry, which has no path dependency at all (02 §4.3: a DENY must not be
- * invalidated by an unrelated route flap).
- */
-#define CILIUM_SRV6_REV_ABSENT ((u64) 0)
-
-/*
- * D-85 (00 §2.23) — agent revision incarnation.
- *
- * A revision is not a bare counter. It is
- *
- *   revision = (agent_revision_incarnation << 32) | local_sequence
- *
- * where the incarnation is a durable monotonic counter of *agent process*
- * generations (srv6_instance_state v2) and the sequence is the per-key
- * process-local counter the agent already had. A restarted agent therefore
- * starts numerically above everything any previous process of that node
- * published, in every namespace at once, so the per-key "lower is refused" rule
- * above accepts it with no resynchronisation and no dump message.
- *
- * The layout alone does not cover a key the new agent process no longer knows
- * about: nothing republishes it, so this plugin keeps the old value and an
- * entry installed by the old process would still compare equal to it. So the
- * plugin also keeps the incarnation it last accepted
- * (`hm->current_revision_incarnation`) and treats *every* quotation of another
- * incarnation as stale. That is what makes "the agent that decided this is
- * gone" a property of the quotation itself, with no table walk.
- *
- * Neither reserved value can be produced by the agent's composition (0 has
- * incarnation 0, which is never claimed; ~0 would need incarnation 0xffffffff,
- * which is reserved), so the two rules do not interfere.
- *
- * The one quoted 0 that is legal — a DENY's `path_revision` — is *not*
- * incarnation-checked, for the same reason it is not key-checked: it states
- * "this entry has no path dependency" and is not a member of the revision
- * namespace at all.
- */
-#define CILIUM_SRV6_REV_INCARNATION(rev) ((u32) ((rev) >> 32))
 
 /*
  * ENDPOINT_ABSENCE_REVISION — the reserved ENDPOINT revision key `::`
@@ -1798,31 +1751,33 @@ cilium_srv6_revisions_match (const cilium_srv6_headend_main_t *hm, u32 policy_re
 			     u64 policy_revision, u32 endpoint_rev_slot, u64 endpoint_revision,
 			     u32 path_cache_index, u64 path_revision)
 {
+  u32 incarnation = hm->current_revision_incarnation;
+  u64 published;
+
   /*
-   * D-85 fence, first because it is the cheapest and the most general: an entry
-   * whose quoted revisions were produced by an agent process that no longer
-   * holds the revision authority can never be valid, whatever the per-key
-   * tables say. It is what makes an entry for a key the current agent process
-   * never republished — and therefore one whose slot still holds the old
-   * value — stale without enumerating anything.
+   * Each of the three is judged by cilium_srv6_revision_matches(), which is the
+   * D-85 fence and the per-key equality in one function — the same function the
+   * conntrack reply bypass and the D-51 lease call, so that no forwarding
+   * judgement can be fenced differently from another, and so that the CLI
+   * (which reaches all of them through this function and
+   * cilium_srv6_policy_lease_remaining) shows exactly what the packet path
+   * decides.
    *
-   * Cost: two shifts and two compares against one u32 that shares a cache line
-   * with the revision table pointers this function already dereferences. No
-   * per-entry field is added: the incarnation is *in* the quoted revisions, so
-   * storing a copy would be a third place the same number lives.
+   * The fence is what makes an entry for a key the current agent process never
+   * republished — and therefore one whose slot still holds the old value —
+   * stale without enumerating anything.
+   *
+   * Cost: three shifts and three compares against one u32 that shares a cache
+   * line with the revision table pointers this function already dereferences.
+   * No per-entry field is added: the incarnation is *in* the quoted revisions,
+   * so storing a copy would be a third place the same number lives.
    */
-  if (PREDICT_FALSE (CILIUM_SRV6_REV_INCARNATION (policy_revision) !=
-		     hm->current_revision_incarnation))
+  published = cilium_srv6_policy_revision (hm, policy_rev_slot);
+  if (PREDICT_FALSE (!cilium_srv6_revision_matches (policy_revision, published, incarnation)))
     return 0;
 
-  if (PREDICT_FALSE (CILIUM_SRV6_REV_INCARNATION (endpoint_revision) !=
-		     hm->current_revision_incarnation))
-    return 0;
-
-  if (policy_revision != cilium_srv6_policy_revision (hm, policy_rev_slot))
-    return 0;
-
-  if (endpoint_revision != cilium_srv6_endpoint_revision (hm, endpoint_rev_slot))
+  published = cilium_srv6_endpoint_revision (hm, endpoint_rev_slot);
+  if (PREDICT_FALSE (!cilium_srv6_revision_matches (endpoint_revision, published, incarnation)))
     return 0;
 
   /* A DENY quotes 0 here: "no path dependency". It is not a revision, so it is
@@ -1830,11 +1785,8 @@ cilium_srv6_revisions_match (const cilium_srv6_headend_main_t *hm, u32 policy_re
   if (path_revision == CILIUM_SRV6_REV_ABSENT)
     return 1;
 
-  if (PREDICT_FALSE (CILIUM_SRV6_REV_INCARNATION (path_revision) !=
-		     hm->current_revision_incarnation))
-    return 0;
-
-  return path_revision == cilium_srv6_path_revision (hm, path_cache_index);
+  published = cilium_srv6_path_revision (hm, path_cache_index);
+  return cilium_srv6_revision_matches (path_revision, published, incarnation);
 }
 
 /*
@@ -1852,7 +1804,7 @@ cilium_srv6_revision_is_stale_incarnation (const cilium_srv6_headend_main_t *hm,
   if (revision == CILIUM_SRV6_REV_ABSENT)
     return 0;
 
-  return CILIUM_SRV6_REV_INCARNATION (revision) != hm->current_revision_incarnation;
+  return !cilium_srv6_revision_is_current (revision, hm->current_revision_incarnation);
 }
 
 /*
@@ -1869,17 +1821,32 @@ cilium_srv6_revision_is_stale_incarnation (const cilium_srv6_headend_main_t *hm,
  *   2. the lease must have been granted for this very revision, so that a
  *      lease pushed for an older or newer revision does not keep this
  *      decision alive;
- *   3. the deadline must not have passed.
+ *   3. the revision the lease was granted for must belong to the agent process
+ *      that currently holds the revision authority (D-85, 00 §2.23.5);
+ *   4. the deadline must not have passed.
  *
- * One indexed read of the slot answers all three; there is no second table
+ * One indexed read of the slot answers all four; there is no second table
  * and no per-entry field, which is what keeps srv6_lease_extend O(identities)
  * (02 §5.4).
+ *
+ * Condition 3 is not implied by the others. A lease is a statement by *a*
+ * policy watcher that it is alive and vouches for a revision, and it carries a
+ * deadline of its own; when the agent process is replaced, a lease the previous
+ * process pushed is still within its deadline and still granted for the very
+ * revision the old entry quotes, and the slot still holds that revision for
+ * every key the new process has not republished. Without this condition such a
+ * lease keeps a previous generation's decision alive until it times out, which
+ * is precisely the liveness proof D-51 says a lease is: the process that made
+ * the statement no longer exists. The comparison is the same one-u32 fence the
+ * revision check uses, so the CLI's "(NO VALID LEASE)" and the hot path's
+ * PUNT_LEASE stay one predicate (errata #34 item 176).
  */
 static_always_inline int
 cilium_srv6_policy_lease_valid (const cilium_srv6_headend_main_t *hm, u32 slot, u32 identity,
 				u64 dependency_revision, f64 now)
 {
   const cilium_srv6_policy_rev_t *r;
+  u32 incarnation = hm->current_revision_incarnation;
 
   if (PREDICT_FALSE (slot == 0 || slot >= vec_len (hm->policy_rev)))
     return 0;
@@ -1891,6 +1858,9 @@ cilium_srv6_policy_lease_valid (const cilium_srv6_headend_main_t *hm, u32 slot, 
 
   if (PREDICT_FALSE (dependency_revision == CILIUM_SRV6_REV_INVALID ||
 		     r->lease_revision != dependency_revision))
+    return 0;
+
+  if (PREDICT_FALSE (!cilium_srv6_revision_is_current (dependency_revision, incarnation)))
     return 0;
 
   return now < r->lease_valid_until;

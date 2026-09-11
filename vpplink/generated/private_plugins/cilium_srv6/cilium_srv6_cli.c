@@ -950,8 +950,8 @@ cilium_srv6_show_conntrack_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   "ConntrackTable: %u/%u UNVERIFIED (D-38 budget), %u/%u authorised\n"
 		   "  created %llu/%llu, promotions %llu (rejected %llu), quota drops %llu,\n"
 		   "  evictions %llu, timeouts %llu, invalidated %llu\n"
-		   "  reply hits refused: incarnation %llu, revision %llu, lease %llu, "
-		   "protocol state %llu\n"
+		   "  reply hits refused: incarnation %llu, revision %llu (of which stale "
+		   "agent incarnation %llu), lease %llu, protocol state %llu\n"
 		   "  hooks %s",
 		   ctm->n_entries[CILIUM_SRV6_CT_BUDGET_UNVERIFIED], ctm->unverified_capacity,
 		   ctm->n_entries[CILIUM_SRV6_CT_BUDGET_VERIFIED],
@@ -960,7 +960,7 @@ cilium_srv6_show_conntrack_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   ctm->n_created[CILIUM_SRV6_CT_BUDGET_VERIFIED], ctm->n_verified,
 		   ctm->n_verify_rejected, ctm->n_quota_drops, ctm->n_evictions, ctm->n_gc,
 		   ctm->n_invalidated, ctm->n_incarnation_mismatch, ctm->n_revision_mismatch,
-		   ctm->n_lease_expired, ctm->n_proto_state_denied,
+		   ctm->n_stale_incarnation, ctm->n_lease_expired, ctm->n_proto_state_denied,
 		   cilium_srv6_ct_lookup_hook ? "registered" : "absent");
 
   for (index = 0; index < ctm->capacity && n < max; index++)

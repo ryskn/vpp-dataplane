@@ -273,6 +273,16 @@ typedef struct
   u64 n_forward;
   u64 n_incarnation_mismatch;
   u64 n_revision_mismatch;
+  /* D-85 (00 §2.23.5, errata #34 item 176): of the `n_revision_mismatch`
+     refusals above, how many were the agent-revision-incarnation fence — the
+     entry's `verified_revision` was quoted by an agent process that no longer
+     holds the revision authority — rather than a per-key policy change. A
+     subset, not a separate reason, because the remedy for the packet is the
+     same (D-47 branch 2) while the remedy for the *node* is not: a per-key
+     change is fixed by the next re-authorisation, this one only by the new
+     agent process finishing its seed. CLI only: adding a field to
+     srv6_conntrack_stats_reply would change that message's CRC. */
+  u64 n_stale_incarnation;
   u64 n_lease_expired;
   u64 n_proto_state_denied;
 

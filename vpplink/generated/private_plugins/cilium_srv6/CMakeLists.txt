@@ -67,6 +67,7 @@ add_vpp_plugin(cilium_srv6
   cilium_srv6_gparse.h
   cilium_srv6_hparse.h
   cilium_srv6_punt_wire.h
+  cilium_srv6_revision.h
   cilium_srv6_pmtud.h
   cilium_srv6_pmtud_parse.h
   cilium_srv6_counters.h

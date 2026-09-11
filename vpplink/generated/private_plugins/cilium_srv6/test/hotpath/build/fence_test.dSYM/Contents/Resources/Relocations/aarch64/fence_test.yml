@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/ryosuke/project/cilium-wt/impl-176/vpp/plugins/cilium_srv6/test/hotpath/build/fence_test'
+relocations:     []
+...

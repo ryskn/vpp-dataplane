@@ -413,6 +413,8 @@ cilium_srv6_ct_lookup (vlib_main_t *vm, u32 thread_index, vlib_buffer_t *b,
   const cilium_srv6_path_meta_t *pm = cilium_srv6_path_meta (b);
   const ip6_header_t *ip;
   cilium_srv6_ct_entry_t *e;
+  u32 incarnation = hm->current_revision_incarnation;
+  u64 published;
   u64 key[5];
   u32 index;
   u8 th;
@@ -504,12 +506,35 @@ cilium_srv6_ct_lookup (vlib_main_t *vm, u32 thread_index, vlib_buffer_t *b,
    * This is where a policy change is detected, and it is detected on the
    * first reply after the change regardless of how much lease is left: the
    * two are independent properties (00 §2.1).
+   *
+   * D-85 (00 §2.23.5, errata #34 item 176): the equality alone is not enough.
+   * `verified_revision` is a quotation made by whichever agent process answered
+   * the re-authorisation, and the ruling makes *every* quotation of an older
+   * incarnation stale — "それ以前の incarnation を quote する Program /
+   * Fragment / CT 由来 revision はすべて stale として扱う". For a remote
+   * identity the new process no longer knows about, nothing republishes the
+   * slot, so the equality keeps passing and this bypass would forward a reply
+   * on a decision taken by a process that no longer holds the revision
+   * authority — and it forwards it straight to cilium-srv6-encap, where the
+   * ProgramCache check that carries the fence never runs. The fence is
+   * therefore part of the same predicate the ProgramCache path uses
+   * (cilium_srv6_revision_matches), and a refusal is an UNVERIFIED entry as far
+   * as this node is concerned: D-47 branch 2, the re-authorisation punt.
    */
-  if (PREDICT_FALSE (e->verified_revision == CILIUM_SRV6_REV_INVALID ||
-		     e->verified_revision !=
-		       cilium_srv6_policy_revision_of (hm, e->policy_rev_slot, e->remote_identity)))
+  published = cilium_srv6_policy_revision_of (hm, e->policy_rev_slot, e->remote_identity);
+  if (PREDICT_FALSE (!cilium_srv6_revision_matches (e->verified_revision, published, incarnation)))
     {
       ctm->n_revision_mismatch++;
+
+      /* A breakdown of the line above, not a second reason: how many of those
+	 refusals were the D-85 fence rather than a per-key change. The sentinel
+	 is excluded — an UNVERIFIED entry quotes no revision at all, so it is
+	 not a quotation of a previous incarnation. */
+      if (e->verified_revision != CILIUM_SRV6_REV_INVALID &&
+	  e->verified_revision != CILIUM_SRV6_REV_ABSENT &&
+	  !cilium_srv6_revision_is_current (e->verified_revision, incarnation))
+	ctm->n_stale_incarnation++;
+
       return CILIUM_SRV6_CT_REPLY_REAUTH;
     }
 
