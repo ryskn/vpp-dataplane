@@ -226,6 +226,39 @@
 #define CILIUM_SRV6_REV_ABSENT ((u64) 0)
 
 /*
+ * D-85 (00 §2.23) — agent revision incarnation.
+ *
+ * A revision is not a bare counter. It is
+ *
+ *   revision = (agent_revision_incarnation << 32) | local_sequence
+ *
+ * where the incarnation is a durable monotonic counter of *agent process*
+ * generations (srv6_instance_state v2) and the sequence is the per-key
+ * process-local counter the agent already had. A restarted agent therefore
+ * starts numerically above everything any previous process of that node
+ * published, in every namespace at once, so the per-key "lower is refused" rule
+ * above accepts it with no resynchronisation and no dump message.
+ *
+ * The layout alone does not cover a key the new agent process no longer knows
+ * about: nothing republishes it, so this plugin keeps the old value and an
+ * entry installed by the old process would still compare equal to it. So the
+ * plugin also keeps the incarnation it last accepted
+ * (`hm->current_revision_incarnation`) and treats *every* quotation of another
+ * incarnation as stale. That is what makes "the agent that decided this is
+ * gone" a property of the quotation itself, with no table walk.
+ *
+ * Neither reserved value can be produced by the agent's composition (0 has
+ * incarnation 0, which is never claimed; ~0 would need incarnation 0xffffffff,
+ * which is reserved), so the two rules do not interfere.
+ *
+ * The one quoted 0 that is legal — a DENY's `path_revision` — is *not*
+ * incarnation-checked, for the same reason it is not key-checked: it states
+ * "this entry has no path dependency" and is not a member of the revision
+ * namespace at all.
+ */
+#define CILIUM_SRV6_REV_INCARNATION(rev) ((u32) ((rev) >> 32))
+
+/*
  * ENDPOINT_ABSENCE_REVISION — the reserved ENDPOINT revision key `::`
  * (D-83, 02 §4.3.1, errata #34 item 153).
  *
@@ -1296,6 +1329,20 @@ typedef struct
      generation half of the handle check. */
   u64 *path_revs;
 
+  /* D-85 (00 §2.23): the agent process generation this plugin instance last
+     accepted a revision publish from, i.e. the high 32 bits of every revision
+     that may currently be quoted.
+
+     0 means "no agent has published a revision to this instance yet", which is
+     the state a fresh plugin instance starts in and in which no ProgramCache
+     entry can exist to be fenced. The first publish of any namespace advances
+     it; a publish quoting a lower incarnation is refused exactly like any other
+     backwards move; a quotation of any other incarnation is stale.
+
+     It sits next to the revision tables rather than in the control-plane block
+     below because the hot path reads it on every ProgramCache validation. */
+  u32 current_revision_incarnation;
+
   /* 01 §1 outer header parameters. */
   ip6_address_t node_address;
   u32 outer_fib_index;
@@ -1465,6 +1512,18 @@ typedef struct
      stale handle, a mismatch is a compiler that resolved the destination to
      the wrong endpoint. Same retval. */
   u64 n_program_local_target_mismatch;
+  /* D-85 (00 §2.23): an install, a fragment verdict or an srv6_ct_verify
+     refused because a quoted revision carries an agent revision incarnation
+     that is not `current_revision_incarnation`. It is counted apart from
+     `n_program_stale_installs` because the two point at different faults and
+     have different remedies: a stale install is a lost race against a key that
+     moved, which the next compile fixes, while this one says the decision was
+     taken by an agent process that no longer holds the revision authority —
+     every entry of that generation is unusable, and what fixes it is the new
+     process finishing its seed, not a recompile of this one entry. CLI only:
+     adding a field to srv6_headend_status_reply would change that message's
+     CRC, and the retval is the existing stale-install one. */
+  u64 n_stale_incarnation_quotes;
   u64 n_lease_extends;
   u64 n_revision_publishes;
   u64 n_frag_evictions;
@@ -1739,16 +1798,61 @@ cilium_srv6_revisions_match (const cilium_srv6_headend_main_t *hm, u32 policy_re
 			     u64 policy_revision, u32 endpoint_rev_slot, u64 endpoint_revision,
 			     u32 path_cache_index, u64 path_revision)
 {
+  /*
+   * D-85 fence, first because it is the cheapest and the most general: an entry
+   * whose quoted revisions were produced by an agent process that no longer
+   * holds the revision authority can never be valid, whatever the per-key
+   * tables say. It is what makes an entry for a key the current agent process
+   * never republished — and therefore one whose slot still holds the old
+   * value — stale without enumerating anything.
+   *
+   * Cost: two shifts and two compares against one u32 that shares a cache line
+   * with the revision table pointers this function already dereferences. No
+   * per-entry field is added: the incarnation is *in* the quoted revisions, so
+   * storing a copy would be a third place the same number lives.
+   */
+  if (PREDICT_FALSE (CILIUM_SRV6_REV_INCARNATION (policy_revision) !=
+		     hm->current_revision_incarnation))
+    return 0;
+
+  if (PREDICT_FALSE (CILIUM_SRV6_REV_INCARNATION (endpoint_revision) !=
+		     hm->current_revision_incarnation))
+    return 0;
+
   if (policy_revision != cilium_srv6_policy_revision (hm, policy_rev_slot))
     return 0;
 
   if (endpoint_revision != cilium_srv6_endpoint_revision (hm, endpoint_rev_slot))
     return 0;
 
+  /* A DENY quotes 0 here: "no path dependency". It is not a revision, so it is
+     neither key-checked nor incarnation-checked. */
   if (path_revision == CILIUM_SRV6_REV_ABSENT)
     return 1;
 
+  if (PREDICT_FALSE (CILIUM_SRV6_REV_INCARNATION (path_revision) !=
+		     hm->current_revision_incarnation))
+    return 0;
+
   return path_revision == cilium_srv6_path_revision (hm, path_cache_index);
+}
+
+/*
+ * The D-85 fence on its own, for the control-plane paths that want to count the
+ * refusal apart from a per-key mismatch (srv6_program_add_del,
+ * srv6_fragment_verdict_add, srv6_ct_verify). Returns non-zero when `revision`
+ * was produced by an agent process that is not the current revision authority.
+ *
+ * `CILIUM_SRV6_REV_ABSENT` answers 0: a quoted 0 is a DENY's "no path
+ * dependency", which the caller has already established is legal for it.
+ */
+static_always_inline int
+cilium_srv6_revision_is_stale_incarnation (const cilium_srv6_headend_main_t *hm, u64 revision)
+{
+  if (revision == CILIUM_SRV6_REV_ABSENT)
+    return 0;
+
+  return CILIUM_SRV6_REV_INCARNATION (revision) != hm->current_revision_incarnation;
 }
 
 /*

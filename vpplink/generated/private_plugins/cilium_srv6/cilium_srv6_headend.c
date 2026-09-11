@@ -1840,6 +1840,29 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
 	return VNET_API_ERROR_INVALID_VALUE_3;
       }
 
+    /*
+     * D-85 (00 §2.23): a quotation from another agent process generation.
+     *
+     * It is checked before the per-key comparison below, because the two are
+     * not the same fault and the per-key one cannot see this case at all: an
+     * entry for a key the current agent process never republished still finds
+     * the old value in the slot and would compare equal. Checking it here is
+     * what makes "the agent that decided this is gone" refuse the install
+     * without enumerating or deleting a single old key.
+     *
+     * A DENY's `path_revision == 0` is excluded, exactly as it is excluded from
+     * the missing-key and per-key checks: it states "no path dependency" and is
+     * not a member of the revision namespace.
+     */
+    if (cilium_srv6_revision_is_stale_incarnation (hm, policy_revision) ||
+	cilium_srv6_revision_is_stale_incarnation (hm, endpoint_revision) ||
+	cilium_srv6_revision_is_stale_incarnation (hm, path_revision))
+      {
+	hm->n_stale_incarnation_quotes++;
+	hm->n_program_stale_installs++;
+	return VNET_API_ERROR_INVALID_VALUE_3;
+      }
+
     /* Missing key: fail-closed, and distinguishable from a stale quotation. A
        DENY quotes path_revision 0 ("no path dependency"), which is not a
        reference to a PATH key and is therefore not checked here. */
@@ -2102,6 +2125,53 @@ csh_revision_value_check (u64 revision, u64 current, int *rv)
 }
 
 /*
+ * D-85 (00 §2.23), the publish half: the agent revision incarnation carried in
+ * the high 32 bits of every published revision.
+ *
+ * Per element, in the same validation pass and with the same all-or-nothing
+ * discipline as csh_revision_value_check():
+ *
+ *   below `hm->current_revision_incarnation`  refused. A publish from an agent
+ *       process that no longer holds the revision authority is a backwards move
+ *       of the whole namespace, so it is refused with the same retval a
+ *       backwards move of one key gets (VNET_API_ERROR_INVALID_VALUE_2).
+ *   equal                                     nothing to do; the per-key rules
+ *       of csh_revision_value_check() decide.
+ *   above                                      accepted, and `*next` is raised.
+ *       The caller writes `*next` into hm->current_revision_incarnation inside
+ *       the barrier, so the advance happens exactly when the message is applied.
+ *
+ * A withdraw (revision 0) carries no incarnation and is skipped: it says a key
+ * stopped existing, which is true under any generation.
+ *
+ * Advancing is what makes every quotation of an older incarnation stale, with
+ * no walk of the ProgramCache and no dump of the old key set: the comparison
+ * lives in cilium_srv6_revisions_match(), on the packet.
+ */
+static int
+csh_revision_incarnation_check (const cilium_srv6_headend_main_t *hm, u64 revision, u32 *next,
+				int *rv)
+{
+  u32 incarnation;
+
+  if (revision == CILIUM_SRV6_REV_ABSENT || revision == CILIUM_SRV6_REV_INVALID)
+    return 0;
+
+  incarnation = CILIUM_SRV6_REV_INCARNATION (revision);
+
+  if (incarnation < hm->current_revision_incarnation)
+    {
+      *rv = VNET_API_ERROR_INVALID_VALUE_2;
+      return -1;
+    }
+
+  if (incarnation > *next)
+    *next = incarnation;
+
+  return 0;
+}
+
+/*
  * D-30 + D-84: the POLICY namespace, keyed by SecurityIdentity. The producer
  * is the agent's policy revision bumper, which seeds the whole identity
  * snapshot before ProgramCache publication opens and then publishes only the
@@ -2115,6 +2185,8 @@ cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   vlib_main_t *vm = vlib_get_main ();
   u32 i, n_new = 0;
+  /* D-85: the incarnation this message would leave the plugin at. */
+  u32 next_incarnation = hm->current_revision_incarnation;
   int taken;
   int rv = 0;
 
@@ -2136,6 +2208,9 @@ cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions
 	}
       else
 	current = hm->policy_rev[slot].policy_revision;
+
+      if (csh_revision_incarnation_check (hm, revisions[i], &next_incarnation, &rv))
+	return rv;
 
       if (csh_revision_value_check (revisions[i], current, &rv))
 	return rv;
@@ -2185,6 +2260,11 @@ cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions
       hm->policy_rev[slot].policy_revision = revisions[i];
     }
 
+  /* D-85: the advance happens with the message, inside the barrier, so no
+     packet can observe the new incarnation before the revisions that carry
+     it — nor the revisions before the incarnation. */
+  hm->current_revision_incarnation = next_incarnation;
+
   hm->n_revision_publishes++;
 
   cilium_srv6_barrier_release (vm, taken);
@@ -2217,6 +2297,10 @@ cilium_srv6_endpoint_revision_publish (const ip6_address_t *dsts, const u64 *rev
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   vlib_main_t *vm = vlib_get_main ();
   u32 i, n_new = 0;
+  /* D-85: the incarnation this message would leave the plugin at. The absence
+     seed of 00 §2.23 is an ordinary member of this namespace, which is what
+     makes a node with zero endpoints able to advance it at all. */
+  u32 next_incarnation = hm->current_revision_incarnation;
   int taken;
   int rv = 0;
 
@@ -2247,6 +2331,9 @@ cilium_srv6_endpoint_revision_publish (const ip6_address_t *dsts, const u64 *rev
 	}
       else
 	current = hm->endpoint_rev[slot].hwm;
+
+      if (csh_revision_incarnation_check (hm, revisions[i], &next_incarnation, &rv))
+	return rv;
 
       if (csh_revision_value_check (revisions[i], current, &rv))
 	return rv;
@@ -2302,6 +2389,9 @@ cilium_srv6_endpoint_revision_publish (const ip6_address_t *dsts, const u64 *rev
 	hm->endpoint_rev[slot].hwm = revisions[i];
     }
 
+  /* D-85: see the policy publish. */
+  hm->current_revision_incarnation = next_incarnation;
+
   hm->n_revision_publishes++;
 
   cilium_srv6_barrier_release (vm, taken);
@@ -2320,6 +2410,8 @@ cilium_srv6_path_revision_publish (const u32 *indices, const u64 *revisions, u32
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   vlib_main_t *vm = vlib_get_main ();
   u32 i;
+  /* D-85: the incarnation this message would leave the plugin at. */
+  u32 next_incarnation = hm->current_revision_incarnation;
   int taken;
 
   if (!hm->initialised)
@@ -2341,6 +2433,9 @@ cilium_srv6_path_revision_publish (const u32 *indices, const u64 *revisions, u32
 	   hm->paths[indices[i]].state != CILIUM_SRV6_PATH_PUBLISHED))
 	return VNET_API_ERROR_NO_SUCH_ENTRY;
 
+      if (csh_revision_incarnation_check (hm, revisions[i], &next_incarnation, &rv))
+	return rv;
+
       if (csh_revision_value_check (revisions[i], hm->path_revs[indices[i]], &rv))
 	return rv;
     }
@@ -2349,6 +2444,9 @@ cilium_srv6_path_revision_publish (const u32 *indices, const u64 *revisions, u32
 
   for (i = 0; i < n_path; i++)
     hm->path_revs[indices[i]] = revisions[i];
+
+  /* D-85: see the policy publish. */
+  hm->current_revision_incarnation = next_incarnation;
 
   hm->n_revision_publishes++;
 
@@ -3074,6 +3172,19 @@ cilium_srv6_frag_verdict_add (const ip6_address_t *src, const ip6_address_t *dst
 	return VNET_API_ERROR_INVALID_DST_ADDRESS;
       }
   }
+
+  /* D-85 (00 §2.23), counted apart from the per-key mismatch below for the
+     same reason srv6_program_add_del counts it apart: a fragment verdict
+     decided by an agent process that no longer holds the revision authority is
+     not a lost race, and the retval the caller sees is the same one the
+     per-key mismatch produces. The DENY exclusion is inside the helper. */
+  if (cilium_srv6_revision_is_stale_incarnation (hm, policy_revision) ||
+      cilium_srv6_revision_is_stale_incarnation (hm, endpoint_revision) ||
+      cilium_srv6_revision_is_stale_incarnation (hm, path_revision))
+    {
+      hm->n_stale_incarnation_quotes++;
+      return VNET_API_ERROR_INVALID_VALUE_4;
+    }
 
   if (!cilium_srv6_revisions_match (hm, ep->policy_rev_slot, policy_revision, endpoint_slot,
 				    endpoint_revision, path_cache_index, path_revision))

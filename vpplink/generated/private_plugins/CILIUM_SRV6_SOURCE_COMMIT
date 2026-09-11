@@ -5,4 +5,4 @@
 # snapshot and this commit's tree differ by a single byte.
 CILIUM_SRV6_SOURCE_REPO=https://github.com/ryskn/cilium-private.git
 CILIUM_SRV6_SOURCE_PATH=vpp/plugins/cilium_srv6
-CILIUM_SRV6_SOURCE_COMMIT=bc6d2c80c4a43d63b694b53d155c0dee2acd2e2c
+CILIUM_SRV6_SOURCE_COMMIT=b0d9e89cfbd21c923e56fe2622feb342cef436dd

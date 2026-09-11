@@ -925,6 +925,19 @@ cilium_srv6_ct_verify (const ip6_address_t *src, const ip6_address_t *dst, u8 pr
       goto done;
     }
 
+  /* D-85 (00 §2.23): the re-authorisation was decided by an agent process that
+     no longer holds the revision authority. It is checked before the per-key
+     comparison because the per-key one cannot see it: if the peer identity is
+     one the current agent process does not know about, the slot still holds the
+     previous generation's value and the two would compare equal. Counted apart
+     for the same reason srv6_program_add_del counts it apart. */
+  if (cilium_srv6_revision_is_stale_incarnation (hm, policy_revision))
+    {
+      cilium_srv6_headend_main.n_stale_incarnation_quotes++;
+      rv = VNET_API_ERROR_INVALID_VALUE_4;
+      goto done;
+    }
+
   /* Same rule as srv6_program_add_del: nothing decided under a revision is
      installed once that revision has moved (02 §4.3). */
   if (policy_revision != cilium_srv6_policy_revision_of (hm, slot, remote_identity))

@@ -554,11 +554,14 @@ cilium_srv6_show_headend_command_fn (vlib_main_t *vm, unformat_input_t *input,
     vlib_cli_output (vm,
 		     "revision keys (D-83): endpoint %u/%u, path %u/%u, policy %u/%u, "
 		     "%llu publishes\n"
+		     "agent revision incarnation (D-85): %u"
+		     " (%llu quotations refused as stale)\n"
 		     "PolicyLeaseTable: %u/%u identities, %u leased now, "
 		     "install-time lease %.1f s, %llu renewals (D-51)",
 		     (u32) pool_elts (hm->endpoint_rev) - 1, hm->endpoint_rev_capacity,
 		     n_path_revisions, hm->path_capacity, (u32) pool_elts (hm->policy_rev) - 1,
 		     hm->policy_rev_capacity, hm->n_revision_publishes,
+		     hm->current_revision_incarnation, hm->n_stale_incarnation_quotes,
 		     (u32) pool_elts (hm->policy_rev) - 1, hm->policy_rev_capacity, n_leased,
 		     (f64) hm->allow_lease_ms * 1e-3, hm->n_lease_extends);
   }
