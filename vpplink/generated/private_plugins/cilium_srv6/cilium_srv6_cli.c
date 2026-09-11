@@ -94,6 +94,56 @@ VLIB_CLI_COMMAND (cilium_srv6_show_guard_command, static) = {
   .function = cilium_srv6_show_guard_command_fn,
 };
 
+/*
+ * D-72: the plugin instance identity, on the CLI.
+ *
+ * The identity already exists and is already reported over IF-2 by
+ * srv6_instance_get; this command adds no state and no API message, it prints
+ * the value cilium_srv6_guard_init drew. It exists because the identity is the
+ * load-bearing one of the three lifetimes D-72 keeps apart - an InterfaceHandle
+ * `(sw_if_index, if_incarnation)` is unique only WITHIN one plugin instance, so
+ * "is this the same handle" cannot be answered without it - and IF-2 is not a
+ * channel an operator, or an acceptance runbook, can read. 06 §4 asks for a
+ * plugin CLI usable while the agent is down, and the composite capability
+ * identity is exactly the question that has to be answerable then: after a VPP
+ * restart the lifecycle service re-creates the same interfaces in the same
+ * order and the incarnation counter restarts with the plugin, so the bare
+ * tuples come back identical and only this value separates the two namespaces.
+ *
+ * Only equality is meaningful. The value is not a secret, carries no ordering
+ * and must not be parsed for structure, so it is printed as the same 32 lower
+ * case hex digits the wire and the agent's durable record use (16 bytes, which
+ * is format_hex_bytes' short form: one %02x per byte, no separators).
+ *
+ * `initialised` is the same gate the API handler applies, for the same reason:
+ * before init completes there is no drawn identity, and printing the zero value
+ * would be indistinguishable from a real one - which is the single failure this
+ * identity exists to prevent, since every consumer's decision is an equality
+ * test on it.
+ */
+static clib_error_t *
+cilium_srv6_show_instance_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				      vlib_cli_command_t *cmd)
+{
+  const cilium_srv6_main_t *cm = &cilium_srv6_main;
+
+  if (!cm->initialised)
+    {
+      vlib_cli_output (vm, "plugin instance: NOT INITIALISED");
+      return 0;
+    }
+
+  vlib_cli_output (vm, "plugin instance: %U", format_hex_bytes, cm->plugin_instance_id,
+		   (int) CILIUM_SRV6_INSTANCE_ID_LEN);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cilium_srv6_show_instance_command, static) = {
+  .path = "show cilium srv6 instance",
+  .short_help = "show cilium srv6 instance",
+  .function = cilium_srv6_show_instance_command_fn,
+};
+
 static clib_error_t *
 cilium_srv6_set_acl_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
