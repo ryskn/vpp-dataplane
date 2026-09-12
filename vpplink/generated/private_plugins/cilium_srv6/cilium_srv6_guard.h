@@ -27,6 +27,11 @@
    a vlib-free header so that they can be fuzzed as a pure function. */
 #include <cilium_srv6/cilium_srv6_gparse.h>
 
+/* The trust classification values (03 §1.1, D-31) and the predicate that
+   decides which interfaces carry cilium-srv6-classify (errata #34 item 191)
+   live in a vlib-free header for the same reason. */
+#include <cilium_srv6/cilium_srv6_classify_scope.h>
+
 /*
  * Worker barrier helpers shared by every control plane path of the plugin.
  *
@@ -115,19 +120,9 @@ cilium_srv6_barrier_release (vlib_main_t *vm, int taken)
  */
 #define CILIUM_SRV6_INSTANCE_ID_LEN 16
 
-/*
- * Interface trust classification (03 §1.1, D-31).
- *
- * QUARANTINED must stay 0: every zero-initialised or not-yet-classified
- * interface has to be fail-safe.
- */
-typedef enum
-{
-  CILIUM_SRV6_TRUST_QUARANTINED = 0,
-  CILIUM_SRV6_TRUST_UNTRUSTED = 1,
-  CILIUM_SRV6_TRUST_TRUSTED_FABRIC = 2,
-  CILIUM_SRV6_TRUST_N,
-} cilium_srv6_trust_t;
+/* The interface trust classification enum (03 §1.1, D-31) is defined in
+ * cilium_srv6_classify_scope.h, included above, next to the predicate that
+ * reads it. */
 
 /*
  * Per-interface guard state. The dataplane reads only `trust`; every other
@@ -144,7 +139,13 @@ typedef struct
   /* control plane */
   u8 valid;	      /* interface currently exists */
   u8 guard_installed; /* cilium-srv6-guard on the ingress arc */
-  u8 promotable;      /* may become TRUSTED_FABRIC (D-31) */
+  /* cilium-srv6-classify on the ingress arc. Owned by the headend
+     (cilium_srv6_headend_classify_refresh), kept here because it is
+     per-interface-lifetime state that outlives any one local endpoint, and
+     because vnet_feature_enable_disable() is reference counted and must not
+     be called twice for the same state. */
+  u8 classify_installed;
+  u8 promotable; /* may become TRUSTED_FABRIC (D-31) */
   u32 incarnation;
   f64 quarantined_at; /* time of the last entry into QUARANTINED */
 } cilium_srv6_guard_if_t;

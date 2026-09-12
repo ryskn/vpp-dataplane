@@ -1934,6 +1934,15 @@ int cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 ident
 				  u32 owner_quota_class, u8 is_add);
 
 /*
+ * Re-evaluate cilium_srv6_classify_wanted() for one interface and install or
+ * remove cilium-srv6-classify accordingly (errata #34 item 191). Call it from
+ * every event that can change either input — a LocalEndpointTable write and a
+ * trust classification commit — with the worker barrier held. Returns 0 when
+ * the interface ends up in the wanted state.
+ */
+int cilium_srv6_headend_classify_refresh (u32 sw_if_index);
+
+/*
  * The PathCache index and generation are assigned by the plugin, not by the
  * agent: the pool belongs to the dataplane and D-12 requires the generation
  * to be the plugin's own record of how many times the slot has been reused.

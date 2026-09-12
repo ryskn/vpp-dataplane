@@ -781,9 +781,15 @@ VLIB_REGISTER_NODE (cilium_srv6_classify_node) = {
 /*
  * 02 §1: the headend chain starts at the Pod interface, immediately after the
  * ingress guard of 03 §1.1. Unlike the guard — which is permanent and on
- * every interface — classify is enabled per interface by
- * srv6_local_ep_add_del, because an interface with no local endpoint has no
- * source identity to resolve.
+ * every interface — classify is enabled per interface, by
+ * cilium_srv6_headend_classify_refresh() against
+ * cilium_srv6_classify_wanted(): from the moment the interface is classified
+ * UNTRUSTED (D-73, i.e. it is Pod-facing) and for as long as it has a local
+ * endpoint. It used to be enabled by srv6_local_ep_add_del alone, which made
+ * DROP_UNKNOWN_SOURCE_EP unreachable in the one state it describes: the
+ * packets of a Pod interface with no endpoint were not classified at all,
+ * they left the arc and were forwarded by the plain IPv6 FIB (errata #34
+ * item 191).
  *
  * Ordering: after cilium-srv6-guard (a packet must pass the injection guard
  * before it is classified) and before ip6-flow-classify, which is the head of

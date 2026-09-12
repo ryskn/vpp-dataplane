@@ -2559,8 +2559,13 @@ cilium_srv6_lease_extend (const u32 *identities, const u64 *revisions, u32 n_pol
 
 /*
  * cilium-srv6-classify is enabled per interface rather than globally: the
- * graph of 02 §1 starts at a Pod interface, and an interface with no local
- * endpoint has nothing for the classify stage to resolve.
+ * graph of 02 §1 starts at a Pod interface, and putting it on every interface
+ * would put it on the host TAP, which never has a LocalEndpointTable entry
+ * (03 §1.1 / D-58).
+ *
+ * Which interfaces it belongs on is cilium_srv6_classify_wanted()
+ * (cilium_srv6_classify_scope.h). It is deliberately not "an interface with a
+ * local endpoint": see errata #34 item 191 and the header comment there.
  */
 static int
 csh_classify_feature_set (u32 sw_if_index, int enable)
@@ -2572,6 +2577,69 @@ csh_classify_feature_set (u32 sw_if_index, int enable)
 		 sw_if_index, rv);
 
   return rv;
+}
+
+/*
+ * Drive the classify feature of one interface to `want`.
+ *
+ * vnet_feature_enable_disable() is reference counted per (arc, feature,
+ * interface), so the state has to be tracked rather than re-asserted; this is
+ * the same shape as csg_guard_feature_set() and it is what makes every caller
+ * below able to call unconditionally. The flag lives in the trust map entry
+ * because it belongs to the interface lifetime, not to any one local endpoint.
+ *
+ * The caller must hold the worker barrier.
+ */
+static int
+csh_classify_set (u32 sw_if_index, int want)
+{
+  cilium_srv6_main_t *cm = &cilium_srv6_main;
+  cilium_srv6_guard_if_t *e;
+  u8 w = want ? 1 : 0;
+  int rv;
+
+  if (sw_if_index >= vec_len (cm->ifs))
+    return 0;
+
+  e = vec_elt_at_index (cm->ifs, sw_if_index);
+
+  if (w == e->classify_installed)
+    return 0;
+
+  rv = csh_classify_feature_set (sw_if_index, w);
+  if (rv != 0)
+    return rv;
+
+  e->classify_installed = w;
+  return 0;
+}
+
+/*
+ * Bring the classify feature of one interface in line with
+ * cilium_srv6_classify_wanted(), i.e. with the current trust classification
+ * (D-73) and the current LocalEndpointTable content. Safe to call from every
+ * event that can change either input; errata #34 item 191.
+ *
+ * The caller must hold the worker barrier: the answer is read from the trust
+ * map and the LocalEndpointTable, both of which the dataplane reads.
+ */
+int
+cilium_srv6_headend_classify_refresh (u32 sw_if_index)
+{
+  cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+  const cilium_srv6_main_t *cm = &cilium_srv6_main;
+  int has_local_ep;
+
+  if (!hm->initialised)
+    return 0;
+
+  if (sw_if_index >= vec_len (cm->ifs) || !cm->ifs[sw_if_index].valid)
+    return 0;
+
+  has_local_ep = (sw_if_index < vec_len (hm->local_eps) && hm->local_eps[sw_if_index].valid);
+
+  return csh_classify_set (sw_if_index,
+			   cilium_srv6_classify_wanted (cm->ifs[sw_if_index].trust, has_local_ep));
 }
 
 int
@@ -2619,7 +2687,12 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
       csh_policy_rev_slot_unref (hm, e->policy_rev_slot);
       clib_memset (e, 0, sizeof (*e));
 
-      csh_classify_feature_set (sw_if_index, 0 /* disable */);
+      /* Item 191: not an unconditional disable. The endpoint is gone, but the
+	 interface is still whatever D-73 classified it as, and while it is
+	 UNTRUSTED its packets must keep reaching classify — which now answers
+	 DROP_UNKNOWN_SOURCE_EP (02 §3) instead of letting them fall through
+	 the arc into ip6-lookup. */
+      cilium_srv6_headend_classify_refresh (sw_if_index);
 
       cilium_srv6_barrier_release (vm, taken);
 
@@ -2666,7 +2739,7 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
   CLIB_MEMORY_STORE_BARRIER ();
   e->valid = 1;
 
-  rv = csh_classify_feature_set (sw_if_index, 1 /* enable */);
+  rv = cilium_srv6_headend_classify_refresh (sw_if_index);
   if (rv != 0)
     {
       /* Without the feature the endpoint is not classified at all, which is
@@ -2702,6 +2775,21 @@ cilium_srv6_headend_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32
 
   if (is_add || !hm->initialised)
     return NULL;
+
+  /*
+   * The classify feature is retired here even when there was no endpoint on
+   * this index. sw_if_index values are reused (D-31) and VPP does not clear
+   * an interface's feature arc configuration on delete, so a feature left
+   * behind would be inherited by the next interface to take the index — for
+   * classify that means the next interface's packets are classified against
+   * whatever LocalEndpointTable entry that index later acquires.
+   */
+  if (sw_if_index < vec_len (cilium_srv6_main.ifs))
+    {
+      taken = cilium_srv6_barrier_acquire (vm);
+      csh_classify_set (sw_if_index, 0 /* disable */);
+      cilium_srv6_barrier_release (vm, taken);
+    }
 
   if (sw_if_index >= vec_len (hm->local_eps) || !hm->local_eps[sw_if_index].valid)
     return NULL;

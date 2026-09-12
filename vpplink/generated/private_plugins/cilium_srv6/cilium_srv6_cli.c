@@ -42,6 +42,32 @@ cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   "the guard installed)",
 		   cilium_srv6_guard_coverage_complete (cm) ? "COMPLETE" : "INCOMPLETE",
 		   cm->n_uncovered, cm->n_uncovered == 1 ? "" : "s");
+  /*
+   * errata #34 item 191. "guard coverage: COMPLETE" says only that every live
+   * interface is on cilium-srv6-guard, and the guard passes everything that
+   * is not SID Block destined. It is therefore COMPLETE on a node whose Pod
+   * interfaces are not on the headend path at all — which is what run 16
+   * reported while same-node Pod-to-Pod traffic was being forwarded by the
+   * plain IPv6 FIB. The line below is the one that answers "is Pod traffic
+   * being policy-evaluated at all": every interface classified UNTRUSTED
+   * (D-73, i.e. Pod-facing) must carry cilium-srv6-classify (02 §1).
+   */
+  {
+    u32 n_unclassified = 0;
+
+    for (i = 0; i < vec_len (cm->ifs); i++)
+      {
+	e = vec_elt_at_index (cm->ifs, i);
+	if (e->valid && e->trust == CILIUM_SRV6_TRUST_UNTRUSTED && !e->classify_installed)
+	  n_unclassified++;
+      }
+
+    vlib_cli_output (vm,
+		     "classify coverage    : %s (%u Pod-facing interface%s "
+		     "not on the headend path)",
+		     n_unclassified == 0 ? "COMPLETE" : "INCOMPLETE", n_unclassified,
+		     n_unclassified == 1 ? "" : "s");
+  }
   vlib_cli_output (vm, "context install      : %s",
 		   cilium_srv6_guard_context_install_allowed () ? "allowed" : "BLOCKED");
   vlib_cli_output (vm,
@@ -68,8 +94,8 @@ cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		     "inspected (offset-zero fragment must be fully inspectable)");
   vlib_cli_output (vm, "");
 
-  vlib_cli_output (vm, "%-30s %10s %-15s %6s %6s %10s %10s", "interface", "incarn", "trust",
-		   "guard", "promo", "hold(ms)", "wdraw(ms)");
+  vlib_cli_output (vm, "%-30s %10s %-15s %6s %9s %6s %10s %10s", "interface", "incarn", "trust",
+		   "guard", "classify", "promo", "hold(ms)", "wdraw(ms)");
 
   for (i = 0; i < vec_len (cm->ifs); i++)
     {
@@ -78,9 +104,16 @@ cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (!e->valid)
 	continue;
 
-      vlib_cli_output (vm, "%-30U %10u %-15U %6s %6s %10u %10u", format_vnet_sw_if_index_name, vnm,
-		       i, e->incarnation, format_cilium_srv6_trust, (u32) e->trust,
-		       e->guard_installed ? "yes" : "NO", e->promotable ? "yes" : "no",
+      vlib_cli_output (vm, "%-30U %10u %-15U %6s %9s %6s %10u %10u",
+		       format_vnet_sw_if_index_name, vnm, i, e->incarnation,
+		       format_cilium_srv6_trust, (u32) e->trust,
+		       e->guard_installed ? "yes" : "NO",
+		       /* item 191: "NO" only where 02 §1 requires it, so that the
+			  host TAP and the fabric uplinks do not read as a defect. */
+		       e->classify_installed		    ? "yes" :
+		       e->trust == CILIUM_SRV6_TRUST_UNTRUSTED ? "NO" :
+								 "-",
+		       e->promotable ? "yes" : "no",
 		       cilium_srv6_quarantine_hold_remaining_ms (e),
 		       cilium_srv6_withdraw_delay_remaining_ms (e));
     }

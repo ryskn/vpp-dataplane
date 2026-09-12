@@ -25,6 +25,9 @@
 #include <vnet/ip/format.h>
 
 #include <cilium_srv6/cilium_srv6_guard.h>
+/* cilium_srv6_headend_classify_refresh(): accepting a classification is what
+   decides whether the interface is on the 02 §1 headend path (item 191). */
+#include <cilium_srv6/cilium_srv6_headend.h>
 
 cilium_srv6_main_t cilium_srv6_main;
 
@@ -418,6 +421,29 @@ cilium_srv6_acl_interface_set (u32 sw_if_index, u32 if_incarnation, u8 trust)
     }
 
   csg_set_trust (cm, e, trust, now);
+
+  /*
+   * errata #34 item 191. `UNTRUSTED` is the only authoritative statement the
+   * plugin has that an interface is Pod-facing (D-73 derives it from a
+   * D-68/D-71 attachment binding), so it is here — not at the first
+   * LocalEndpointTable write — that 02 §1's `pod-if -> guard -> classify`
+   * becomes true of the interface. Before this call a Pod interface with no
+   * endpoint carried the guard but not classify, and the guard passes
+   * everything that is not SID Block destined, so those packets left the
+   * ip6-unicast arc into ip6-lookup and were forwarded with no policy
+   * evaluation at all (00 §2.20.1 invariant 2 forbids exactly that).
+   *
+   * A failure here does not reject the classification: it is already
+   * committed above and, for a downgrade to QUARANTINED, must be (D-73:
+   * trust removal is a fail-closed downgrade and is applied immediately).
+   * The agent re-asserts the same classification on its next reconcile
+   * (§2.15.4), which retries this; until then the log below is the record.
+   */
+  if (cilium_srv6_headend_classify_refresh (sw_if_index) != 0)
+    CSG_LOG_ERR ("classify feature not brought in line with trust %U on "
+		 "sw_if_index %u: the interface is not on the 02 §1 headend path",
+		 format_cilium_srv6_trust, (u32) trust, sw_if_index);
+
   cilium_srv6_barrier_release (vm, taken);
 
   return 0;
@@ -441,6 +467,16 @@ csg_quarantine_all (const char *reason, int keep_fabric)
   f64 now = vlib_time_now (vm);
   int taken;
 
+  /*
+   * Deliberately no cilium_srv6_headend_classify_refresh() here (item 191).
+   * A bulk quarantine happens when the agent is presumed gone or has just
+   * restarted, which is when removing classify from a Pod interface that has
+   * no endpoint would hand its packets back to the plain IPv6 FIB. Leaving
+   * the feature where it is keeps that interface fail-closed
+   * (DROP_UNKNOWN_SOURCE_EP) and keeps a Pod that still has an endpoint
+   * delivering, which is what D-35 requires. The next accepted
+   * classification re-derives the state.
+   */
   taken = cilium_srv6_barrier_acquire (vm);
   vec_foreach (e, cm->ifs)
     {
