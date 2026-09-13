@@ -395,6 +395,52 @@ The script refuses to emit a tag when the `BASE` assignment in the clone script
 is absent or ambiguous, and it reports a dirty working tree so callers can
 refuse to name an image after a commit that does not describe it.
 
+### Refreshing the `cilium_srv6` pin
+
+Two artifacts move together, and forgetting the second one is a run-time
+failure, not a build failure:
+
+```
+# 1. refresh the snapshot and the pin file
+scripts/sync-cilium-srv6.sh <cilium-repo> <commit>
+
+# 2. regenerate the Go bindings from the refreshed .api file
+make gen-cilium-srv6-binapi CILIUM_SRV6_VPP_SRC=<vpp>/src
+
+# 3. prove both are in sync
+scripts/check-cilium-srv6-sync.sh <cilium-repo>
+```
+
+Step 2 exists because the `.api` file is the only input the Go bindings have.
+Every message whose definition changed gets a new CRC, and GoVPP's codec
+refuses to decode a reply whose CRC is not the one the bindings were generated
+for. A refresh that skips step 2 therefore builds and vets cleanly and then
+fails at run time: after the refresh to `46b07cb152`, `srv6_acl_details` changed
+from `0x437a687c` to `0xea1bcd20`, so `IfIncarnation` in `vpplink/srv6ec_ifbind.go`
+could not decode the `srv6_acl_dump` reply, reported `srv6 acl dump reported no
+state for if[N]`, and no Pod interface could be created (errata #34 items 160
+and 210).
+
+`make gen-cilium-srv6-binapi` regenerates only
+`vpplink/generated/bindings/cilium_srv6/`. It needs `python3` and a VPP *source*
+tree (for `tools/vppapigen` and for the `memclnt`, `interface_types` and
+`ip_types` definitions the plugin imports), not a built VPP, so unlike `make
+goapi` it runs on a developer machine including macOS. The generator version is
+read from `go.fd.io/govpp` in `go.mod`, so the bindings stay compatible with the
+GoVPP runtime the agent links against; override it with
+`CILIUM_SRV6_GOVPP_VERSION=` only to reproduce an older file.
+
+Step 3 is what makes the coupling enforceable. `check-cilium-srv6-sync.sh` now
+checks two things: the snapshot is byte-for-byte the pinned commit's tree, and
+the generated bindings carry the pinned `.api` file's version string and the
+same per-message CRC table as the canonical repository's own bindings at that
+commit. The second check reads
+`pkg/srv6ec/vppapi/binapi/cilium_srv6/cilium_srv6.ba.go` from the Cilium
+checkout that is already passed in (override with
+`CILIUM_SRV6_BINDINGS_SOURCE_PATH=`), because the `.api` file is identical on
+both sides and a CRC is a property of that file rather than of the generator, so
+CI needs no Python and no VPP tree to run it.
+
 ### CI
 
 `.github/workflows/vpp-image-srv6ec.yml`:

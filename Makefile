@@ -220,6 +220,49 @@ export VPP_DIR ?= $(shell pwd)/vpp-manager/vpp_build
 goapi:
 	@go generate -v ./vpplink/generated/
 
+# Regenerate only the cilium_srv6 bindings, from the vendored snapshot's .api
+# file (SRv6 Endpoint Context v1, IF-4).  `goapi` regenerates every binding and
+# needs a built VPP tree plus the wrapper-generator plugin, which restricts it
+# to Linux; refreshing the snapshot with scripts/sync-cilium-srv6.sh only
+# changes cilium_srv6, so this target does that one file with vppapigen plus
+# binapi-generator and runs anywhere python3 and a VPP *source* tree exist.
+# scripts/check-cilium-srv6-sync.sh fails when the bindings are older than the
+# snapshot, and names this target.
+CILIUM_SRV6_VPP_SRC ?= $(VPP_DIR)/src
+CILIUM_SRV6_GOVPP_VERSION ?= $(shell go list -m -f '{{.Version}}' go.fd.io/govpp)
+CILIUM_SRV6_API := vpplink/generated/private_plugins/cilium_srv6/cilium_srv6.api
+CILIUM_SRV6_BINDINGS_DIR := vpplink/generated/bindings/cilium_srv6
+CILIUM_SRV6_IMPORT_PREFIX := github.com/projectcalico/vpp-dataplane/v3/vpplink/generated/bindings
+
+.PHONY: gen-cilium-srv6-binapi
+gen-cilium-srv6-binapi:
+	@set -eu; \
+	if [ ! -d "$(CILIUM_SRV6_VPP_SRC)/tools/vppapigen" ]; then \
+		echo "CILIUM_SRV6_VPP_SRC=$(CILIUM_SRV6_VPP_SRC) is not a VPP source tree"; \
+		echo "pass CILIUM_SRV6_VPP_SRC=<vpp>/src"; exit 1; \
+	fi; \
+	tmp=$$(mktemp -d -t cilium.srv6.binapi.XXXXXXXX); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	mkdir -p "$$tmp/json"; \
+	for api in vlibmemory/memclnt vnet/interface_types vnet/ip/ip_types; do \
+		python3 "$(CILIUM_SRV6_VPP_SRC)/tools/vppapigen/vppapigen.py" \
+			--includedir "$(CILIUM_SRV6_VPP_SRC)" \
+			--input "$(CILIUM_SRV6_VPP_SRC)/$$api.api" JSON \
+			--outputdir "$$tmp/json" --output "$$tmp/json/$$(basename $$api).api.json"; \
+	done; \
+	python3 "$(CILIUM_SRV6_VPP_SRC)/tools/vppapigen/vppapigen.py" \
+		--includedir "$(CILIUM_SRV6_VPP_SRC)" \
+		--input "$(CILIUM_SRV6_API)" JSON \
+		--outputdir "$$tmp/json" --output "$$tmp/json/cilium_srv6.api.json"; \
+	rm -f "$$tmp"/json/*.api_json.h; \
+	GOOS= GOARCH= go run go.fd.io/govpp/cmd/binapi-generator@$(CILIUM_SRV6_GOVPP_VERSION) \
+		--no-version-info --no-source-path-info --gen rpc \
+		--input="$$tmp/json" --output-dir="$$tmp/out" \
+		--import-prefix=$(CILIUM_SRV6_IMPORT_PREFIX); \
+	cp "$$tmp"/out/cilium_srv6/*.ba.go $(CILIUM_SRV6_BINDINGS_DIR)/; \
+	gofmt -l $(CILIUM_SRV6_BINDINGS_DIR) | { ! grep .; }
+	@git status $(CILIUM_SRV6_BINDINGS_DIR) --porcelain
+
 .PHONY: cherry-vpp
 cherry-vpp:
 	@if [ "$(FORCE)" = "y" ]; then \

@@ -28,6 +28,7 @@ type RPCService interface {
 	Srv6CtStatusGet(ctx context.Context, in *Srv6CtStatusGet) (*Srv6CtStatusGetReply, error)
 	Srv6CtVerify(ctx context.Context, in *Srv6CtVerify) (*Srv6CtVerifyReply, error)
 	Srv6EndciliumStatusGet(ctx context.Context, in *Srv6EndciliumStatusGet) (*Srv6EndciliumStatusGetReply, error)
+	Srv6EndpointRevisionPublish(ctx context.Context, in *Srv6EndpointRevisionPublish) (*Srv6EndpointRevisionPublishReply, error)
 	Srv6FragmentVerdictAdd(ctx context.Context, in *Srv6FragmentVerdictAdd) (*Srv6FragmentVerdictAddReply, error)
 	Srv6HeadendConfigSet(ctx context.Context, in *Srv6HeadendConfigSet) (*Srv6HeadendConfigSetReply, error)
 	Srv6HeadendStatusGet(ctx context.Context, in *Srv6HeadendStatusGet) (*Srv6HeadendStatusGetReply, error)
@@ -39,13 +40,14 @@ type RPCService interface {
 	Srv6LocalEpDump(ctx context.Context, in *Srv6LocalEpDump) (RPCService_Srv6LocalEpDumpClient, error)
 	Srv6PathAddDel(ctx context.Context, in *Srv6PathAddDel) (*Srv6PathAddDelReply, error)
 	Srv6PathDump(ctx context.Context, in *Srv6PathDump) (RPCService_Srv6PathDumpClient, error)
+	Srv6PathRevisionPublish(ctx context.Context, in *Srv6PathRevisionPublish) (*Srv6PathRevisionPublishReply, error)
 	Srv6PathTxnAbort(ctx context.Context, in *Srv6PathTxnAbort) (*Srv6PathTxnAbortReply, error)
 	Srv6PathTxnBegin(ctx context.Context, in *Srv6PathTxnBegin) (*Srv6PathTxnBeginReply, error)
 	Srv6PathTxnCommit(ctx context.Context, in *Srv6PathTxnCommit) (*Srv6PathTxnCommitReply, error)
 	Srv6PathTxnPut(ctx context.Context, in *Srv6PathTxnPut) (*Srv6PathTxnPutReply, error)
+	Srv6PolicyRevisionPublish(ctx context.Context, in *Srv6PolicyRevisionPublish) (*Srv6PolicyRevisionPublishReply, error)
 	Srv6ProgramAddDel(ctx context.Context, in *Srv6ProgramAddDel) (*Srv6ProgramAddDelReply, error)
 	Srv6ProgramDump(ctx context.Context, in *Srv6ProgramDump) (RPCService_Srv6ProgramDumpClient, error)
-	Srv6RevisionPublish(ctx context.Context, in *Srv6RevisionPublish) (*Srv6RevisionPublishReply, error)
 	Srv6SrDomainDump(ctx context.Context, in *Srv6SrDomainDump) (RPCService_Srv6SrDomainDumpClient, error)
 	Srv6SrDomainPrefixAddDel(ctx context.Context, in *Srv6SrDomainPrefixAddDel) (*Srv6SrDomainPrefixAddDelReply, error)
 	Srv6UcLocatorSet(ctx context.Context, in *Srv6UcLocatorSet) (*Srv6UcLocatorSetReply, error)
@@ -364,6 +366,15 @@ func (c *serviceClient) Srv6EndciliumStatusGet(ctx context.Context, in *Srv6Endc
 	return out, api.RetvalToVPPApiError(out.Retval)
 }
 
+func (c *serviceClient) Srv6EndpointRevisionPublish(ctx context.Context, in *Srv6EndpointRevisionPublish) (*Srv6EndpointRevisionPublishReply, error) {
+	out := new(Srv6EndpointRevisionPublishReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
 func (c *serviceClient) Srv6FragmentVerdictAdd(ctx context.Context, in *Srv6FragmentVerdictAdd) (*Srv6FragmentVerdictAddReply, error) {
 	out := new(Srv6FragmentVerdictAddReply)
 	err := c.conn.Invoke(ctx, in, out)
@@ -565,6 +576,15 @@ func (c *serviceClient_Srv6PathDumpClient) Recv() (*Srv6PathDetails, error) {
 	}
 }
 
+func (c *serviceClient) Srv6PathRevisionPublish(ctx context.Context, in *Srv6PathRevisionPublish) (*Srv6PathRevisionPublishReply, error) {
+	out := new(Srv6PathRevisionPublishReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
 func (c *serviceClient) Srv6PathTxnAbort(ctx context.Context, in *Srv6PathTxnAbort) (*Srv6PathTxnAbortReply, error) {
 	out := new(Srv6PathTxnAbortReply)
 	err := c.conn.Invoke(ctx, in, out)
@@ -594,6 +614,15 @@ func (c *serviceClient) Srv6PathTxnCommit(ctx context.Context, in *Srv6PathTxnCo
 
 func (c *serviceClient) Srv6PathTxnPut(ctx context.Context, in *Srv6PathTxnPut) (*Srv6PathTxnPutReply, error) {
 	out := new(Srv6PathTxnPutReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) Srv6PolicyRevisionPublish(ctx context.Context, in *Srv6PolicyRevisionPublish) (*Srv6PolicyRevisionPublishReply, error) {
+	out := new(Srv6PolicyRevisionPublishReply)
 	err := c.conn.Invoke(ctx, in, out)
 	if err != nil {
 		return nil, err
@@ -651,15 +680,6 @@ func (c *serviceClient_Srv6ProgramDumpClient) Recv() (*Srv6ProgramDetails, error
 	default:
 		return nil, fmt.Errorf("unexpected message: %T %v", m, m)
 	}
-}
-
-func (c *serviceClient) Srv6RevisionPublish(ctx context.Context, in *Srv6RevisionPublish) (*Srv6RevisionPublishReply, error) {
-	out := new(Srv6RevisionPublishReply)
-	err := c.conn.Invoke(ctx, in, out)
-	if err != nil {
-		return nil, err
-	}
-	return out, api.RetvalToVPPApiError(out.Retval)
 }
 
 func (c *serviceClient) Srv6SrDomainDump(ctx context.Context, in *Srv6SrDomainDump) (RPCService_Srv6SrDomainDumpClient, error) {

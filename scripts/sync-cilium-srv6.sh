@@ -89,4 +89,6 @@ CILIUM_SRV6_SOURCE_COMMIT=$COMMIT
 EOF
 
 green "Wrote $PIN_FILE"
-green "Snapshot refreshed. Regenerate the binapi bindings with 'make gen-binapi' on a Linux host."
+green "Snapshot refreshed."
+green "Regenerate the Go bindings, or scripts/check-cilium-srv6-sync.sh will fail:"
+green "  make gen-cilium-srv6-binapi CILIUM_SRV6_VPP_SRC=<vpp>/src"

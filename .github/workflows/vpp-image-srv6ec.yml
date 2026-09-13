@@ -44,6 +44,7 @@ on:
       - 'vpplink/generated/vpp_clone_current.sh'
       - 'vpplink/generated/patches/**'
       - 'vpplink/generated/private_plugins/**'
+      - 'vpplink/generated/bindings/cilium_srv6/**'
       - 'vpp-manager/**'
       - 'scripts/srv6ec-image-tag.sh'
       - 'scripts/check-cilium-srv6-sync.sh'

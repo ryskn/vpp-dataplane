@@ -3,9 +3,9 @@
 // Package cilium_srv6 contains generated bindings for API file cilium_srv6.api.
 //
 // Contents:
-// -  5 enums
-// -  1 struct
-// - 72 messages
+// -  6 enums
+// -  3 structs
+// - 76 messages
 package cilium_srv6
 
 import (
@@ -25,8 +25,8 @@ const _ = api.GoVppAPIPackageIsVersion2
 
 const (
 	APIFile    = "cilium_srv6"
-	APIVersion = "1.8.0"
-	VersionCrc = 0x536624fa
+	APIVersion = "1.9.0"
+	VersionCrc = 0x79736e70
 )
 
 // Srv6ACLTrust defines enum 'srv6_acl_trust'.
@@ -227,6 +227,33 @@ func (x Srv6DropReason) String() string {
 	return "Srv6DropReason(" + strconv.Itoa(int(x)) + ")"
 }
 
+// Srv6ProgramAction defines enum 'srv6_program_action'.
+type Srv6ProgramAction uint8
+
+const (
+	SRV6_PROGRAM_ACTION_API_ENCAP         Srv6ProgramAction = 0
+	SRV6_PROGRAM_ACTION_API_LOCAL_DELIVER Srv6ProgramAction = 1
+)
+
+var (
+	Srv6ProgramAction_name = map[uint8]string{
+		0: "SRV6_PROGRAM_ACTION_API_ENCAP",
+		1: "SRV6_PROGRAM_ACTION_API_LOCAL_DELIVER",
+	}
+	Srv6ProgramAction_value = map[string]uint8{
+		"SRV6_PROGRAM_ACTION_API_ENCAP":         0,
+		"SRV6_PROGRAM_ACTION_API_LOCAL_DELIVER": 1,
+	}
+)
+
+func (x Srv6ProgramAction) String() string {
+	s, ok := Srv6ProgramAction_name[uint8(x)]
+	if ok {
+		return s
+	}
+	return "Srv6ProgramAction(" + strconv.Itoa(int(x)) + ")"
+}
+
 // Srv6ProgramVerdict defines enum 'srv6_program_verdict'.
 type Srv6ProgramVerdict uint8
 
@@ -254,6 +281,19 @@ func (x Srv6ProgramVerdict) String() string {
 	return "Srv6ProgramVerdict(" + strconv.Itoa(int(x)) + ")"
 }
 
+// Srv6EndpointRevision defines type 'srv6_endpoint_revision'.
+type Srv6EndpointRevision struct {
+	Dst      ip_types.IP6Address `binapi:"ip6_address,name=dst" json:"dst,omitempty"`
+	Revision uint64              `binapi:"u64,name=revision" json:"revision,omitempty"`
+}
+
+// Srv6PathRevision defines type 'srv6_path_revision'.
+type Srv6PathRevision struct {
+	PathIndex uint32 `binapi:"u32,name=path_index" json:"path_index,omitempty"`
+	Pad       uint32 `binapi:"u32,name=pad" json:"pad,omitempty"`
+	Revision  uint64 `binapi:"u64,name=revision" json:"revision,omitempty"`
+}
+
 // Srv6PolicyRevision defines type 'srv6_policy_revision'.
 type Srv6PolicyRevision struct {
 	Identity uint32 `binapi:"u32,name=identity" json:"identity,omitempty"`
@@ -269,6 +309,24 @@ type Srv6PolicyRevision struct {
 //	- guard_installed - cilium-srv6-guard is on this interface's
 //	       ingress feature arc. An injection path is guard-covered only
 //	       when this is true for the interface it arrives on (D-58).
+//	- classify_installed - cilium-srv6-classify is on this
+//	       interface's ip6-unicast ingress feature arc, i.e. the interface
+//	       is on the 02 section 1 headend path and its packets are
+//	       policy-evaluated (errata #34 items 191, 196). The guard alone
+//	       does not imply this: the guard passes everything that is not
+//	       SID Block destined, so an interface with guard_installed and
+//	       without classify_installed forwards Pod traffic through the
+//	       plain IPv6 FIB. Every interface with pod_facing or
+//	       trust == UNTRUSTED must report true; that is the classify
+//	       coverage the agent folds into D-58 FoundationReady and the
+//	       plugin folds into context_install_blocked.
+//	- pod_facing - a D-71 attachment binding was accepted for this
+//	       interface, which is the declaration that it is Pod-facing
+//	       (errata #34 item 195). Sticky for the interface lifetime: a
+//	       binding DELETE does not clear it, only the interface going away
+//	       does. It is set before the binding ADD is acknowledged, together
+//	       with classify_installed, so an ACKed ADD means the interface is
+//	       on the headend path.
 //	- trusted_fabric_promotable - false for every interface whose
 //	       device class is not physical/bond/uplink (tap family, memif,
 //	       af-packet, vhost-user), which can never become TRUSTED_FABRIC
@@ -289,7 +347,8 @@ type Srv6PolicyRevision struct {
 //	       (03 §1.1)
 //	- deadman_active - agent keepalive lapsed and the plugin
 //	       quarantined every interface by itself (D-35)
-//	       (D-35; also while guard coverage is incomplete)
+//	       (D-35; also while guard coverage or classify coverage is
+//	       incomplete, errata #34 item 196)
 //	- n_quarantined_interfaces - gauge for acl_quarantined_interfaces
 //	- deadman_activations - counter for guard_deadman_activations_total
 //
@@ -299,6 +358,8 @@ type Srv6ACLDetails struct {
 	IfIncarnation             uint32                         `binapi:"u32,name=if_incarnation" json:"if_incarnation,omitempty"`
 	Trust                     Srv6ACLTrust                   `binapi:"srv6_acl_trust,name=trust" json:"trust,omitempty"`
 	GuardInstalled            bool                           `binapi:"bool,name=guard_installed" json:"guard_installed,omitempty"`
+	ClassifyInstalled         bool                           `binapi:"bool,name=classify_installed" json:"classify_installed,omitempty"`
+	PodFacing                 bool                           `binapi:"bool,name=pod_facing" json:"pod_facing,omitempty"`
 	TrustedFabricPromotable   bool                           `binapi:"bool,name=trusted_fabric_promotable" json:"trusted_fabric_promotable,omitempty"`
 	QuarantineHoldRemainingMs uint32                         `binapi:"u32,name=quarantine_hold_remaining_ms" json:"quarantine_hold_remaining_ms,omitempty"`
 	WithdrawDelayRemainingMs  uint32                         `binapi:"u32,name=withdraw_delay_remaining_ms" json:"withdraw_delay_remaining_ms,omitempty"`
@@ -311,7 +372,7 @@ type Srv6ACLDetails struct {
 
 func (m *Srv6ACLDetails) Reset()               { *m = Srv6ACLDetails{} }
 func (*Srv6ACLDetails) GetMessageName() string { return "srv6_acl_details" }
-func (*Srv6ACLDetails) GetCrcString() string   { return "437a687c" }
+func (*Srv6ACLDetails) GetCrcString() string   { return "ea1bcd20" }
 func (*Srv6ACLDetails) GetMessageType() api.MessageType {
 	return api.ReplyMessage
 }
@@ -324,6 +385,8 @@ func (m *Srv6ACLDetails) Size() (size int) {
 	size += 4 // m.IfIncarnation
 	size += 1 // m.Trust
 	size += 1 // m.GuardInstalled
+	size += 1 // m.ClassifyInstalled
+	size += 1 // m.PodFacing
 	size += 1 // m.TrustedFabricPromotable
 	size += 4 // m.QuarantineHoldRemainingMs
 	size += 4 // m.WithdrawDelayRemainingMs
@@ -343,6 +406,8 @@ func (m *Srv6ACLDetails) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeUint32(m.IfIncarnation)
 	buf.EncodeUint8(uint8(m.Trust))
 	buf.EncodeBool(m.GuardInstalled)
+	buf.EncodeBool(m.ClassifyInstalled)
+	buf.EncodeBool(m.PodFacing)
 	buf.EncodeBool(m.TrustedFabricPromotable)
 	buf.EncodeUint32(m.QuarantineHoldRemainingMs)
 	buf.EncodeUint32(m.WithdrawDelayRemainingMs)
@@ -359,6 +424,8 @@ func (m *Srv6ACLDetails) Unmarshal(b []byte) error {
 	m.IfIncarnation = buf.DecodeUint32()
 	m.Trust = Srv6ACLTrust(buf.DecodeUint8())
 	m.GuardInstalled = buf.DecodeBool()
+	m.ClassifyInstalled = buf.DecodeBool()
+	m.PodFacing = buf.DecodeBool()
 	m.TrustedFabricPromotable = buf.DecodeBool()
 	m.QuarantineHoldRemainingMs = buf.DecodeUint32()
 	m.WithdrawDelayRemainingMs = buf.DecodeUint32()
@@ -1904,9 +1971,12 @@ func (m *Srv6CtStatusGetReply) Unmarshal(b []byte) error {
 //	      it, so a handle that has been retired degrades to another
 //	      re-authorisation punt instead of forwarding on a guessed path.
 //	The revision of `remote_identity` must have been published with
-//	srv6_revision_publish before this call: a promotion carrying a revision
-//	that is not the currently published one is refused, exactly as
-//	srv6_program_add_del refuses a stale compile (02 §4.3).
+//	srv6_policy_revision_publish before this call: a promotion carrying a
+//	revision that is not the currently published one is refused, exactly as
+//	srv6_program_add_del refuses a stale compile (02 §4.3). D-84 is what makes
+//	that publish exist for a *remote* identity: the reply re-authorisation
+//	references the forward-direction source identity's revision, so the policy
+//	revision producer publishes remote identities too.
 //	Rejections (all fail-closed, no state change):
 //	  INIT_FAILED         - tables not built yet
 //	  INVALID_VALUE       - src or dst is the unspecified address,
@@ -2189,6 +2259,136 @@ func (m *Srv6EndciliumStatusGetReply) Unmarshal(b []byte) error {
 	m.NSrDomainPrefixes = buf.DecodeUint32()
 	m.DeliverySuspends = buf.DecodeUint64()
 	m.LocalsidInstalls = buf.DecodeUint64()
+	return nil
+}
+
+// Publish the ENDPOINT revision namespace (IF-2, 02 §8, D-83).
+//
+//	D-83 replaced the single node-global srv6_revision_publish with one typed
+//	message per revision namespace. The key type is explicit on the wire: an
+//	ENDPOINT revision names a destination address, a PATH revision names a
+//	PathCache index and a POLICY revision names a SecurityIdentity, and no
+//	message carries a union that has to be disambiguated by a discriminator.
+//	A node-global endpoint or path revision is forbidden: it made every
+//	endpoint or path change stale every ProgramCache entry on the node, which
+//	is a cluster-scale fail-closed trigger reachable by an unprivileged tenant
+//	(the same attack surface D-30 removed from the policy revision).
+//	Per key (02 §4.3):
+//	  - the same revision again is idempotent;
+//	  - a lower revision is refused (it would let a revoked ALLOW become valid
+//	    again);
+//	  - a higher revision advances the key, and every ProgramCache entry that
+//	    quotes the old one becomes stale at its next hot-path comparison.
+//	    Nothing is walked eagerly: 02 §4.2 compares per packet.
+//	  - revision 0 withdraws the key. The key stops existing, so every entry
+//	    that quotes it is stale and no install may quote it. The slot is kept
+//	    while ProgramCache entries still reference it, so its high water mark
+//	    cannot be lost while a stale quotation of it still exists.
+//	The whole message is applied as one unit: every element is validated
+//	first, and if any is rejected nothing is applied. A successful reply is
+//	therefore an acknowledgement for every key in the message, which is what
+//	the agent's mandatory ordering needs (D-83): authority change ->
+//	per-key revision publish ACK -> old Program becomes stale -> new Program
+//	publication. Publishing after installing would leave a window in which the
+//	old program still looks valid.
+//	Rejections:
+//	  INIT_FAILED     - tables not built yet
+//	  INVALID_VALUE   - a count without an array
+//	  INVALID_VALUE_2 - a revision moves backwards for its key
+//	  INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
+//	  LIMIT_EXCEEDED  - the ENDPOINT revision table has no room for the new
+//	                    keys of this message
+//	- n_endpoint - number of (destination, revision) pairs that follow
+//	- endpoint - the pairs
+//
+// Srv6EndpointRevisionPublish defines message 'srv6_endpoint_revision_publish'.
+type Srv6EndpointRevisionPublish struct {
+	NEndpoint uint32                 `binapi:"u32,name=n_endpoint" json:"-"`
+	Endpoint  []Srv6EndpointRevision `binapi:"srv6_endpoint_revision[n_endpoint],name=endpoint" json:"endpoint,omitempty"`
+}
+
+func (m *Srv6EndpointRevisionPublish) Reset()               { *m = Srv6EndpointRevisionPublish{} }
+func (*Srv6EndpointRevisionPublish) GetMessageName() string { return "srv6_endpoint_revision_publish" }
+func (*Srv6EndpointRevisionPublish) GetCrcString() string   { return "7028fdd7" }
+func (*Srv6EndpointRevisionPublish) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6EndpointRevisionPublish) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.NEndpoint
+	for j1 := 0; j1 < len(m.Endpoint); j1++ {
+		var s1 Srv6EndpointRevision
+		_ = s1
+		if j1 < len(m.Endpoint) {
+			s1 = m.Endpoint[j1]
+		}
+		size += 1 * 16 // s1.Dst
+		size += 8      // s1.Revision
+	}
+	return size
+}
+func (m *Srv6EndpointRevisionPublish) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint32(uint32(len(m.Endpoint)))
+	for j0 := 0; j0 < len(m.Endpoint); j0++ {
+		var v0 Srv6EndpointRevision // Endpoint
+		if j0 < len(m.Endpoint) {
+			v0 = m.Endpoint[j0]
+		}
+		buf.EncodeBytes(v0.Dst[:], 16)
+		buf.EncodeUint64(v0.Revision)
+	}
+	return buf.Bytes(), nil
+}
+func (m *Srv6EndpointRevisionPublish) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.NEndpoint = buf.DecodeUint32()
+	m.Endpoint = make([]Srv6EndpointRevision, m.NEndpoint)
+	for j0 := 0; j0 < len(m.Endpoint); j0++ {
+		copy(m.Endpoint[j0].Dst[:], buf.DecodeBytes(16))
+		m.Endpoint[j0].Revision = buf.DecodeUint64()
+	}
+	return nil
+}
+
+// Srv6EndpointRevisionPublishReply defines message 'srv6_endpoint_revision_publish_reply'.
+type Srv6EndpointRevisionPublishReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6EndpointRevisionPublishReply) Reset() { *m = Srv6EndpointRevisionPublishReply{} }
+func (*Srv6EndpointRevisionPublishReply) GetMessageName() string {
+	return "srv6_endpoint_revision_publish_reply"
+}
+func (*Srv6EndpointRevisionPublishReply) GetCrcString() string { return "e8d4e804" }
+func (*Srv6EndpointRevisionPublishReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6EndpointRevisionPublishReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	return size
+}
+func (m *Srv6EndpointRevisionPublishReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	return buf.Bytes(), nil
+}
+func (m *Srv6EndpointRevisionPublishReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
 	return nil
 }
 
@@ -2538,7 +2738,7 @@ func (m *Srv6HeadendConfigSetReply) Unmarshal(b []byte) error {
 //	left is the table occupancy and slow path state the metrics of 06 §3 need
 //	(program_cache_entries, program_cache_quota_drops_total,
 //	program_cache_fair_evictions_total, slowpath_queue_depth,
-//	slowpath_drops_total, path_cache_entries, revision).
+//	slowpath_drops_total, path_cache_entries, revision_keys).
 //
 // Srv6HeadendStatusGet defines message 'srv6_headend_status_get'.
 type Srv6HeadendStatusGet struct{}
@@ -2577,53 +2777,136 @@ func (m *Srv6HeadendStatusGet) Unmarshal(b []byte) error {
 //   - punt_drops - slowpath_drops_total per queue, all refusal reasons
 //     summed (the split is in the plugin log and CLI)
 //   - punt_no_transport - punts refused because no IF-3 transport is
-//     registered; a non-zero value means the slow path is not wired up
+//     registered or because it is not connected to the agent; a non-zero
+//     value means the slow path is not reaching the agent
+//   - punt_queue_full - punts refused because the IF-3 transport's
+//     bounded queue hit its entry cap (4096, 02 §5.2) or its byte cap
+//     (00 §2.18.7). It is separate from punt_no_transport because "no
+//     agent" and "the agent is not keeping up" call for different action
+//   - punt_write_failed - frames that were being written when the IF-3
+//     connection failed. They are never resent (00 §2.18.8): with no ACK
+//     on IF-3 a resend risks a second reinject of a packet the agent
+//     already had, so the token is released locally and the packet is
+//     dropped
+//   - punt_released - punts the agent answered with opRelease instead of
+//     a reinject (02 §5.6.3). The 06 §2 reason of each is a
+//     cilium-srv6-punt error counter (release_*)
+//   - if3_connected - the transport owner currently holds a connection to
+//     the D-27 punt socket
+//   - if3_socket_configured - a `cilium-srv6 { punt-socket <path> }` was
+//     given. Without one there is no transport at all, which is a
+//     startup configuration gap rather than an agent that is down
+//   - if3_connects - successful connects, i.e. 1 + reconnects
+//   - if3_disconnects - established connections that were lost
+//   - if3_frames_sent - punt frames fully written to the socket
+//   - if3_bytes_sent - bytes written, partial frames included
+//   - if3_frames_received - reinject and release frames read
+//   - if3_message_rejections - framing violations (version / opcode /
+//     length / truncated). Each one closed the connection, so this is
+//     also how many times IF-3 was torn down for an unusable stream. It
+//     is the plugin-side source of ipc_message_rejections_total
+//     {interface="if3"} (06 §3)
+//   - if3_frame_drops - semantic violations (a field out of range, or
+//     fields that contradict each other) in an otherwise well-framed
+//     frame. Exactly one frame was dropped and the connection kept
+//     (00 §2.18.9). It is the source of ipc_frame_drops_total
+//     {interface="if3"}. A sustained non-zero rate means the two ends
+//     disagree about a field's range, not about the protocol version
+//   - if3_unusable_token - reinject or release frames whose token was
+//     unknown or already consumed. They change no dataplane state
+//     (00 §2.18.6)
+//   - if3_encode_refused - punts the serializer refused before they
+//     reached the queue, because a classify result was outside the wire's
+//     range (02 §5.6.2). A non-zero value is a plugin bug rather than an
+//     agent one: the agent would have dropped such a frame as a field
+//     violation and the flow would punt for ever. Expected 0
+//   - if3_queue_entries - punt frames waiting in the transport queue
+//   - if3_queue_bytes - bytes they occupy
+//   - if3_queue_byte_cap - the configured byte budget
+//     (`punt-queue-bytes`, default 8 MiB)
+//   - if3_queue_high_water_bytes - the largest occupancy seen since
+//     start up, which is what says whether the byte budget is the bound
+//     that is actually binding
+//   - program_missing_key_installs - srv6_program_add_del refused because
+//     a referenced revision key does not exist at all (D-83). It is
+//     separate from program_stale_installs because the two mean different
+//     things: a stale install is a lost race a recompile fixes, while a
+//     missing key means the mandatory order (publish + ACK, then install)
+//     was violated and recompiling alone loops forever. Expected 0.
+//   - n_endpoint_revisions - published keys of the ENDPOINT revision
+//     namespace, including the reserved `::` key (D-83)
+//   - n_path_revisions - published keys of the PATH revision namespace
+//   - n_policy_revisions - published keys of the POLICY revision
+//     namespace. D-83 removed the two node-global revisions this reply
+//     used to carry: there is no such value any more, and a count of
+//     published keys per namespace is what 06 §3's
+//     `revision_keys{kind}` reads.
 //   - conntrack_registered - a C10 conntrack lookup hook is registered;
 //     while it is not, every packet takes 02 §7.2 branch 3
 //
 // Srv6HeadendStatusGetReply defines message 'srv6_headend_status_get_reply'.
 type Srv6HeadendStatusGetReply struct {
-	Retval                  int32               `binapi:"i32,name=retval" json:"retval,omitempty"`
-	Configured              bool                `binapi:"bool,name=configured" json:"configured,omitempty"`
-	NodeAddress             ip_types.IP6Address `binapi:"ip6_address,name=node_address" json:"node_address,omitempty"`
-	OuterTableID            uint32              `binapi:"u32,name=outer_table_id" json:"outer_table_id,omitempty"`
-	InnerMtu                uint16              `binapi:"u16,name=inner_mtu" json:"inner_mtu,omitempty"`
-	HopLimit                uint8               `binapi:"u8,name=hop_limit" json:"hop_limit,omitempty"`
-	CopyDscp                bool                `binapi:"bool,name=copy_dscp" json:"copy_dscp,omitempty"`
-	ProgramCapacity         uint32              `binapi:"u32,name=program_capacity" json:"program_capacity,omitempty"`
-	ProgramNegativeCapacity uint32              `binapi:"u32,name=program_negative_capacity" json:"program_negative_capacity,omitempty"`
-	NProgramsAllow          uint32              `binapi:"u32,name=n_programs_allow" json:"n_programs_allow,omitempty"`
-	NProgramsNegative       uint32              `binapi:"u32,name=n_programs_negative" json:"n_programs_negative,omitempty"`
-	PathCapacity            uint32              `binapi:"u32,name=path_capacity" json:"path_capacity,omitempty"`
-	NPaths                  uint32              `binapi:"u32,name=n_paths" json:"n_paths,omitempty"`
-	FragCapacity            uint32              `binapi:"u32,name=frag_capacity" json:"frag_capacity,omitempty"`
-	NFrags                  uint32              `binapi:"u32,name=n_frags" json:"n_frags,omitempty"`
-	NLocalEndpoints         uint32              `binapi:"u32,name=n_local_endpoints" json:"n_local_endpoints,omitempty"`
-	EndpointRevision        uint64              `binapi:"u64,name=endpoint_revision" json:"endpoint_revision,omitempty"`
-	PathRevision            uint64              `binapi:"u64,name=path_revision" json:"path_revision,omitempty"`
-	ProgramInstalls         uint64              `binapi:"u64,name=program_installs" json:"program_installs,omitempty"`
-	ProgramDeletes          uint64              `binapi:"u64,name=program_deletes" json:"program_deletes,omitempty"`
-	ProgramQuotaDrops       uint64              `binapi:"u64,name=program_quota_drops" json:"program_quota_drops,omitempty"`
-	ProgramFairEvictions    uint64              `binapi:"u64,name=program_fair_evictions" json:"program_fair_evictions,omitempty"`
-	ProgramStaleInstalls    uint64              `binapi:"u64,name=program_stale_installs" json:"program_stale_installs,omitempty"`
-	LeaseExtends            uint64              `binapi:"u64,name=lease_extends" json:"lease_extends,omitempty"`
-	RevisionPublishes       uint64              `binapi:"u64,name=revision_publishes" json:"revision_publishes,omitempty"`
-	FragEvictions           uint64              `binapi:"u64,name=frag_evictions" json:"frag_evictions,omitempty"`
-	FragQuotaDrops          uint64              `binapi:"u64,name=frag_quota_drops" json:"frag_quota_drops,omitempty"`
-	FragGc                  uint64              `binapi:"u64,name=frag_gc" json:"frag_gc,omitempty"`
-	PuntOutstanding         []uint32            `binapi:"u32[3],name=punt_outstanding" json:"punt_outstanding,omitempty"`
-	PuntPunted              []uint64            `binapi:"u64[3],name=punt_punted" json:"punt_punted,omitempty"`
-	PuntDrops               []uint64            `binapi:"u64[3],name=punt_drops" json:"punt_drops,omitempty"`
-	PuntNoTransport         uint64              `binapi:"u64,name=punt_no_transport" json:"punt_no_transport,omitempty"`
-	PuntReinjected          uint64              `binapi:"u64,name=punt_reinjected" json:"punt_reinjected,omitempty"`
-	PuntReinjectRejected    uint64              `binapi:"u64,name=punt_reinject_rejected" json:"punt_reinject_rejected,omitempty"`
-	ConntrackRegistered     bool                `binapi:"bool,name=conntrack_registered" json:"conntrack_registered,omitempty"`
-	PuntTransportRegistered bool                `binapi:"bool,name=punt_transport_registered" json:"punt_transport_registered,omitempty"`
+	Retval                    int32               `binapi:"i32,name=retval" json:"retval,omitempty"`
+	Configured                bool                `binapi:"bool,name=configured" json:"configured,omitempty"`
+	NodeAddress               ip_types.IP6Address `binapi:"ip6_address,name=node_address" json:"node_address,omitempty"`
+	OuterTableID              uint32              `binapi:"u32,name=outer_table_id" json:"outer_table_id,omitempty"`
+	InnerMtu                  uint16              `binapi:"u16,name=inner_mtu" json:"inner_mtu,omitempty"`
+	HopLimit                  uint8               `binapi:"u8,name=hop_limit" json:"hop_limit,omitempty"`
+	CopyDscp                  bool                `binapi:"bool,name=copy_dscp" json:"copy_dscp,omitempty"`
+	ProgramCapacity           uint32              `binapi:"u32,name=program_capacity" json:"program_capacity,omitempty"`
+	ProgramNegativeCapacity   uint32              `binapi:"u32,name=program_negative_capacity" json:"program_negative_capacity,omitempty"`
+	NProgramsAllow            uint32              `binapi:"u32,name=n_programs_allow" json:"n_programs_allow,omitempty"`
+	NProgramsNegative         uint32              `binapi:"u32,name=n_programs_negative" json:"n_programs_negative,omitempty"`
+	PathCapacity              uint32              `binapi:"u32,name=path_capacity" json:"path_capacity,omitempty"`
+	NPaths                    uint32              `binapi:"u32,name=n_paths" json:"n_paths,omitempty"`
+	FragCapacity              uint32              `binapi:"u32,name=frag_capacity" json:"frag_capacity,omitempty"`
+	NFrags                    uint32              `binapi:"u32,name=n_frags" json:"n_frags,omitempty"`
+	NLocalEndpoints           uint32              `binapi:"u32,name=n_local_endpoints" json:"n_local_endpoints,omitempty"`
+	NEndpointRevisions        uint32              `binapi:"u32,name=n_endpoint_revisions" json:"n_endpoint_revisions,omitempty"`
+	NPathRevisions            uint32              `binapi:"u32,name=n_path_revisions" json:"n_path_revisions,omitempty"`
+	NPolicyRevisions          uint32              `binapi:"u32,name=n_policy_revisions" json:"n_policy_revisions,omitempty"`
+	ProgramInstalls           uint64              `binapi:"u64,name=program_installs" json:"program_installs,omitempty"`
+	ProgramDeletes            uint64              `binapi:"u64,name=program_deletes" json:"program_deletes,omitempty"`
+	ProgramQuotaDrops         uint64              `binapi:"u64,name=program_quota_drops" json:"program_quota_drops,omitempty"`
+	ProgramFairEvictions      uint64              `binapi:"u64,name=program_fair_evictions" json:"program_fair_evictions,omitempty"`
+	ProgramStaleInstalls      uint64              `binapi:"u64,name=program_stale_installs" json:"program_stale_installs,omitempty"`
+	ProgramMissingKeyInstalls uint64              `binapi:"u64,name=program_missing_key_installs" json:"program_missing_key_installs,omitempty"`
+	LeaseExtends              uint64              `binapi:"u64,name=lease_extends" json:"lease_extends,omitempty"`
+	RevisionPublishes         uint64              `binapi:"u64,name=revision_publishes" json:"revision_publishes,omitempty"`
+	FragEvictions             uint64              `binapi:"u64,name=frag_evictions" json:"frag_evictions,omitempty"`
+	FragQuotaDrops            uint64              `binapi:"u64,name=frag_quota_drops" json:"frag_quota_drops,omitempty"`
+	FragGc                    uint64              `binapi:"u64,name=frag_gc" json:"frag_gc,omitempty"`
+	PuntOutstanding           []uint32            `binapi:"u32[3],name=punt_outstanding" json:"punt_outstanding,omitempty"`
+	PuntPunted                []uint64            `binapi:"u64[3],name=punt_punted" json:"punt_punted,omitempty"`
+	PuntDrops                 []uint64            `binapi:"u64[3],name=punt_drops" json:"punt_drops,omitempty"`
+	PuntNoTransport           uint64              `binapi:"u64,name=punt_no_transport" json:"punt_no_transport,omitempty"`
+	PuntQueueFull             uint64              `binapi:"u64,name=punt_queue_full" json:"punt_queue_full,omitempty"`
+	PuntWriteFailed           uint64              `binapi:"u64,name=punt_write_failed" json:"punt_write_failed,omitempty"`
+	PuntReleased              uint64              `binapi:"u64,name=punt_released" json:"punt_released,omitempty"`
+	PuntReinjected            uint64              `binapi:"u64,name=punt_reinjected" json:"punt_reinjected,omitempty"`
+	PuntReinjectRejected      uint64              `binapi:"u64,name=punt_reinject_rejected" json:"punt_reinject_rejected,omitempty"`
+	If3Connects               uint64              `binapi:"u64,name=if3_connects" json:"if3_connects,omitempty"`
+	If3Disconnects            uint64              `binapi:"u64,name=if3_disconnects" json:"if3_disconnects,omitempty"`
+	If3FramesSent             uint64              `binapi:"u64,name=if3_frames_sent" json:"if3_frames_sent,omitempty"`
+	If3BytesSent              uint64              `binapi:"u64,name=if3_bytes_sent" json:"if3_bytes_sent,omitempty"`
+	If3FramesReceived         uint64              `binapi:"u64,name=if3_frames_received" json:"if3_frames_received,omitempty"`
+	If3MessageRejections      uint64              `binapi:"u64,name=if3_message_rejections" json:"if3_message_rejections,omitempty"`
+	If3FrameDrops             uint64              `binapi:"u64,name=if3_frame_drops" json:"if3_frame_drops,omitempty"`
+	If3UnusableToken          uint64              `binapi:"u64,name=if3_unusable_token" json:"if3_unusable_token,omitempty"`
+	If3EncodeRefused          uint64              `binapi:"u64,name=if3_encode_refused" json:"if3_encode_refused,omitempty"`
+	If3QueueEntries           uint32              `binapi:"u32,name=if3_queue_entries" json:"if3_queue_entries,omitempty"`
+	If3QueueBytes             uint32              `binapi:"u32,name=if3_queue_bytes" json:"if3_queue_bytes,omitempty"`
+	If3QueueByteCap           uint32              `binapi:"u32,name=if3_queue_byte_cap" json:"if3_queue_byte_cap,omitempty"`
+	If3QueueHighWaterBytes    uint32              `binapi:"u32,name=if3_queue_high_water_bytes" json:"if3_queue_high_water_bytes,omitempty"`
+	ConntrackRegistered       bool                `binapi:"bool,name=conntrack_registered" json:"conntrack_registered,omitempty"`
+	PuntTransportRegistered   bool                `binapi:"bool,name=punt_transport_registered" json:"punt_transport_registered,omitempty"`
+	If3SocketConfigured       bool                `binapi:"bool,name=if3_socket_configured" json:"if3_socket_configured,omitempty"`
+	If3Connected              bool                `binapi:"bool,name=if3_connected" json:"if3_connected,omitempty"`
 }
 
 func (m *Srv6HeadendStatusGetReply) Reset()               { *m = Srv6HeadendStatusGetReply{} }
 func (*Srv6HeadendStatusGetReply) GetMessageName() string { return "srv6_headend_status_get_reply" }
-func (*Srv6HeadendStatusGetReply) GetCrcString() string   { return "c8d1bb9a" }
+func (*Srv6HeadendStatusGetReply) GetCrcString() string   { return "4208465e" }
 func (*Srv6HeadendStatusGetReply) GetMessageType() api.MessageType {
 	return api.ReplyMessage
 }
@@ -2648,13 +2931,15 @@ func (m *Srv6HeadendStatusGetReply) Size() (size int) {
 	size += 4      // m.FragCapacity
 	size += 4      // m.NFrags
 	size += 4      // m.NLocalEndpoints
-	size += 8      // m.EndpointRevision
-	size += 8      // m.PathRevision
+	size += 4      // m.NEndpointRevisions
+	size += 4      // m.NPathRevisions
+	size += 4      // m.NPolicyRevisions
 	size += 8      // m.ProgramInstalls
 	size += 8      // m.ProgramDeletes
 	size += 8      // m.ProgramQuotaDrops
 	size += 8      // m.ProgramFairEvictions
 	size += 8      // m.ProgramStaleInstalls
+	size += 8      // m.ProgramMissingKeyInstalls
 	size += 8      // m.LeaseExtends
 	size += 8      // m.RevisionPublishes
 	size += 8      // m.FragEvictions
@@ -2664,10 +2949,28 @@ func (m *Srv6HeadendStatusGetReply) Size() (size int) {
 	size += 8 * 3  // m.PuntPunted
 	size += 8 * 3  // m.PuntDrops
 	size += 8      // m.PuntNoTransport
+	size += 8      // m.PuntQueueFull
+	size += 8      // m.PuntWriteFailed
+	size += 8      // m.PuntReleased
 	size += 8      // m.PuntReinjected
 	size += 8      // m.PuntReinjectRejected
+	size += 8      // m.If3Connects
+	size += 8      // m.If3Disconnects
+	size += 8      // m.If3FramesSent
+	size += 8      // m.If3BytesSent
+	size += 8      // m.If3FramesReceived
+	size += 8      // m.If3MessageRejections
+	size += 8      // m.If3FrameDrops
+	size += 8      // m.If3UnusableToken
+	size += 8      // m.If3EncodeRefused
+	size += 4      // m.If3QueueEntries
+	size += 4      // m.If3QueueBytes
+	size += 4      // m.If3QueueByteCap
+	size += 4      // m.If3QueueHighWaterBytes
 	size += 1      // m.ConntrackRegistered
 	size += 1      // m.PuntTransportRegistered
+	size += 1      // m.If3SocketConfigured
+	size += 1      // m.If3Connected
 	return size
 }
 func (m *Srv6HeadendStatusGetReply) Marshal(b []byte) ([]byte, error) {
@@ -2691,13 +2994,15 @@ func (m *Srv6HeadendStatusGetReply) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeUint32(m.FragCapacity)
 	buf.EncodeUint32(m.NFrags)
 	buf.EncodeUint32(m.NLocalEndpoints)
-	buf.EncodeUint64(m.EndpointRevision)
-	buf.EncodeUint64(m.PathRevision)
+	buf.EncodeUint32(m.NEndpointRevisions)
+	buf.EncodeUint32(m.NPathRevisions)
+	buf.EncodeUint32(m.NPolicyRevisions)
 	buf.EncodeUint64(m.ProgramInstalls)
 	buf.EncodeUint64(m.ProgramDeletes)
 	buf.EncodeUint64(m.ProgramQuotaDrops)
 	buf.EncodeUint64(m.ProgramFairEvictions)
 	buf.EncodeUint64(m.ProgramStaleInstalls)
+	buf.EncodeUint64(m.ProgramMissingKeyInstalls)
 	buf.EncodeUint64(m.LeaseExtends)
 	buf.EncodeUint64(m.RevisionPublishes)
 	buf.EncodeUint64(m.FragEvictions)
@@ -2725,10 +3030,28 @@ func (m *Srv6HeadendStatusGetReply) Marshal(b []byte) ([]byte, error) {
 		buf.EncodeUint64(x)
 	}
 	buf.EncodeUint64(m.PuntNoTransport)
+	buf.EncodeUint64(m.PuntQueueFull)
+	buf.EncodeUint64(m.PuntWriteFailed)
+	buf.EncodeUint64(m.PuntReleased)
 	buf.EncodeUint64(m.PuntReinjected)
 	buf.EncodeUint64(m.PuntReinjectRejected)
+	buf.EncodeUint64(m.If3Connects)
+	buf.EncodeUint64(m.If3Disconnects)
+	buf.EncodeUint64(m.If3FramesSent)
+	buf.EncodeUint64(m.If3BytesSent)
+	buf.EncodeUint64(m.If3FramesReceived)
+	buf.EncodeUint64(m.If3MessageRejections)
+	buf.EncodeUint64(m.If3FrameDrops)
+	buf.EncodeUint64(m.If3UnusableToken)
+	buf.EncodeUint64(m.If3EncodeRefused)
+	buf.EncodeUint32(m.If3QueueEntries)
+	buf.EncodeUint32(m.If3QueueBytes)
+	buf.EncodeUint32(m.If3QueueByteCap)
+	buf.EncodeUint32(m.If3QueueHighWaterBytes)
 	buf.EncodeBool(m.ConntrackRegistered)
 	buf.EncodeBool(m.PuntTransportRegistered)
+	buf.EncodeBool(m.If3SocketConfigured)
+	buf.EncodeBool(m.If3Connected)
 	return buf.Bytes(), nil
 }
 func (m *Srv6HeadendStatusGetReply) Unmarshal(b []byte) error {
@@ -2749,13 +3072,15 @@ func (m *Srv6HeadendStatusGetReply) Unmarshal(b []byte) error {
 	m.FragCapacity = buf.DecodeUint32()
 	m.NFrags = buf.DecodeUint32()
 	m.NLocalEndpoints = buf.DecodeUint32()
-	m.EndpointRevision = buf.DecodeUint64()
-	m.PathRevision = buf.DecodeUint64()
+	m.NEndpointRevisions = buf.DecodeUint32()
+	m.NPathRevisions = buf.DecodeUint32()
+	m.NPolicyRevisions = buf.DecodeUint32()
 	m.ProgramInstalls = buf.DecodeUint64()
 	m.ProgramDeletes = buf.DecodeUint64()
 	m.ProgramQuotaDrops = buf.DecodeUint64()
 	m.ProgramFairEvictions = buf.DecodeUint64()
 	m.ProgramStaleInstalls = buf.DecodeUint64()
+	m.ProgramMissingKeyInstalls = buf.DecodeUint64()
 	m.LeaseExtends = buf.DecodeUint64()
 	m.RevisionPublishes = buf.DecodeUint64()
 	m.FragEvictions = buf.DecodeUint64()
@@ -2774,10 +3099,28 @@ func (m *Srv6HeadendStatusGetReply) Unmarshal(b []byte) error {
 		m.PuntDrops[i] = buf.DecodeUint64()
 	}
 	m.PuntNoTransport = buf.DecodeUint64()
+	m.PuntQueueFull = buf.DecodeUint64()
+	m.PuntWriteFailed = buf.DecodeUint64()
+	m.PuntReleased = buf.DecodeUint64()
 	m.PuntReinjected = buf.DecodeUint64()
 	m.PuntReinjectRejected = buf.DecodeUint64()
+	m.If3Connects = buf.DecodeUint64()
+	m.If3Disconnects = buf.DecodeUint64()
+	m.If3FramesSent = buf.DecodeUint64()
+	m.If3BytesSent = buf.DecodeUint64()
+	m.If3FramesReceived = buf.DecodeUint64()
+	m.If3MessageRejections = buf.DecodeUint64()
+	m.If3FrameDrops = buf.DecodeUint64()
+	m.If3UnusableToken = buf.DecodeUint64()
+	m.If3EncodeRefused = buf.DecodeUint64()
+	m.If3QueueEntries = buf.DecodeUint32()
+	m.If3QueueBytes = buf.DecodeUint32()
+	m.If3QueueByteCap = buf.DecodeUint32()
+	m.If3QueueHighWaterBytes = buf.DecodeUint32()
 	m.ConntrackRegistered = buf.DecodeBool()
 	m.PuntTransportRegistered = buf.DecodeBool()
+	m.If3SocketConfigured = buf.DecodeBool()
+	m.If3Connected = buf.DecodeBool()
 	return nil
 }
 
@@ -3238,6 +3581,30 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	sw_if_index is reused after an interface is deleted, so a write carrying
 //	the incarnation of a lifetime that has already ended is refused rather
 //	than allowed to give a new Pod the previous Pod's identity.
+//	An ADD also names the CNI attachment the entry is for, and the plugin
+//	accepts it only when its own attachment binding table (D-68,
+//	srv6_if_attachment_add_del) holds exactly that
+//	(attachment_id, sw_if_index, if_incarnation) [決定 (errata #34 項目 200)].
+//	The key alone is not enough: a bare (sw_if_index, if_incarnation) tuple is
+//	drawn from counters a restarting plugin restarts, so a caller that kept a
+//	handle across a plugin instance replays a *valid-looking* tuple that names
+//	whatever interface the new instance put in that slot. Issue #21 run 17 is
+//	that case - the Pod interface lifecycle service recreated four TUNs in a
+//	different order, two attachments swapped slots, and both tuples were live -
+//	and it is why this is a cross-authority consistency check rather than
+//	defence in depth: the writer's authority is the attachment, the binding
+//	table's authority is which interface that attachment is behind, and the
+//	write is refused when the two disagree. D-72 reconstructs the binding table
+//	before any LocalEndpoint is installed, so there is no ordering in which a
+//	legitimate ADD arrives before its binding.
+//	A DELETE that carries an attachment_id removes the entry only when the
+//	entry was installed for that same attachment, so a delete left over from a
+//	previous attachment cannot remove the entry a new one installed. A DELETE
+//	with an empty attachment_id is the unverified form, keyed by
+//	(sw_if_index, if_incarnation) alone: it exists for the D-70 orphan sweep,
+//	which names a lifetime it has just read out of srv6_local_ep_dump under the
+//	current plugin instance and has no attachment identity to quote, because
+//	srv6_local_ep_details does not carry one.
 //	Installing an entry also enables cilium-srv6-classify on that interface;
 //	removing it disables it again. An interface with no entry is therefore
 //	not part of the headend graph at all, which is why 02 §1 starts the chain
@@ -3250,11 +3617,32 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	                        (D-31)
 //	  INVALID_VALUE_3     - ip is link-local; 02 §3 assumes one global
 //	                        unicast address per endpoint
-//	  NO_SUCH_ENTRY       - delete of an entry that is not installed
+//	  INVALID_VALUE_4     - attachment_id is malformed: empty on an ADD, longer
+//	                        than 255 bytes, or outside printable ASCII. The
+//	                        same rule and the same bound as
+//	                        srv6_if_attachment_add_del
+//	  NO_SUCH_ENTRY       - ADD: the binding table holds no binding for
+//	                        sw_if_index, so no attachment claims this interface
+//	                        (D-68).
+//	                        DELETE: no entry is installed for this interface,
+//	                        or the installed entry belongs to a different
+//	                        attachment - which is the same answer, because the
+//	                        named attachment has no entry here
+//	  ENTRY_ALREADY_EXISTS - ADD: sw_if_index is bound to a *different*
+//	                        attachment. Nothing is replaced and nothing is
+//	                        installed; the writer withdraws the old binding
+//	                        first (D-68)
+//	  INVALID_INTERFACE   - ADD: the binding for sw_if_index was published for
+//	                        an if_incarnation other than the one on the wire
 //	  UNSPECIFIED         - the classify feature could not be enabled, so the
 //	                        endpoint would not be classified at all
 //	- sw_if_index - the Pod interface
 //	- if_incarnation - incarnation as reported by srv6_acl_dump (D-31)
+//	- attachment_id - the CNI attachment identity this entry is for,
+//	       verbatim, exactly as srv6_if_attachment_add_del carries it: same
+//	       type, same 255-byte bound, same character set. Required on an ADD;
+//	       on a DELETE it is either the identity the entry was installed for or
+//	       empty
 //	- identity - the src identity every packet from this interface is
 //	       classified with (02 §3: identity comes from the interface, never
 //	       from the packet's source address)
@@ -3274,11 +3662,12 @@ type Srv6LocalEpAddDel struct {
 	LocalContextID  uint32                         `binapi:"u32,name=local_context_id" json:"local_context_id,omitempty"`
 	OwnerQuotaClass uint32                         `binapi:"u32,name=owner_quota_class" json:"owner_quota_class,omitempty"`
 	IsAdd           bool                           `binapi:"bool,name=is_add" json:"is_add,omitempty"`
+	AttachmentID    string                         `binapi:"string[],name=attachment_id" json:"attachment_id,omitempty"`
 }
 
 func (m *Srv6LocalEpAddDel) Reset()               { *m = Srv6LocalEpAddDel{} }
 func (*Srv6LocalEpAddDel) GetMessageName() string { return "srv6_local_ep_add_del" }
-func (*Srv6LocalEpAddDel) GetCrcString() string   { return "b8be0b8d" }
+func (*Srv6LocalEpAddDel) GetCrcString() string   { return "fbb7541c" }
 func (*Srv6LocalEpAddDel) GetMessageType() api.MessageType {
 	return api.RequestMessage
 }
@@ -3287,13 +3676,14 @@ func (m *Srv6LocalEpAddDel) Size() (size int) {
 	if m == nil {
 		return 0
 	}
-	size += 4      // m.SwIfIndex
-	size += 4      // m.IfIncarnation
-	size += 4      // m.Identity
-	size += 1 * 16 // m.IP
-	size += 4      // m.LocalContextID
-	size += 4      // m.OwnerQuotaClass
-	size += 1      // m.IsAdd
+	size += 4                       // m.SwIfIndex
+	size += 4                       // m.IfIncarnation
+	size += 4                       // m.Identity
+	size += 1 * 16                  // m.IP
+	size += 4                       // m.LocalContextID
+	size += 4                       // m.OwnerQuotaClass
+	size += 1                       // m.IsAdd
+	size += 4 + len(m.AttachmentID) // m.AttachmentID
 	return size
 }
 func (m *Srv6LocalEpAddDel) Marshal(b []byte) ([]byte, error) {
@@ -3308,6 +3698,7 @@ func (m *Srv6LocalEpAddDel) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeUint32(m.LocalContextID)
 	buf.EncodeUint32(m.OwnerQuotaClass)
 	buf.EncodeBool(m.IsAdd)
+	buf.EncodeString(m.AttachmentID, 0)
 	return buf.Bytes(), nil
 }
 func (m *Srv6LocalEpAddDel) Unmarshal(b []byte) error {
@@ -3319,6 +3710,7 @@ func (m *Srv6LocalEpAddDel) Unmarshal(b []byte) error {
 	m.LocalContextID = buf.DecodeUint32()
 	m.OwnerQuotaClass = buf.DecodeUint32()
 	m.IsAdd = buf.DecodeBool()
+	m.AttachmentID = buf.DecodeString(0)
 	return nil
 }
 
@@ -3734,6 +4126,116 @@ func (m *Srv6PathDump) Marshal(b []byte) ([]byte, error) {
 func (m *Srv6PathDump) Unmarshal(b []byte) error {
 	buf := codec.NewBuffer(b)
 	m.PathIndex = buf.DecodeUint32()
+	return nil
+}
+
+// Publish the PATH revision namespace (IF-2, 02 §8, D-83).
+//
+//	Per-key semantics, atomicity and ordering are those of
+//	srv6_endpoint_revision_publish. The key is a PathCache index, so this
+//	message can only be sent after srv6_path_txn_commit has published the
+//	indices it names (D-61): a revision for an index that is not published is
+//	refused rather than remembered.
+//	Rejections:
+//	  INIT_FAILED     - tables not built yet
+//	  INVALID_VALUE   - a count without an array
+//	  INVALID_VALUE_2 - a revision moves backwards for its key
+//	  INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
+//	  NO_SUCH_ENTRY   - an index that is out of range or not published
+//	- n_path - number of (PathCache index, revision) pairs that follow
+//	- path - the pairs
+//
+// Srv6PathRevisionPublish defines message 'srv6_path_revision_publish'.
+type Srv6PathRevisionPublish struct {
+	NPath uint32             `binapi:"u32,name=n_path" json:"-"`
+	Path  []Srv6PathRevision `binapi:"srv6_path_revision[n_path],name=path" json:"path,omitempty"`
+}
+
+func (m *Srv6PathRevisionPublish) Reset()               { *m = Srv6PathRevisionPublish{} }
+func (*Srv6PathRevisionPublish) GetMessageName() string { return "srv6_path_revision_publish" }
+func (*Srv6PathRevisionPublish) GetCrcString() string   { return "72bcb1e2" }
+func (*Srv6PathRevisionPublish) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6PathRevisionPublish) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.NPath
+	for j1 := 0; j1 < len(m.Path); j1++ {
+		var s1 Srv6PathRevision
+		_ = s1
+		if j1 < len(m.Path) {
+			s1 = m.Path[j1]
+		}
+		size += 4 // s1.PathIndex
+		size += 4 // s1.Pad
+		size += 8 // s1.Revision
+	}
+	return size
+}
+func (m *Srv6PathRevisionPublish) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint32(uint32(len(m.Path)))
+	for j0 := 0; j0 < len(m.Path); j0++ {
+		var v0 Srv6PathRevision // Path
+		if j0 < len(m.Path) {
+			v0 = m.Path[j0]
+		}
+		buf.EncodeUint32(v0.PathIndex)
+		buf.EncodeUint32(v0.Pad)
+		buf.EncodeUint64(v0.Revision)
+	}
+	return buf.Bytes(), nil
+}
+func (m *Srv6PathRevisionPublish) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.NPath = buf.DecodeUint32()
+	m.Path = make([]Srv6PathRevision, m.NPath)
+	for j0 := 0; j0 < len(m.Path); j0++ {
+		m.Path[j0].PathIndex = buf.DecodeUint32()
+		m.Path[j0].Pad = buf.DecodeUint32()
+		m.Path[j0].Revision = buf.DecodeUint64()
+	}
+	return nil
+}
+
+// Srv6PathRevisionPublishReply defines message 'srv6_path_revision_publish_reply'.
+type Srv6PathRevisionPublishReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6PathRevisionPublishReply) Reset() { *m = Srv6PathRevisionPublishReply{} }
+func (*Srv6PathRevisionPublishReply) GetMessageName() string {
+	return "srv6_path_revision_publish_reply"
+}
+func (*Srv6PathRevisionPublishReply) GetCrcString() string { return "e8d4e804" }
+func (*Srv6PathRevisionPublishReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6PathRevisionPublishReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	return size
+}
+func (m *Srv6PathRevisionPublishReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	return buf.Bytes(), nil
+}
+func (m *Srv6PathRevisionPublishReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
 	return nil
 }
 
@@ -4200,40 +4702,213 @@ func (m *Srv6PathTxnPutReply) Unmarshal(b []byte) error {
 	return nil
 }
 
+// Publish the POLICY revision namespace (IF-2, 02 §8, D-30, D-84).
+//
+//	Per-key semantics, atomicity and ordering are those of
+//	srv6_endpoint_revision_publish. The key is a SecurityIdentity.
+//	D-84 fixes who sends it and when. The revision the compiler quotes in
+//	srv6_program_add_del is produced by the agent's policy revision bumper, so
+//	the bumper is also the producer here:
+//	  - on startup, and after a plugin instance change (D-72), the agent seeds
+//	    the current snapshot of every identity it holds a revision for, and
+//	    does not open ProgramCache publication until this message has been
+//	    acknowledged;
+//	  - at runtime it publishes only the identities the bumper reports as
+//	    changed, in the order revision[X] bump -> publish[X] + ACK ->
+//	    compilation and publication for X.
+//	Remote identities are in scope, not only local ones: the reply
+//	re-authorisation of 02 §7.2 compares the conntrack entry's stored revision
+//	against the revision of the *forward direction source* identity, which on
+//	this node is usually a remote one (D-30, D-49).
+//	Publishing a revision for an identity that has no slot creates one, and
+//	the slot is retained afterwards so that the next srv6_program_add_del and
+//	the next srv6_ct_verify for that identity have something to compare
+//	against.
+//	Rejections:
+//	  INIT_FAILED     - tables not built yet
+//	  INVALID_VALUE   - a count without an array
+//	  INVALID_VALUE_2 - a revision moves backwards for its key
+//	  INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
+//	  LIMIT_EXCEEDED  - the per-identity revision table has no room for the
+//	                    new identities of this message
+//	- n_policy - number of (identity, revision) pairs that follow
+//	- policy - the pairs
+//
+// Srv6PolicyRevisionPublish defines message 'srv6_policy_revision_publish'.
+type Srv6PolicyRevisionPublish struct {
+	NPolicy uint32               `binapi:"u32,name=n_policy" json:"-"`
+	Policy  []Srv6PolicyRevision `binapi:"srv6_policy_revision[n_policy],name=policy" json:"policy,omitempty"`
+}
+
+func (m *Srv6PolicyRevisionPublish) Reset()               { *m = Srv6PolicyRevisionPublish{} }
+func (*Srv6PolicyRevisionPublish) GetMessageName() string { return "srv6_policy_revision_publish" }
+func (*Srv6PolicyRevisionPublish) GetCrcString() string   { return "614b7fcc" }
+func (*Srv6PolicyRevisionPublish) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6PolicyRevisionPublish) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.NPolicy
+	for j1 := 0; j1 < len(m.Policy); j1++ {
+		var s1 Srv6PolicyRevision
+		_ = s1
+		if j1 < len(m.Policy) {
+			s1 = m.Policy[j1]
+		}
+		size += 4 // s1.Identity
+		size += 8 // s1.Revision
+	}
+	return size
+}
+func (m *Srv6PolicyRevisionPublish) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint32(uint32(len(m.Policy)))
+	for j0 := 0; j0 < len(m.Policy); j0++ {
+		var v0 Srv6PolicyRevision // Policy
+		if j0 < len(m.Policy) {
+			v0 = m.Policy[j0]
+		}
+		buf.EncodeUint32(v0.Identity)
+		buf.EncodeUint64(v0.Revision)
+	}
+	return buf.Bytes(), nil
+}
+func (m *Srv6PolicyRevisionPublish) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.NPolicy = buf.DecodeUint32()
+	m.Policy = make([]Srv6PolicyRevision, m.NPolicy)
+	for j0 := 0; j0 < len(m.Policy); j0++ {
+		m.Policy[j0].Identity = buf.DecodeUint32()
+		m.Policy[j0].Revision = buf.DecodeUint64()
+	}
+	return nil
+}
+
+// Srv6PolicyRevisionPublishReply defines message 'srv6_policy_revision_publish_reply'.
+type Srv6PolicyRevisionPublishReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6PolicyRevisionPublishReply) Reset() { *m = Srv6PolicyRevisionPublishReply{} }
+func (*Srv6PolicyRevisionPublishReply) GetMessageName() string {
+	return "srv6_policy_revision_publish_reply"
+}
+func (*Srv6PolicyRevisionPublishReply) GetCrcString() string { return "e8d4e804" }
+func (*Srv6PolicyRevisionPublishReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6PolicyRevisionPublishReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	return size
+}
+func (m *Srv6PolicyRevisionPublishReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	return buf.Bytes(), nil
+}
+func (m *Srv6PolicyRevisionPublishReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
+	return nil
+}
+
 // Install or remove one ProgramCache entry (IF-2, 02 §8).
 //
 //	Idempotent: re-installing the same key overwrites the entry.
 //	The three dependency revisions are compared against the ones this node
 //	currently publishes before anything is written, which is the plugin side
 //	of 02 §4.3's "VPP install 直前に再比較する。一つでも変化したら結果を
-//	install せず再試行する". An identity that has never appeared in an
-//	srv6_revision_publish has no revision slot, and its slot reads as the ~0
-//	sentinel, so the first install for a new identity must be preceded by a
-//	publish.
+//	install せず再試行する".
+//	D-83 fixes what "the one this node currently publishes" resolves against.
+//	Each quoted revision is resolved in its own namespace, by its own key:
+//	  - `policy_revision` against the POLICY key `src_identity`;
+//	  - `endpoint_revision` against the ENDPOINT key `dst`, falling back to
+//	    the reserved `::` key when `dst` is not a published endpoint. That
+//	    fallback is the dependency of a negative entry: it is what makes the
+//	    destination *appearing* invalidate the DENY that was compiled because
+//	    it was absent;
+//	  - `path_revision` against the PATH key `path_cache_index`. A DENY has no
+//	    path dependency and must quote 0; an ALLOW must quote the current
+//	    revision of the index it names.
+//	An install is accepted only when every referenced key exists and every
+//	quoted revision matches it exactly. A key with no published revision is
+//	refused rather than defaulted: the first install for a new identity,
+//	destination or path index must be preceded by the publish of that key
+//	(INVALID_VALUE_4, counted in `program_missing_key_installs`).
 //	Capacity is governed by 02 §5.3 / D-26 / D-42: ALLOW and negative (DENY)
 //	entries have separate budgets so that scan traffic cannot evict
 //	established flows, and eviction inside a budget prefers entries whose
 //	owner and identity are over their soft quota.
+//	D-80 adds the forwarding action, and with it a third legal combination.
+//	The three are exhaustive and the cross product is refused
+//	(INVALID_ARGUMENT, counted in `program_illegal_action_installs`):
+//	  verdict  action         path_cache_index  path_revision  target
+//	  DENY     ENCAP          ~0                0              none
+//	  ALLOW    ENCAP          a valid index     current (>0)   none
+//	  ALLOW    LOCAL_DELIVER  ~0                0              a live lifetime
+//	A LOCAL_DELIVER entry depends on the destination's own ENDPOINT key like
+//	any other positive Program — never on the reserved `::` key — because the
+//	destination is a published endpoint of this node. It has no PATH
+//	dependency, because it resolves no path.
+//	The target is validated against the LocalEndpointTable and is not taken on
+//	the caller's word (D-80: the local destination resolution authority is the
+//	LocalEndpoint state). (target_sw_if_index, target_if_incarnation) must be a
+//	live interface lifetime (D-31/D-68), the endpoint it carries must be `dst`,
+//	and its identity must be `target_identity` — the identity the policy
+//	decision was taken against (D-69).
 //	Rejections (all fail-closed, no state change):
-//	  INVALID_VALUE   - dst is the unspecified address
-//	  INVALID_VALUE_2 - unknown verdict
-//	  INVALID_VALUE_3 - one of the three revisions is not the one currently
-//	                    published (stale compile, 02 §4.3)
-//	  NO_SUCH_ENTRY   - ALLOW whose path handle does not resolve, or a delete
-//	                    of a key that is not installed
-//	  LIMIT_EXCEEDED  - the budget is full and fair eviction found nothing to
-//	                    evict (counted in program_cache_quota_drops_total)
+//	  INVALID_VALUE     - dst is the unspecified address
+//	  INVALID_VALUE_2   - unknown verdict or unknown action
+//	  INVALID_VALUE_3   - one of the three revisions is not the one currently
+//	                      published for its key (stale compile, 02 §4.3)
+//	  INVALID_VALUE_4   - a referenced revision key does not exist: the
+//	                      identity, the destination (with no `::` fallback
+//	                      published) or the PathCache index has no published
+//	                      revision (fail-closed, D-83)
+//	  INVALID_ARGUMENT  - the {verdict, action, path, target} combination is
+//	                      not one of the three above (D-80, counted in
+//	                      `program_illegal_action_installs`)
+//	  INVALID_INTERFACE - LOCAL_DELIVER whose target is not a live interface
+//	                      lifetime (`program_local_target_unbound`), or whose
+//	                      live entry does not carry this destination address or
+//	                      identity (`program_local_target_mismatch`)
+//	  NO_SUCH_ENTRY     - ALLOW+ENCAP whose path handle does not resolve, or a
+//	                      delete of a key that is not installed
+//	  LIMIT_EXCEEDED    - the budget is full and fair eviction found nothing to
+//	                      evict (counted in program_cache_quota_drops_total)
 //	- src_identity - key: source identity
 //	- dst - key: destination address
 //	- proto - key: upper layer protocol
 //	- l4_discriminator - key: TCP/UDP destination port, ICMPv6
 //	       (type << 8) | code, 0 otherwise (D-41)
 //	- verdict - ALLOW or DENY
-//	- policy_revision - revision of policy_revision[src_identity] (D-30)
-//	- endpoint_revision - dst identity / RemoteEndpoint dependency
-//	- path_revision - PathCache dependency
-//	- path_cache_index - versioned handle, ALLOW only
-//	- path_generation - versioned handle, ALLOW only
+//	- action - ENCAP or LOCAL_DELIVER (D-80); ENCAP for every DENY
+//	- policy_revision - POLICY key src_identity (D-30)
+//	- endpoint_revision - ENDPOINT key dst, or the reserved `::` key when
+//	       dst is not a published endpoint (D-83)
+//	- path_revision - PATH key path_cache_index; 0 for a DENY and for a
+//	       LOCAL_DELIVER, neither of which has a path dependency
+//	- path_cache_index - versioned handle, ALLOW+ENCAP only
+//	- path_generation - versioned handle, ALLOW+ENCAP only
+//	- target_sw_if_index - LOCAL_DELIVER only: the destination endpoint's
+//	       VPP interface; 0 otherwise
+//	- target_if_incarnation - LOCAL_DELIVER only: the incarnation of that
+//	       interface lifetime (D-31); 0 otherwise
+//	- target_identity - LOCAL_DELIVER only: the destination endpoint's
+//	       Security Identity, re-checked at delivery time (D-69); 0 otherwise
 //	- owner_quota_class - owner(namespace) quota class (D-42)
 //	D-51: there is no lease field. The lease belongs to the dependency
 //	identity, not to the entry (00 §2.1), and an accepted ALLOW install grants
@@ -4244,23 +4919,27 @@ func (m *Srv6PathTxnPutReply) Unmarshal(b []byte) error {
 //
 // Srv6ProgramAddDel defines message 'srv6_program_add_del'.
 type Srv6ProgramAddDel struct {
-	SrcIdentity      uint32              `binapi:"u32,name=src_identity" json:"src_identity,omitempty"`
-	Dst              ip_types.IP6Address `binapi:"ip6_address,name=dst" json:"dst,omitempty"`
-	Proto            uint8               `binapi:"u8,name=proto" json:"proto,omitempty"`
-	L4Discriminator  uint16              `binapi:"u16,name=l4_discriminator" json:"l4_discriminator,omitempty"`
-	Verdict          Srv6ProgramVerdict  `binapi:"srv6_program_verdict,name=verdict" json:"verdict,omitempty"`
-	PolicyRevision   uint64              `binapi:"u64,name=policy_revision" json:"policy_revision,omitempty"`
-	EndpointRevision uint64              `binapi:"u64,name=endpoint_revision" json:"endpoint_revision,omitempty"`
-	PathRevision     uint64              `binapi:"u64,name=path_revision" json:"path_revision,omitempty"`
-	PathCacheIndex   uint32              `binapi:"u32,name=path_cache_index" json:"path_cache_index,omitempty"`
-	PathGeneration   uint32              `binapi:"u32,name=path_generation" json:"path_generation,omitempty"`
-	OwnerQuotaClass  uint32              `binapi:"u32,name=owner_quota_class" json:"owner_quota_class,omitempty"`
-	IsAdd            bool                `binapi:"bool,name=is_add" json:"is_add,omitempty"`
+	SrcIdentity         uint32              `binapi:"u32,name=src_identity" json:"src_identity,omitempty"`
+	Dst                 ip_types.IP6Address `binapi:"ip6_address,name=dst" json:"dst,omitempty"`
+	Proto               uint8               `binapi:"u8,name=proto" json:"proto,omitempty"`
+	L4Discriminator     uint16              `binapi:"u16,name=l4_discriminator" json:"l4_discriminator,omitempty"`
+	Verdict             Srv6ProgramVerdict  `binapi:"srv6_program_verdict,name=verdict" json:"verdict,omitempty"`
+	Action              Srv6ProgramAction   `binapi:"srv6_program_action,name=action" json:"action,omitempty"`
+	PolicyRevision      uint64              `binapi:"u64,name=policy_revision" json:"policy_revision,omitempty"`
+	EndpointRevision    uint64              `binapi:"u64,name=endpoint_revision" json:"endpoint_revision,omitempty"`
+	PathRevision        uint64              `binapi:"u64,name=path_revision" json:"path_revision,omitempty"`
+	PathCacheIndex      uint32              `binapi:"u32,name=path_cache_index" json:"path_cache_index,omitempty"`
+	PathGeneration      uint32              `binapi:"u32,name=path_generation" json:"path_generation,omitempty"`
+	TargetSwIfIndex     uint32              `binapi:"u32,name=target_sw_if_index" json:"target_sw_if_index,omitempty"`
+	TargetIfIncarnation uint32              `binapi:"u32,name=target_if_incarnation" json:"target_if_incarnation,omitempty"`
+	TargetIdentity      uint32              `binapi:"u32,name=target_identity" json:"target_identity,omitempty"`
+	OwnerQuotaClass     uint32              `binapi:"u32,name=owner_quota_class" json:"owner_quota_class,omitempty"`
+	IsAdd               bool                `binapi:"bool,name=is_add" json:"is_add,omitempty"`
 }
 
 func (m *Srv6ProgramAddDel) Reset()               { *m = Srv6ProgramAddDel{} }
 func (*Srv6ProgramAddDel) GetMessageName() string { return "srv6_program_add_del" }
-func (*Srv6ProgramAddDel) GetCrcString() string   { return "3926f4be" }
+func (*Srv6ProgramAddDel) GetCrcString() string   { return "827e005a" }
 func (*Srv6ProgramAddDel) GetMessageType() api.MessageType {
 	return api.RequestMessage
 }
@@ -4274,11 +4953,15 @@ func (m *Srv6ProgramAddDel) Size() (size int) {
 	size += 1      // m.Proto
 	size += 2      // m.L4Discriminator
 	size += 1      // m.Verdict
+	size += 1      // m.Action
 	size += 8      // m.PolicyRevision
 	size += 8      // m.EndpointRevision
 	size += 8      // m.PathRevision
 	size += 4      // m.PathCacheIndex
 	size += 4      // m.PathGeneration
+	size += 4      // m.TargetSwIfIndex
+	size += 4      // m.TargetIfIncarnation
+	size += 4      // m.TargetIdentity
 	size += 4      // m.OwnerQuotaClass
 	size += 1      // m.IsAdd
 	return size
@@ -4293,11 +4976,15 @@ func (m *Srv6ProgramAddDel) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeUint8(m.Proto)
 	buf.EncodeUint16(m.L4Discriminator)
 	buf.EncodeUint8(uint8(m.Verdict))
+	buf.EncodeUint8(uint8(m.Action))
 	buf.EncodeUint64(m.PolicyRevision)
 	buf.EncodeUint64(m.EndpointRevision)
 	buf.EncodeUint64(m.PathRevision)
 	buf.EncodeUint32(m.PathCacheIndex)
 	buf.EncodeUint32(m.PathGeneration)
+	buf.EncodeUint32(m.TargetSwIfIndex)
+	buf.EncodeUint32(m.TargetIfIncarnation)
+	buf.EncodeUint32(m.TargetIdentity)
 	buf.EncodeUint32(m.OwnerQuotaClass)
 	buf.EncodeBool(m.IsAdd)
 	return buf.Bytes(), nil
@@ -4309,11 +4996,15 @@ func (m *Srv6ProgramAddDel) Unmarshal(b []byte) error {
 	m.Proto = buf.DecodeUint8()
 	m.L4Discriminator = buf.DecodeUint16()
 	m.Verdict = Srv6ProgramVerdict(buf.DecodeUint8())
+	m.Action = Srv6ProgramAction(buf.DecodeUint8())
 	m.PolicyRevision = buf.DecodeUint64()
 	m.EndpointRevision = buf.DecodeUint64()
 	m.PathRevision = buf.DecodeUint64()
 	m.PathCacheIndex = buf.DecodeUint32()
 	m.PathGeneration = buf.DecodeUint32()
+	m.TargetSwIfIndex = buf.DecodeUint32()
+	m.TargetIfIncarnation = buf.DecodeUint32()
+	m.TargetIdentity = buf.DecodeUint32()
 	m.OwnerQuotaClass = buf.DecodeUint32()
 	m.IsAdd = buf.DecodeBool()
 	return nil
@@ -4360,30 +5051,43 @@ func (m *Srv6ProgramAddDelReply) Unmarshal(b []byte) error {
 //     revision, and for an expired one.
 //   - stale - the entry's dependency revisions no longer match what the
 //     node publishes, so the next packet punts (02 §4.2)
+//   - action - the forwarding action of an ALLOW (D-80). It is reported
+//     because an operator reading `cilium-dbg srv6 program-cache` cannot
+//     otherwise tell a same-node delivery from an encapsulation: a
+//     LOCAL_DELIVER entry has no path handle, which without this field is
+//     indistinguishable from a DENY's absent one.
+//   - target_sw_if_index - LOCAL_DELIVER only: the delivery interface
+//   - target_if_incarnation - LOCAL_DELIVER only: its incarnation (D-31)
+//   - target_identity - LOCAL_DELIVER only: the destination endpoint's
+//     Security Identity the decision was taken against (D-69)
 //
 // Srv6ProgramDetails defines message 'srv6_program_details'.
 type Srv6ProgramDetails struct {
-	ProgramIndex     uint32              `binapi:"u32,name=program_index" json:"program_index,omitempty"`
-	SrcIdentity      uint32              `binapi:"u32,name=src_identity" json:"src_identity,omitempty"`
-	Dst              ip_types.IP6Address `binapi:"ip6_address,name=dst" json:"dst,omitempty"`
-	Proto            uint8               `binapi:"u8,name=proto" json:"proto,omitempty"`
-	L4Discriminator  uint16              `binapi:"u16,name=l4_discriminator" json:"l4_discriminator,omitempty"`
-	Verdict          Srv6ProgramVerdict  `binapi:"srv6_program_verdict,name=verdict" json:"verdict,omitempty"`
-	PolicyRevision   uint64              `binapi:"u64,name=policy_revision" json:"policy_revision,omitempty"`
-	EndpointRevision uint64              `binapi:"u64,name=endpoint_revision" json:"endpoint_revision,omitempty"`
-	PathRevision     uint64              `binapi:"u64,name=path_revision" json:"path_revision,omitempty"`
-	PathCacheIndex   uint32              `binapi:"u32,name=path_cache_index" json:"path_cache_index,omitempty"`
-	PathGeneration   uint32              `binapi:"u32,name=path_generation" json:"path_generation,omitempty"`
-	LeaseRemainingMs uint32              `binapi:"u32,name=lease_remaining_ms" json:"lease_remaining_ms,omitempty"`
-	OwnerQuotaClass  uint32              `binapi:"u32,name=owner_quota_class" json:"owner_quota_class,omitempty"`
-	Stale            bool                `binapi:"bool,name=stale" json:"stale,omitempty"`
-	Packets          uint64              `binapi:"u64,name=packets" json:"packets,omitempty"`
-	Bytes            uint64              `binapi:"u64,name=bytes" json:"bytes,omitempty"`
+	ProgramIndex        uint32              `binapi:"u32,name=program_index" json:"program_index,omitempty"`
+	SrcIdentity         uint32              `binapi:"u32,name=src_identity" json:"src_identity,omitempty"`
+	Dst                 ip_types.IP6Address `binapi:"ip6_address,name=dst" json:"dst,omitempty"`
+	Proto               uint8               `binapi:"u8,name=proto" json:"proto,omitempty"`
+	L4Discriminator     uint16              `binapi:"u16,name=l4_discriminator" json:"l4_discriminator,omitempty"`
+	Verdict             Srv6ProgramVerdict  `binapi:"srv6_program_verdict,name=verdict" json:"verdict,omitempty"`
+	Action              Srv6ProgramAction   `binapi:"srv6_program_action,name=action" json:"action,omitempty"`
+	PolicyRevision      uint64              `binapi:"u64,name=policy_revision" json:"policy_revision,omitempty"`
+	EndpointRevision    uint64              `binapi:"u64,name=endpoint_revision" json:"endpoint_revision,omitempty"`
+	PathRevision        uint64              `binapi:"u64,name=path_revision" json:"path_revision,omitempty"`
+	PathCacheIndex      uint32              `binapi:"u32,name=path_cache_index" json:"path_cache_index,omitempty"`
+	PathGeneration      uint32              `binapi:"u32,name=path_generation" json:"path_generation,omitempty"`
+	TargetSwIfIndex     uint32              `binapi:"u32,name=target_sw_if_index" json:"target_sw_if_index,omitempty"`
+	TargetIfIncarnation uint32              `binapi:"u32,name=target_if_incarnation" json:"target_if_incarnation,omitempty"`
+	TargetIdentity      uint32              `binapi:"u32,name=target_identity" json:"target_identity,omitempty"`
+	LeaseRemainingMs    uint32              `binapi:"u32,name=lease_remaining_ms" json:"lease_remaining_ms,omitempty"`
+	OwnerQuotaClass     uint32              `binapi:"u32,name=owner_quota_class" json:"owner_quota_class,omitempty"`
+	Stale               bool                `binapi:"bool,name=stale" json:"stale,omitempty"`
+	Packets             uint64              `binapi:"u64,name=packets" json:"packets,omitempty"`
+	Bytes               uint64              `binapi:"u64,name=bytes" json:"bytes,omitempty"`
 }
 
 func (m *Srv6ProgramDetails) Reset()               { *m = Srv6ProgramDetails{} }
 func (*Srv6ProgramDetails) GetMessageName() string { return "srv6_program_details" }
-func (*Srv6ProgramDetails) GetCrcString() string   { return "e695e149" }
+func (*Srv6ProgramDetails) GetCrcString() string   { return "1b9bedfa" }
 func (*Srv6ProgramDetails) GetMessageType() api.MessageType {
 	return api.ReplyMessage
 }
@@ -4398,11 +5102,15 @@ func (m *Srv6ProgramDetails) Size() (size int) {
 	size += 1      // m.Proto
 	size += 2      // m.L4Discriminator
 	size += 1      // m.Verdict
+	size += 1      // m.Action
 	size += 8      // m.PolicyRevision
 	size += 8      // m.EndpointRevision
 	size += 8      // m.PathRevision
 	size += 4      // m.PathCacheIndex
 	size += 4      // m.PathGeneration
+	size += 4      // m.TargetSwIfIndex
+	size += 4      // m.TargetIfIncarnation
+	size += 4      // m.TargetIdentity
 	size += 4      // m.LeaseRemainingMs
 	size += 4      // m.OwnerQuotaClass
 	size += 1      // m.Stale
@@ -4421,11 +5129,15 @@ func (m *Srv6ProgramDetails) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeUint8(m.Proto)
 	buf.EncodeUint16(m.L4Discriminator)
 	buf.EncodeUint8(uint8(m.Verdict))
+	buf.EncodeUint8(uint8(m.Action))
 	buf.EncodeUint64(m.PolicyRevision)
 	buf.EncodeUint64(m.EndpointRevision)
 	buf.EncodeUint64(m.PathRevision)
 	buf.EncodeUint32(m.PathCacheIndex)
 	buf.EncodeUint32(m.PathGeneration)
+	buf.EncodeUint32(m.TargetSwIfIndex)
+	buf.EncodeUint32(m.TargetIfIncarnation)
+	buf.EncodeUint32(m.TargetIdentity)
 	buf.EncodeUint32(m.LeaseRemainingMs)
 	buf.EncodeUint32(m.OwnerQuotaClass)
 	buf.EncodeBool(m.Stale)
@@ -4441,11 +5153,15 @@ func (m *Srv6ProgramDetails) Unmarshal(b []byte) error {
 	m.Proto = buf.DecodeUint8()
 	m.L4Discriminator = buf.DecodeUint16()
 	m.Verdict = Srv6ProgramVerdict(buf.DecodeUint8())
+	m.Action = Srv6ProgramAction(buf.DecodeUint8())
 	m.PolicyRevision = buf.DecodeUint64()
 	m.EndpointRevision = buf.DecodeUint64()
 	m.PathRevision = buf.DecodeUint64()
 	m.PathCacheIndex = buf.DecodeUint32()
 	m.PathGeneration = buf.DecodeUint32()
+	m.TargetSwIfIndex = buf.DecodeUint32()
+	m.TargetIfIncarnation = buf.DecodeUint32()
+	m.TargetIdentity = buf.DecodeUint32()
 	m.LeaseRemainingMs = buf.DecodeUint32()
 	m.OwnerQuotaClass = buf.DecodeUint32()
 	m.Stale = buf.DecodeBool()
@@ -4498,124 +5214,6 @@ func (m *Srv6ProgramDump) Unmarshal(b []byte) error {
 	m.SrcIdentity = buf.DecodeUint32()
 	m.Cursor = buf.DecodeUint32()
 	m.MaxEntries = buf.DecodeUint32()
-	return nil
-}
-
-// Publish the dependency revision table (IF-2, 02 §8, D-30).
-//
-//	Every per-identity policy revision and both global revisions are applied
-//	inside one worker barrier section, so a packet never observes a partially
-//	applied publish (02 §4.3). Revisions are monotonic: a publish that would
-//	move one backwards is refused, because that would let a revoked ALLOW
-//	become valid again.
-//	Publishing a revision for an identity that has no slot creates one. The
-//	slot is retained afterwards so that the next srv6_program_add_del for
-//	that identity has something to compare against.
-//	Rejections:
-//	  INVALID_VALUE   - policy count without an array
-//	  INVALID_VALUE_2 - a revision moves backwards
-//	  INVALID_VALUE_3 - a revision equals the reserved ~0 sentinel
-//	  LIMIT_EXCEEDED  - the per-identity revision table is full; the
-//	                    identities that could not be given a slot punt
-//	- endpoint_revision - new global endpoint/RemoteEndpoint revision
-//	- path_revision - new global PathCache revision
-//	- n_policy - number of per-identity revisions that follow
-//	- policy - the per-identity revisions
-//
-// Srv6RevisionPublish defines message 'srv6_revision_publish'.
-type Srv6RevisionPublish struct {
-	EndpointRevision uint64               `binapi:"u64,name=endpoint_revision" json:"endpoint_revision,omitempty"`
-	PathRevision     uint64               `binapi:"u64,name=path_revision" json:"path_revision,omitempty"`
-	NPolicy          uint32               `binapi:"u32,name=n_policy" json:"-"`
-	Policy           []Srv6PolicyRevision `binapi:"srv6_policy_revision[n_policy],name=policy" json:"policy,omitempty"`
-}
-
-func (m *Srv6RevisionPublish) Reset()               { *m = Srv6RevisionPublish{} }
-func (*Srv6RevisionPublish) GetMessageName() string { return "srv6_revision_publish" }
-func (*Srv6RevisionPublish) GetCrcString() string   { return "2856aa3e" }
-func (*Srv6RevisionPublish) GetMessageType() api.MessageType {
-	return api.RequestMessage
-}
-
-func (m *Srv6RevisionPublish) Size() (size int) {
-	if m == nil {
-		return 0
-	}
-	size += 8 // m.EndpointRevision
-	size += 8 // m.PathRevision
-	size += 4 // m.NPolicy
-	for j1 := 0; j1 < len(m.Policy); j1++ {
-		var s1 Srv6PolicyRevision
-		_ = s1
-		if j1 < len(m.Policy) {
-			s1 = m.Policy[j1]
-		}
-		size += 4 // s1.Identity
-		size += 8 // s1.Revision
-	}
-	return size
-}
-func (m *Srv6RevisionPublish) Marshal(b []byte) ([]byte, error) {
-	if b == nil {
-		b = make([]byte, m.Size())
-	}
-	buf := codec.NewBuffer(b)
-	buf.EncodeUint64(m.EndpointRevision)
-	buf.EncodeUint64(m.PathRevision)
-	buf.EncodeUint32(uint32(len(m.Policy)))
-	for j0 := 0; j0 < len(m.Policy); j0++ {
-		var v0 Srv6PolicyRevision // Policy
-		if j0 < len(m.Policy) {
-			v0 = m.Policy[j0]
-		}
-		buf.EncodeUint32(v0.Identity)
-		buf.EncodeUint64(v0.Revision)
-	}
-	return buf.Bytes(), nil
-}
-func (m *Srv6RevisionPublish) Unmarshal(b []byte) error {
-	buf := codec.NewBuffer(b)
-	m.EndpointRevision = buf.DecodeUint64()
-	m.PathRevision = buf.DecodeUint64()
-	m.NPolicy = buf.DecodeUint32()
-	m.Policy = make([]Srv6PolicyRevision, m.NPolicy)
-	for j0 := 0; j0 < len(m.Policy); j0++ {
-		m.Policy[j0].Identity = buf.DecodeUint32()
-		m.Policy[j0].Revision = buf.DecodeUint64()
-	}
-	return nil
-}
-
-// Srv6RevisionPublishReply defines message 'srv6_revision_publish_reply'.
-type Srv6RevisionPublishReply struct {
-	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
-}
-
-func (m *Srv6RevisionPublishReply) Reset()               { *m = Srv6RevisionPublishReply{} }
-func (*Srv6RevisionPublishReply) GetMessageName() string { return "srv6_revision_publish_reply" }
-func (*Srv6RevisionPublishReply) GetCrcString() string   { return "e8d4e804" }
-func (*Srv6RevisionPublishReply) GetMessageType() api.MessageType {
-	return api.ReplyMessage
-}
-
-func (m *Srv6RevisionPublishReply) Size() (size int) {
-	if m == nil {
-		return 0
-	}
-	size += 4 // m.Retval
-	return size
-}
-func (m *Srv6RevisionPublishReply) Marshal(b []byte) ([]byte, error) {
-	if b == nil {
-		b = make([]byte, m.Size())
-	}
-	buf := codec.NewBuffer(b)
-	buf.EncodeInt32(m.Retval)
-	return buf.Bytes(), nil
-}
-func (m *Srv6RevisionPublishReply) Unmarshal(b []byte) error {
-	buf := codec.NewBuffer(b)
-	m.Retval = buf.DecodeInt32()
 	return nil
 }
 
@@ -4893,7 +5491,7 @@ func (m *Srv6UcLocatorSetReply) Unmarshal(b []byte) error {
 
 func init() { file_cilium_srv6_binapi_init() }
 func file_cilium_srv6_binapi_init() {
-	api.RegisterMessage((*Srv6ACLDetails)(nil), "srv6_acl_details_437a687c")
+	api.RegisterMessage((*Srv6ACLDetails)(nil), "srv6_acl_details_ea1bcd20")
 	api.RegisterMessage((*Srv6ACLDump)(nil), "srv6_acl_dump_f9e6675e")
 	api.RegisterMessage((*Srv6ACLInterfaceSet)(nil), "srv6_acl_interface_set_60b691f7")
 	api.RegisterMessage((*Srv6ACLInterfaceSetReply)(nil), "srv6_acl_interface_set_reply_e8d4e804")
@@ -4923,12 +5521,14 @@ func file_cilium_srv6_binapi_init() {
 	api.RegisterMessage((*Srv6CtVerifyReply)(nil), "srv6_ct_verify_reply_e8d4e804")
 	api.RegisterMessage((*Srv6EndciliumStatusGet)(nil), "srv6_endcilium_status_get_51077d14")
 	api.RegisterMessage((*Srv6EndciliumStatusGetReply)(nil), "srv6_endcilium_status_get_reply_24d085ae")
+	api.RegisterMessage((*Srv6EndpointRevisionPublish)(nil), "srv6_endpoint_revision_publish_7028fdd7")
+	api.RegisterMessage((*Srv6EndpointRevisionPublishReply)(nil), "srv6_endpoint_revision_publish_reply_e8d4e804")
 	api.RegisterMessage((*Srv6FragmentVerdictAdd)(nil), "srv6_fragment_verdict_add_347007d6")
 	api.RegisterMessage((*Srv6FragmentVerdictAddReply)(nil), "srv6_fragment_verdict_add_reply_e8d4e804")
 	api.RegisterMessage((*Srv6HeadendConfigSet)(nil), "srv6_headend_config_set_299225cf")
 	api.RegisterMessage((*Srv6HeadendConfigSetReply)(nil), "srv6_headend_config_set_reply_e8d4e804")
 	api.RegisterMessage((*Srv6HeadendStatusGet)(nil), "srv6_headend_status_get_51077d14")
-	api.RegisterMessage((*Srv6HeadendStatusGetReply)(nil), "srv6_headend_status_get_reply_c8d1bb9a")
+	api.RegisterMessage((*Srv6HeadendStatusGetReply)(nil), "srv6_headend_status_get_reply_4208465e")
 	api.RegisterMessage((*Srv6IfAttachmentAddDel)(nil), "srv6_if_attachment_add_del_b51f4862")
 	api.RegisterMessage((*Srv6IfAttachmentAddDelReply)(nil), "srv6_if_attachment_add_del_reply_e8d4e804")
 	api.RegisterMessage((*Srv6IfAttachmentDetails)(nil), "srv6_if_attachment_details_28974e11")
@@ -4937,7 +5537,7 @@ func file_cilium_srv6_binapi_init() {
 	api.RegisterMessage((*Srv6InstanceGetReply)(nil), "srv6_instance_get_reply_1b436448")
 	api.RegisterMessage((*Srv6LeaseExtend)(nil), "srv6_lease_extend_07085a75")
 	api.RegisterMessage((*Srv6LeaseExtendReply)(nil), "srv6_lease_extend_reply_0b8a79de")
-	api.RegisterMessage((*Srv6LocalEpAddDel)(nil), "srv6_local_ep_add_del_b8be0b8d")
+	api.RegisterMessage((*Srv6LocalEpAddDel)(nil), "srv6_local_ep_add_del_fbb7541c")
 	api.RegisterMessage((*Srv6LocalEpAddDelReply)(nil), "srv6_local_ep_add_del_reply_e8d4e804")
 	api.RegisterMessage((*Srv6LocalEpDetails)(nil), "srv6_local_ep_details_4f128cbb")
 	api.RegisterMessage((*Srv6LocalEpDump)(nil), "srv6_local_ep_dump_f9e6675e")
@@ -4945,6 +5545,8 @@ func file_cilium_srv6_binapi_init() {
 	api.RegisterMessage((*Srv6PathAddDelReply)(nil), "srv6_path_add_del_reply_50c4d274")
 	api.RegisterMessage((*Srv6PathDetails)(nil), "srv6_path_details_8f42674c")
 	api.RegisterMessage((*Srv6PathDump)(nil), "srv6_path_dump_6786512f")
+	api.RegisterMessage((*Srv6PathRevisionPublish)(nil), "srv6_path_revision_publish_72bcb1e2")
+	api.RegisterMessage((*Srv6PathRevisionPublishReply)(nil), "srv6_path_revision_publish_reply_e8d4e804")
 	api.RegisterMessage((*Srv6PathTxnAbort)(nil), "srv6_path_txn_abort_4598a445")
 	api.RegisterMessage((*Srv6PathTxnAbortReply)(nil), "srv6_path_txn_abort_reply_e8d4e804")
 	api.RegisterMessage((*Srv6PathTxnBegin)(nil), "srv6_path_txn_begin_4598a445")
@@ -4953,12 +5555,12 @@ func file_cilium_srv6_binapi_init() {
 	api.RegisterMessage((*Srv6PathTxnCommitReply)(nil), "srv6_path_txn_commit_reply_e8d4e804")
 	api.RegisterMessage((*Srv6PathTxnPut)(nil), "srv6_path_txn_put_5bf8918c")
 	api.RegisterMessage((*Srv6PathTxnPutReply)(nil), "srv6_path_txn_put_reply_50c4d274")
-	api.RegisterMessage((*Srv6ProgramAddDel)(nil), "srv6_program_add_del_3926f4be")
+	api.RegisterMessage((*Srv6PolicyRevisionPublish)(nil), "srv6_policy_revision_publish_614b7fcc")
+	api.RegisterMessage((*Srv6PolicyRevisionPublishReply)(nil), "srv6_policy_revision_publish_reply_e8d4e804")
+	api.RegisterMessage((*Srv6ProgramAddDel)(nil), "srv6_program_add_del_827e005a")
 	api.RegisterMessage((*Srv6ProgramAddDelReply)(nil), "srv6_program_add_del_reply_e8d4e804")
-	api.RegisterMessage((*Srv6ProgramDetails)(nil), "srv6_program_details_e695e149")
+	api.RegisterMessage((*Srv6ProgramDetails)(nil), "srv6_program_details_1b9bedfa")
 	api.RegisterMessage((*Srv6ProgramDump)(nil), "srv6_program_dump_af97c185")
-	api.RegisterMessage((*Srv6RevisionPublish)(nil), "srv6_revision_publish_2856aa3e")
-	api.RegisterMessage((*Srv6RevisionPublishReply)(nil), "srv6_revision_publish_reply_e8d4e804")
 	api.RegisterMessage((*Srv6SrDomainDetails)(nil), "srv6_sr_domain_details_2e62ff03")
 	api.RegisterMessage((*Srv6SrDomainDump)(nil), "srv6_sr_domain_dump_51077d14")
 	api.RegisterMessage((*Srv6SrDomainPrefixAddDel)(nil), "srv6_sr_domain_prefix_add_del_7259da77")
@@ -5000,6 +5602,8 @@ func AllMessages() []api.Message {
 		(*Srv6CtVerifyReply)(nil),
 		(*Srv6EndciliumStatusGet)(nil),
 		(*Srv6EndciliumStatusGetReply)(nil),
+		(*Srv6EndpointRevisionPublish)(nil),
+		(*Srv6EndpointRevisionPublishReply)(nil),
 		(*Srv6FragmentVerdictAdd)(nil),
 		(*Srv6FragmentVerdictAddReply)(nil),
 		(*Srv6HeadendConfigSet)(nil),
@@ -5022,6 +5626,8 @@ func AllMessages() []api.Message {
 		(*Srv6PathAddDelReply)(nil),
 		(*Srv6PathDetails)(nil),
 		(*Srv6PathDump)(nil),
+		(*Srv6PathRevisionPublish)(nil),
+		(*Srv6PathRevisionPublishReply)(nil),
 		(*Srv6PathTxnAbort)(nil),
 		(*Srv6PathTxnAbortReply)(nil),
 		(*Srv6PathTxnBegin)(nil),
@@ -5030,12 +5636,12 @@ func AllMessages() []api.Message {
 		(*Srv6PathTxnCommitReply)(nil),
 		(*Srv6PathTxnPut)(nil),
 		(*Srv6PathTxnPutReply)(nil),
+		(*Srv6PolicyRevisionPublish)(nil),
+		(*Srv6PolicyRevisionPublishReply)(nil),
 		(*Srv6ProgramAddDel)(nil),
 		(*Srv6ProgramAddDelReply)(nil),
 		(*Srv6ProgramDetails)(nil),
 		(*Srv6ProgramDump)(nil),
-		(*Srv6RevisionPublish)(nil),
-		(*Srv6RevisionPublishReply)(nil),
 		(*Srv6SrDomainDetails)(nil),
 		(*Srv6SrDomainDump)(nil),
 		(*Srv6SrDomainPrefixAddDel)(nil),
