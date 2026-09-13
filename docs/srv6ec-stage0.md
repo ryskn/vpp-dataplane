@@ -300,6 +300,61 @@ descriptors — there is no `SCM_RIGHTS` and no shared-memory segment handshake 
 preserves the protocol. This does not generalise to VPP API clients that use the
 shared-memory transport.
 
+### 4.3 `SRV6_BLOCK` is configured explicitly, and the two sides are gated on equality
+
+The same `cilium-srv6` stanza carries `srv6-block`, the plugin's `SRV6_BLOCK`
+(D-60):
+
+```
+cilium-srv6 {
+    punt-socket /run/cilium/srv6ec/punt.sock
+    srv6-block fdbb:bb00::/32
+}
+```
+
+It is written out rather than left to the plugin's default, because the plugin's
+default is a **test** default. `cilium_srv6_guard.h` names the constant
+`CILIUM_SRV6_BLOCK_TEST_DEFAULT_*` and the header says why it exists: a plugin
+brought up with no startup configuration still needs a block of known extent,
+since a zero-length block would make the guard's `dst in SRV6_BLOCK` comparison
+match every address and drop everything on every interface. It is not a value a
+deployment may use. `show cilium srv6 guard` distinguishes the two cases:
+
+```
+SRV6_BLOCK           : fdbb:bb00::/32 (configured)
+SRV6_BLOCK           : fdbb:bb00::/32 (TEST DEFAULT, not configured)
+```
+
+Stage 0 runs 16 and 17 produced the second line. Nothing failed, because the
+Cilium agent's `--srv6-block` happened to carry the same `fdbb:bb00::/32` — the
+two sides agreed by coincidence, and a change to either one alone would have
+produced a silent disagreement in which the agent allocates and advertises SIDs
+out of one block while the guard polices another (errata #34 item 198).
+
+**Single source of truth.** The agent's value and VPP's value live in two
+repositories and cannot be read out of one file. The declared source of truth is
+the Cilium chart value `srv6EndpointContext.block`
+(`test/srv6ec/stage0/values-stage0.yaml`, rendered into the `srv6-block` key of
+the `cilium-config` ConfigMap). The `srv6-block` line above is an explicit
+parameter of this kit that restates it, with the same Stage 0 default. What
+makes the restatement safe is not discipline but a gate: `check-i.sh` in the
+Cilium kit asserts, on every run,
+
+* **I-0a** — the running plugin reports `(configured)`, not
+  `(TEST DEFAULT, not configured)`;
+* **I-0b** — the prefix the plugin reports is exactly the agent's
+  `--srv6-block`.
+
+so a divergence between the two repositories is a FAIL of the run that observes
+it rather than something that has to be noticed by eye. Write the address in the
+canonical lower-case compressed form that VPP's `format_ip6_address` prints,
+because that is the form I-0b compares.
+
+From the plugin snapshot that carries errata 198 on, an unconfigured block also
+makes `context install` report `BLOCKED`: the readiness predicate that gates
+Context and local SID installation requires a configured block, so a node
+running without this line forwards plainly and installs no SRv6 state at all.
+
 ## 5. Image reproducibility
 
 Issue #135 ruling 6 requires an immutable identity for the VPP image, derived
@@ -404,15 +459,18 @@ The manifest's image references are `:REPLACE-ME` placeholders. Applying
 | `components/uplink-af-xdp` | switches the uplink driver to `af_xdp` | Stage 2 only, and **incomplete**: it changes the driver and nothing else. Hugepages, memory limits, and the securityContext an AF_XDP uplink needs are not addressed |
 
 Values in the ConfigMap that are cluster-specific and have to be checked before
-the first apply: `SERVICE_PREFIX` (the kubeadm `serviceSubnet`), and
+the first apply: `SERVICE_PREFIX` (the kubeadm `serviceSubnet`),
 `uplinkInterfaces[0].interfaceName` (the host NIC name, which differs per
-cluster).
+cluster), and `srv6-block` in the `cilium-srv6` stanza, which must equal the
+Cilium chart's `srv6EndpointContext.block` — see 4.3 for which of the two is the
+source of truth and for the gate that catches a divergence.
 
 `components/poll-sleep` restates the whole `CALICOVPP_CONFIG_TEMPLATE`, because
 a ConfigMap value is one string and there is no way to patch a line of it. Any
 edit to that template in the base has to be repeated there — including the
-`cilium-srv6 { punt-socket ... }` stanza, without which the plugin has no IF-3
-socket to dial and punted packets are dropped rather than resolved.
+`cilium-srv6 { punt-socket ...; srv6-block ... }` stanza, without which the
+plugin has no IF-3 socket to dial (punted packets are then dropped rather than
+resolved) and no configured `SRV6_BLOCK` (4.3).
 
 ### Why the uplink stays `virtio` in Stage 0 and Stage 1
 
@@ -452,6 +510,10 @@ Not part of this repository, listed because Stage 0 does not come up without it:
   not a nicety.
 * the srv6ec flags are named differently on the two sides: the agent takes
   `--srv6-block`, the operator takes `--srv6-locator-block`.
+* the chart value `srv6EndpointContext.block` is the source of truth for
+  `SRV6_BLOCK`, and this kit's `cilium-srv6 { srv6-block ... }` restates it
+  (4.3). The Cilium kit's `check-i.sh` I-0a/I-0b fail the run if the plugin is
+  on its test default or if the two values differ.
 
 ## 8. Known pitfalls
 
@@ -467,7 +529,9 @@ Not part of this repository, listed because Stage 0 does not come up without it:
    deployed on the same node.
 5. **`SRV6_BLOCK` must not overlap node addresses or any PodCIDR** (D-60). The
    test bed value is `fdbb:bb00::/32`, which is a test-only value, not a
-   production default.
+   production default — and it must be written into the `cilium-srv6` stanza
+   explicitly rather than left to the plugin's identically-valued test default,
+   which no deployment may rely on (4.3, errata #34 item 198).
 6. **The `cilium-srv6 { punt-socket ... }` stanza needs a VPP image that knows
    the key.** The plugin's startup config parser rejects an unknown key with a
    `clib_error`, which aborts VPP startup, so pairing this manifest with an

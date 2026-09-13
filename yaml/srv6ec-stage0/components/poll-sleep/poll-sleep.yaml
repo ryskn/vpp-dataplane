@@ -12,8 +12,11 @@
 #
 # The whole template is restated because a ConfigMap value is one string; only
 # the `unix` stanza differs from the base. Every other stanza — including
-# `cilium-srv6 { punt-socket ... }`, which IF-3 does not come up without — has
-# to be kept identical to the base by hand.
+# `cilium-srv6 { punt-socket ...; srv6-block ... }`, without which IF-3 does
+# not come up and the plugin falls back to its test default (errata #34 item
+# 198) — has to be kept identical to the base by hand. `srv6-block` in
+# particular must stay equal to the base manifest AND to the Cilium chart's
+# `srv6EndpointContext.block`; check-i.sh I-0b fails the run if it does not.
 kind: ConfigMap
 apiVersion: v1
 metadata:
@@ -46,6 +49,7 @@ data:
     }
     cilium-srv6 {
         punt-socket /run/cilium/srv6ec/punt.sock
+        srv6-block fdbb:bb00::/32
     }
     buffers {
       buffers-per-numa 131072

@@ -219,12 +219,37 @@ data:
   # the agent's `--srv6-punt-socket`, whose default is
   # /run/cilium/srv6ec/punt.sock (pkg/srv6ec/cell.DefaultPuntSocket).
   #
+  # `srv6-block` is SRV6_BLOCK (D-60). It is written here EXPLICITLY, and that
+  # is a requirement rather than a convenience (errata #34 item 198): the
+  # plugin carries a test default (fdbb:bb00::/32, named TEST_DEFAULT in
+  # cilium_srv6_guard.h) that exists only so that an unconfigured plugin has a
+  # block of known extent, and `show cilium srv6 guard` then reports
+  # `SRV6_BLOCK : fdbb:bb00::/32 (TEST DEFAULT, not configured)`. Stage 0 runs
+  # 16 and 17 ran that way, and passed only because the agent's own
+  # `--srv6-block` happened to carry the same value. No deployment may depend
+  # on that coincidence.
+  #
+  # SINGLE SOURCE OF TRUTH. The two sides live in two repositories and cannot
+  # share one file: the agent reads `srv6EndpointContext.block` from the Cilium
+  # Helm chart (test/srv6ec/stage0/values-stage0.yaml, rendered into the
+  # `srv6-block` key of the cilium-config ConfigMap), and VPP reads the line
+  # below. The DECLARED source of truth is the Cilium chart value; the line
+  # below is an explicit parameter of this kit that restates it with the same
+  # Stage 0 default, and the Cilium kit's I-0a/I-0b assertions
+  # (test/srv6ec/stage0/check-i.sh) are the guard that turns a divergence into
+  # a FAIL instead of a silent split brain. Changing the block means changing
+  # both, in one change. The address must be written in the canonical
+  # lower-case compressed form that VPP's format_ip6_address prints, because
+  # that is the form the equality gate compares.
+  #
   # This stanza requires a VPP image whose vendored cilium_srv6 snapshot knows
   # the `punt-socket` key. An older snapshot's config parser returns
   # "unknown input `punt-socket ...'" and VPP exits during startup, so the
   # DaemonSet crash-loops. The failure is loud and fail-closed rather than
   # silent, but it means this ConfigMap and the pinned VPP image digest have to
-  # move together: see docs/srv6ec-stage0.md §4.1.
+  # move together: see docs/srv6ec-stage0.md §4.1. The same applies to
+  # `srv6-block`, which every snapshot of the plugin has accepted, and which
+  # from errata 198 on is also what keeps `context install` out of BLOCKED.
   CALICOVPP_CONFIG_TEMPLATE: |-
     unix {
       nodaemon
@@ -250,6 +275,7 @@ data:
     }
     cilium-srv6 {
         punt-socket /run/cilium/srv6ec/punt.sock
+        srv6-block fdbb:bb00::/32
     }
     buffers {
       buffers-per-numa 131072
