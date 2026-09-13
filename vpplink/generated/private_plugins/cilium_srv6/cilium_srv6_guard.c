@@ -154,6 +154,11 @@ csg_set_trust (cilium_srv6_main_t *cm, cilium_srv6_guard_if_t *e, u8 trust, f64 
 
   if (trust == CILIUM_SRV6_TRUST_QUARANTINED)
     e->quarantined_at = now;
+
+  /* The classify coverage requirement (errata #34 item 196) has trust as one
+     of its two terms, so every trust transition re-accounts it — including the
+     bulk quarantine, which deliberately does not refresh the feature itself. */
+  cilium_srv6_classify_coverage_account (cm, e);
 }
 
 u32
@@ -286,10 +291,15 @@ csg_interface_add (vlib_main_t *vm, vnet_main_t *vnm, u32 sw_if_index)
   e->valid = 1;
   e->incarnation = ++cm->next_incarnation;
   e->promotable = csg_interface_is_promotable (vnm, sw_if_index);
+  /* errata #34 item 195: the Pod-facing declaration belongs to one interface
+     lifetime. A reused sw_if_index starts without it and only a new D-71
+     binding ADD can set it again. */
+  e->pod_facing = 0;
   csg_set_trust (cm, e, CILIUM_SRV6_TRUST_QUARANTINED, now);
   e->quarantined_at = now;
 
   csg_guard_feature_set (cm, sw_if_index, 1 /* enable */);
+  cilium_srv6_classify_coverage_account (cm, e);
 
   cilium_srv6_barrier_release (vm, taken);
 }
@@ -328,9 +338,21 @@ csg_interface_del (vlib_main_t *vm, u32 sw_if_index)
 
   e->valid = 0;
   e->promotable = 0;
+  /*
+   * errata #34 item 195: this callback is the only place the Pod-facing bit is
+   * cleared. A binding DELETE leaves it set, so the interval between the
+   * binding going away and the interface being destroyed keeps classify on the
+   * interface rather than handing its packets back to the plain IPv6 FIB.
+   * The classify feature itself is retired by the headend's own delete
+   * callback (cilium_srv6_headend_sw_interface_add_del), which is what stops a
+   * reused index from inheriting it (D-31).
+   */
+  e->pod_facing = 0;
   /* Keep trust == QUARANTINED and invalidate the incarnation so that an
    * in-flight agent write for the old interface lifetime is rejected. */
   e->incarnation = ~0;
+
+  cilium_srv6_classify_coverage_account (cm, e);
 
   cilium_srv6_barrier_release (vm, taken);
 }
@@ -445,6 +467,90 @@ cilium_srv6_acl_interface_set (u32 sw_if_index, u32 if_incarnation, u8 trust)
 		 format_cilium_srv6_trust, (u32) trust, sw_if_index);
 
   cilium_srv6_barrier_release (vm, taken);
+
+  return 0;
+}
+
+/*
+ * errata #34 item 195: mark one interface Pod-facing and put it on the 02 §1
+ * headend path, as one step.
+ *
+ * This is what the D-71 attachment binding writer's ADD means. The ruling
+ * refused a separate "Pod-facing" API because D-73 already derives UNTRUSTED
+ * from a D-68/D-71 binding: publishing the binding *is* the declaration, and a
+ * second message would be a second authority over the same fact.
+ *
+ * The classify feature is brought up here, inside the ADD, and the caller
+ * refuses the ADD if this fails. That is the whole point of doing it here
+ * rather than leaving it to the agent's first classification: between a VPP
+ * restart and that first srv6_acl_interface_set every interface reads
+ * QUARANTINED and is indistinguishable from the host TAP, so the window was
+ * fail-open for as long as the agent was absent — unbounded, and re-entered by
+ * the D-35 dead-man switch (item 191's residue). After this, the ACK of the
+ * binding ADD means "this interface is on the headend path", which is an
+ * ordering the lifecycle writer can rely on before it brings the interface up.
+ *
+ * Sticky: nothing here or anywhere else clears `pod_facing` except the
+ * interface delete callback.
+ *
+ * Returns 0, or the error that stopped the feature from being installed, in
+ * which case nothing was changed.
+ */
+int
+cilium_srv6_guard_mark_pod_facing (u32 sw_if_index)
+{
+  cilium_srv6_main_t *cm = &cilium_srv6_main;
+  vlib_main_t *vm = vlib_get_main ();
+  cilium_srv6_guard_if_t *e;
+  u8 was_pod_facing;
+  int taken;
+  int rv;
+
+  if (sw_if_index >= vec_len (cm->ifs))
+    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+
+  e = vec_elt_at_index (cm->ifs, sw_if_index);
+  if (!e->valid)
+    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+
+  taken = cilium_srv6_barrier_acquire (vm);
+
+  was_pod_facing = e->pod_facing;
+  e->pod_facing = 1;
+
+  rv = cilium_srv6_headend_classify_refresh (sw_if_index);
+
+  /*
+   * The post-condition, checked rather than inferred from rv. The refresh
+   * reports success for states in which it deliberately does nothing (the
+   * headend not initialised yet, the entry gone), and the ACK this feeds has
+   * to mean the feature is on the interface, not that nothing went wrong on
+   * the way to not installing it.
+   */
+  if (rv == 0 && !e->classify_installed)
+    rv = VNET_API_ERROR_CANNOT_ENABLE_DISABLE_FEATURE;
+
+  if (rv != 0)
+    {
+      /* Nothing recorded: the caller refuses the ADD, so the declaration must
+	 not survive the refusal either. */
+      e->pod_facing = was_pod_facing;
+      cilium_srv6_classify_coverage_account (cm, e);
+      cilium_srv6_barrier_release (vm, taken);
+      CSG_LOG_ERR ("refused the Pod attachment binding of sw_if_index %u: "
+		   "cilium-srv6-classify could not be installed (%d)",
+		   sw_if_index, rv);
+      return rv;
+    }
+
+  cilium_srv6_classify_coverage_account (cm, e);
+
+  cilium_srv6_barrier_release (vm, taken);
+
+  if (!was_pod_facing)
+    CSG_LOG_NOTICE ("sw_if_index %u is Pod-facing (D-71 attachment binding) and is on the "
+		    "cilium-srv6-classify path",
+		    sw_if_index);
 
   return 0;
 }

@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/ryosuke/project/cilium-wt/impl-200/vpp/plugins/cilium_srv6/test/localep/build/localep_rules_test'
+relocations:     []
+...

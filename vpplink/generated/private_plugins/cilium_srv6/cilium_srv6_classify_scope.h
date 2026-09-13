@@ -6,15 +6,16 @@
  *
  * Both live in a vlib-free header for the same reason the bounded header walk
  * does (cilium_srv6_gparse.h): the predicate is a pure function of
- * (trust, "does this interface have a LocalEndpointTable entry"), so it can be
- * checked on the host without vlib, vnet or plugin state
- * (test/classify-scope).
+ * (trust, "does this interface have a LocalEndpointTable entry", "did a D-71
+ * attachment binding declare this interface Pod-facing"), so it can be checked
+ * on the host without vlib, vnet or plugin state (test/classify-scope).
  *
  * Design references:
  *   design/detail/02-headend-dataplane.md §1 (headend graph), §3 (classify)
  *   design/detail/03-destination-dataplane.md §1.1 (trust classes)
- *   design/detail/00-overview.md §2 (D-31, D-35, D-50, D-73, D-80), §2.20.1
- *   errata #34 item 191
+ *   design/detail/00-overview.md §2 (D-31, D-35, D-50, D-71, D-73, D-80),
+ *     §2.15, §2.20.1
+ *   errata #34 items 191, 195, 196
  */
 
 #ifndef __included_cilium_srv6_classify_scope_h__
@@ -64,7 +65,14 @@ typedef enum
  * destination traverses", and LOCAL_DELIVER "is a compiler/program action,
  * never a bypass to plain VPP forwarding".
  *
- * Hence the two terms:
+ * Hence the three terms:
+ *
+ *   pod_facing           the D-71 attachment binding writer declared this
+ *                        interface Pod-facing by publishing a binding for it,
+ *                        and the plugin attached classify inside the handler
+ *                        before acknowledging the ADD. This is the term that
+ *                        closes item 195: it holds from the moment the
+ *                        interface is bound, with no agent involved.
  *
  *   trust == UNTRUSTED   the interface is Pod-facing on the authority of D-73,
  *                        so 02 §3 applies to it from that moment, endpoint or
@@ -85,10 +93,49 @@ typedef enum
  * all host-originated and hostNetwork Pod traffic — including the agent's own
  * IF-2/IF-3 and BGP sessions.
  */
+/*
+ * The declaration term, split out because it is also the coverage term.
+ *
+ * "This interface is Pod-facing" has exactly two sources and they are the same
+ * authority read at two times:
+ *
+ *   pod_facing    the D-71 attachment binding writer said so, by publishing
+ *                 srv6_if_attachment_add_del(ADD) for this interface. The
+ *                 binding *is* the declaration (errata #34 item 195): D-73
+ *                 already derives UNTRUSTED from a D-68/D-71 binding, so a
+ *                 separate "declare this interface Pod-facing" message would
+ *                 be a second authority over the same fact. The bit is sticky
+ *                 for the interface lifetime — a binding DELETE does not clear
+ *                 it, only the interface delete callback does — so the window
+ *                 between the binding going away and the interface being
+ *                 destroyed is not fail-open either.
+ *
+ *   trust ==      the agent's D-73 classification reconciler committed
+ *   UNTRUSTED     UNTRUSTED, which it derives from the same binding. This is
+ *                 a control-plane view that converges to the same state; it
+ *                 does not carry the initial safety, because between a VPP
+ *                 restart and the agent's first srv6_acl_interface_set there
+ *                 is no classification at all and every interface reads
+ *                 QUARANTINED (errata #34 item 195, the residue of 191).
+ *
+ * Either one is enough. The disjunction is what makes the plugin safe during
+ * the agent's absence and the agent's answer safe during a binding writer's.
+ *
+ * This is also the set 196 makes a READY condition: classify coverage is
+ * complete when every interface this predicate selects carries the feature.
+ * has_local_ep is deliberately not part of it — see below, it is a retention
+ * term, not a declaration.
+ */
 static inline int
-cilium_srv6_classify_wanted (u32 trust, int has_local_ep)
+cilium_srv6_classify_required (u32 trust, int pod_facing)
 {
-  return (trust == CILIUM_SRV6_TRUST_UNTRUSTED) || (has_local_ep != 0);
+  return (pod_facing != 0) || (trust == CILIUM_SRV6_TRUST_UNTRUSTED);
+}
+
+static inline int
+cilium_srv6_classify_wanted (u32 trust, int has_local_ep, int pod_facing)
+{
+  return cilium_srv6_classify_required (trust, pod_facing) || (has_local_ep != 0);
 }
 
 #endif /* __included_cilium_srv6_classify_scope_h__ */

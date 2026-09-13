@@ -42,6 +42,8 @@
 #include <cilium_srv6/cilium_srv6_guard.h>
 #include <cilium_srv6/cilium_srv6_headend.h>
 #include <cilium_srv6/cilium_srv6_ct.h>
+#include <cilium_srv6/cilium_srv6_ifbind.h>
+#include <cilium_srv6/cilium_srv6_localep_rules.h>
 
 cilium_srv6_headend_main_t cilium_srv6_headend_main;
 
@@ -2604,21 +2606,31 @@ csh_classify_set (u32 sw_if_index, int want)
   e = vec_elt_at_index (cm->ifs, sw_if_index);
 
   if (w == e->classify_installed)
-    return 0;
+    {
+      /* The wanted side may have moved even when the installed side did not
+	 (errata #34 item 196). */
+      cilium_srv6_classify_coverage_account (cm, e);
+      return 0;
+    }
 
   rv = csh_classify_feature_set (sw_if_index, w);
   if (rv != 0)
-    return rv;
+    {
+      cilium_srv6_classify_coverage_account (cm, e);
+      return rv;
+    }
 
   e->classify_installed = w;
+  cilium_srv6_classify_coverage_account (cm, e);
   return 0;
 }
 
 /*
  * Bring the classify feature of one interface in line with
- * cilium_srv6_classify_wanted(), i.e. with the current trust classification
- * (D-73) and the current LocalEndpointTable content. Safe to call from every
- * event that can change either input; errata #34 item 191.
+ * cilium_srv6_classify_wanted(), i.e. with the D-71 Pod-facing declaration
+ * (errata #34 item 195), the current trust classification (D-73) and the
+ * current LocalEndpointTable content. Safe to call from every event that can
+ * change any of the three; errata #34 items 191 and 195.
  *
  * The caller must hold the worker barrier: the answer is read from the trust
  * map and the LocalEndpointTable, both of which the dataplane reads.
@@ -2639,18 +2651,110 @@ cilium_srv6_headend_classify_refresh (u32 sw_if_index)
   has_local_ep = (sw_if_index < vec_len (hm->local_eps) && hm->local_eps[sw_if_index].valid);
 
   return csh_classify_set (sw_if_index,
-			   cilium_srv6_classify_wanted (cm->ifs[sw_if_index].trust, has_local_ep));
+			   cilium_srv6_classify_wanted (cm->ifs[sw_if_index].trust, has_local_ep,
+							cm->ifs[sw_if_index].pod_facing));
+}
+
+/*
+ * The CNI attachment identity an installed entry was installed for, as the
+ * rules header wants to see it (errata #34 item 200).
+ */
+static cilium_srv6_localep_entry_t
+csh_local_ep_attachment_obs (const cilium_srv6_headend_main_t *hm, u32 sw_if_index)
+{
+  cilium_srv6_localep_entry_t obs = { 0 };
+  const u8 *id;
+
+  if (sw_if_index >= vec_len (hm->local_eps) || !hm->local_eps[sw_if_index].valid)
+    return obs;
+
+  if (sw_if_index >= vec_len (hm->local_ep_attachments))
+    return obs;
+
+  id = hm->local_ep_attachments[sw_if_index];
+  if (id == 0)
+    return obs;
+
+  obs.present = 1;
+  obs.attachment_id = id;
+  obs.id_len = vec_len (id);
+  return obs;
+}
+
+/* Store the identity of the entry on sw_if_index, replacing whatever was
+   there. The vector is the table's own copy: the caller's buffer is the API
+   message and does not outlive the handler. */
+static void
+csh_local_ep_attachment_set (cilium_srv6_headend_main_t *hm, u32 sw_if_index,
+			     const u8 *attachment_id, u32 id_len)
+{
+  vec_validate_init_empty (hm->local_ep_attachments, sw_if_index, 0);
+  vec_reset_length (hm->local_ep_attachments[sw_if_index]);
+  vec_add (hm->local_ep_attachments[sw_if_index], attachment_id, id_len);
+}
+
+/* Forget it. Called from every site that clears an entry, so that the identity
+   can never outlive the entry it describes and be compared against the next
+   endpoint to take the index (D-31). */
+static void
+csh_local_ep_attachment_clear (cilium_srv6_headend_main_t *hm, u32 sw_if_index)
+{
+  if (sw_if_index >= vec_len (hm->local_ep_attachments))
+    return;
+
+  vec_free (hm->local_ep_attachments[sw_if_index]);
+}
+
+const u8 *
+cilium_srv6_local_ep_attachment (u32 sw_if_index)
+{
+  const cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
+
+  if (sw_if_index >= vec_len (hm->local_ep_attachments))
+    return 0;
+
+  return hm->local_ep_attachments[sw_if_index];
+}
+
+/* The retval each verdict of cilium_srv6_localep_rules.h answers with, as
+   cilium_srv6.api documents them. */
+static int
+csh_local_ep_verdict_to_api_error (cilium_srv6_localep_verdict_t v)
+{
+  switch (v)
+    {
+    case CILIUM_SRV6_LOCALEP_ACCEPT:
+      return 0;
+    case CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID:
+      return VNET_API_ERROR_INVALID_VALUE_4;
+    case CILIUM_SRV6_LOCALEP_REJECT_NO_BINDING:
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    case CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT:
+      return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
+    case CILIUM_SRV6_LOCALEP_REJECT_BINDING_INCARNATION:
+      return VNET_API_ERROR_INVALID_INTERFACE;
+    /* The attachment that is installed here is another one, so this
+       attachment has no entry on this interface: an absence, reported the
+       same way an absent entry is. */
+    case CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT_ENTRY:
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+  return VNET_API_ERROR_UNSPECIFIED;
 }
 
 int
-cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
-			      const ip6_address_t *ip, u32 local_context_id,
-			      u32 owner_quota_class, u8 is_add)
+cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *attachment_id,
+			      u32 id_len, u32 identity, const ip6_address_t *ip,
+			      u32 local_context_id, u32 owner_quota_class, u8 is_add)
 {
   cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   const cilium_srv6_main_t *cm = &cilium_srv6_main;
   vlib_main_t *vm = vlib_get_main ();
   vnet_main_t *vnm = vnet_get_main ();
+  const cilium_srv6_if_binding_t *binding;
+  cilium_srv6_localep_binding_t binding_obs = { 0 };
+  cilium_srv6_localep_verdict_t verdict;
   cilium_srv6_local_ep_t *e;
   u32 slot;
   u32 deleted_context_id;
@@ -2680,12 +2784,31 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
       if (sw_if_index >= vec_len (hm->local_eps) || !hm->local_eps[sw_if_index].valid)
 	return VNET_API_ERROR_NO_SUCH_ENTRY;
 
+      /*
+       * Item 200: a delete that names an attachment removes the entry only if
+       * the entry was installed for that attachment, so a delete left over
+       * from a previous attachment cannot remove the one a new attachment
+       * installed. An empty identity is the unverified form the D-70 orphan
+       * sweep uses; see cilium_srv6_localep_rules.h for why that is not a way
+       * around this check.
+       */
+      verdict = cilium_srv6_localep_decide_del (attachment_id, id_len,
+						csh_local_ep_attachment_obs (hm, sw_if_index));
+      if (verdict != CILIUM_SRV6_LOCALEP_ACCEPT)
+	{
+	  CSH_LOG_ERR ("refusing to remove the local endpoint on sw_if_index %u: it was "
+		       "installed for a different CNI attachment (errata #34 item 200)",
+		       sw_if_index);
+	  return csh_local_ep_verdict_to_api_error (verdict);
+	}
+
       taken = cilium_srv6_barrier_acquire (vm);
 
       e = hm->local_eps + sw_if_index;
       deleted_context_id = e->local_context_id;
       csh_policy_rev_slot_unref (hm, e->policy_rev_slot);
       clib_memset (e, 0, sizeof (*e));
+      csh_local_ep_attachment_clear (hm, sw_if_index);
 
       /* Item 191: not an unconditional disable. The endpoint is gone, but the
 	 interface is still whatever D-73 classified it as, and while it is
@@ -2718,6 +2841,36 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
   if (ip6_address_is_link_local_unicast (ip))
     return VNET_API_ERROR_INVALID_VALUE_3;
 
+  /*
+   * Item 200: the endpoint is installed on the interface the D-68 binding
+   * table says this attachment is behind, or on no interface at all. The D-31
+   * check above proves the handle is live; this one proves it is *this*
+   * attachment's, which is the difference the run-17 failure turned on - two
+   * attachments swapped sw_if_index slots across a VPP restart and both stale
+   * handles were live.
+   *
+   * The binding is read before the barrier is taken, with nothing mutated
+   * either way: a rejection here leaves the table exactly as it was.
+   */
+  binding = cilium_srv6_ifbind_by_sw_if_index (sw_if_index);
+  if (binding != 0)
+    {
+      binding_obs.present = 1;
+      binding_obs.attachment_id = binding->attachment_id;
+      binding_obs.id_len = vec_len (binding->attachment_id);
+      binding_obs.if_incarnation = binding->if_incarnation;
+    }
+
+  verdict = cilium_srv6_localep_decide_add (attachment_id, id_len, if_incarnation, binding_obs);
+  if (verdict != CILIUM_SRV6_LOCALEP_ACCEPT)
+    {
+      CSH_LOG_ERR ("refusing to install a local endpoint on sw_if_index %u "
+		   "(incarnation %u): the CNI attachment binding table does not bind this "
+		   "attachment to this interface (verdict %u, errata #34 item 200)",
+		   sw_if_index, if_incarnation, (u32) verdict);
+      return csh_local_ep_verdict_to_api_error (verdict);
+    }
+
   taken = cilium_srv6_barrier_acquire (vm);
 
   vec_validate_init_empty (hm->local_eps, sw_if_index, (cilium_srv6_local_ep_t){ 0 });
@@ -2735,6 +2888,11 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
   e->policy_rev_slot = slot;
   e->ip = *ip;
 
+  /* The identity this entry is *for*, kept so that a later DELETE can be
+     required to name it (item 200). It is stored under the same barrier as
+     the entry and cleared by every site that clears the entry. */
+  csh_local_ep_attachment_set (hm, sw_if_index, attachment_id, id_len);
+
   /* Complete before it becomes reachable. */
   CLIB_MEMORY_STORE_BARRIER ();
   e->valid = 1;
@@ -2746,6 +2904,7 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
 	 not fail-closed for the headend: undo the install. */
       csh_policy_rev_slot_unref (hm, e->policy_rev_slot);
       clib_memset (e, 0, sizeof (*e));
+      csh_local_ep_attachment_clear (hm, sw_if_index);
       cilium_srv6_barrier_release (vm, taken);
       return VNET_API_ERROR_UNSPECIFIED;
     }
@@ -2798,6 +2957,10 @@ cilium_srv6_headend_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32
   deleted_context_id = hm->local_eps[sw_if_index].local_context_id;
   csh_policy_rev_slot_unref (hm, hm->local_eps[sw_if_index].policy_rev_slot);
   clib_memset (hm->local_eps + sw_if_index, 0, sizeof (hm->local_eps[0]));
+  /* The identity cannot outlive the entry: sw_if_index is reused (D-31), and
+     an identity left behind would be compared against the next endpoint to
+     take the index (errata #34 item 200). */
+  csh_local_ep_attachment_clear (hm, sw_if_index);
   cilium_srv6_barrier_release (vm, taken);
 
   /* D-15: same purge as the explicit delete above. */

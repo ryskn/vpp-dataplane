@@ -203,6 +203,12 @@ cilium_srv6_ifbind_verdict_to_api_error (cilium_srv6_ifbind_verdict_t v)
 /*
  * srv6_if_attachment_add_del (02 §8).
  *
+ * The ADD side also carries the D-71 Pod-facing declaration (errata #34 item
+ * 195); see the comment on the accept path below. The DELETE side deliberately
+ * does not undo it: `pod_facing` is sticky for the interface lifetime and is
+ * cleared only by the interface delete callback, so withdrawing a binding never
+ * takes cilium-srv6-classify off an interface that still exists.
+ *
  * The caller must have bounded id_len before copying the identity out of the
  * API message; this function bounds it again because it is also reachable
  * from the CLI and from tests, and because a length check that only exists at
@@ -248,13 +254,40 @@ cilium_srv6_if_attachment_add_del (const u8 *attachment_id, u32 id_len, u32 sw_i
   switch (verdict)
     {
     case CILIUM_SRV6_IFBIND_ACCEPT_INSERT:
-      csb_insert (bm, attachment_id, id_len, sw_if_index, if_incarnation);
-      return 0;
     case CILIUM_SRV6_IFBIND_ACCEPT_IDEMPOTENT:
-      return 0;
+      break;
     default:
       return cilium_srv6_ifbind_verdict_to_api_error (verdict);
     }
+
+  /*
+   * errata #34 item 195. The binding is the declaration: accepting this ADD is
+   * the plugin learning that sw_if_index is Pod-facing, so the interface is put
+   * on the 02 §1 headend path here, before the ADD is acknowledged. An ACK of
+   * this message therefore means "cilium-srv6-classify is installed on this
+   * interface", which is the ordering guarantee the D-71 lifecycle writer needs
+   * in order to bring the interface up only after it is policy-evaluated.
+   *
+   * D-73's UNTRUSTED says the same thing, but only once the agent has spoken;
+   * between a VPP restart and the agent's first srv6_acl_interface_set nothing
+   * has, and a Pod tun is then indistinguishable from the host TAP. That window
+   * is unbounded when the agent is down and is re-entered by the D-35 dead-man
+   * switch, which is what item 195 closes.
+   *
+   * A failure records nothing — the binding is not inserted and the Pod-facing
+   * bit is rolled back — because a recorded binding whose interface is not on
+   * the headend path is exactly the fail-open state this is preventing. The
+   * retval is distinct from every other rejection of this message so that the
+   * writer can tell "the plugin refused the handle" from "the plugin could not
+   * make the handle safe" and retry rather than re-plan.
+   */
+  if (cilium_srv6_guard_mark_pod_facing (sw_if_index) != 0)
+    return VNET_API_ERROR_CANNOT_ENABLE_DISABLE_FEATURE;
+
+  if (verdict == CILIUM_SRV6_IFBIND_ACCEPT_INSERT)
+    csb_insert (bm, attachment_id, id_len, sw_if_index, if_incarnation);
+
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */

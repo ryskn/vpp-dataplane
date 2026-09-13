@@ -25,7 +25,11 @@
  *   design/detail/06-observability.md §2 (drop reason names), §3 (metrics)
  */
 
-option version = "1.8.0";
+/* 1.9.0: srv6_local_ep_add_del carries the CNI attachment identity
+   [決定 (errata #34 項目 200)]. Unlike every change since 1.6.0 this one is not
+   additive - it moves that message's CRC - so the minor version moves with it
+   and an agent built against 1.8.0 fails the plugin's CRC check by name. */
+option version = "1.9.0";
 
 import "vnet/interface_types.api";
 import "vnet/ip/ip_types.api";
@@ -94,6 +98,24 @@ autoendian define srv6_acl_dump
     @param guard_installed - cilium-srv6-guard is on this interface's
            ingress feature arc. An injection path is guard-covered only
            when this is true for the interface it arrives on (D-58).
+    @param classify_installed - cilium-srv6-classify is on this
+           interface's ip6-unicast ingress feature arc, i.e. the interface
+           is on the 02 section 1 headend path and its packets are
+           policy-evaluated (errata #34 items 191, 196). The guard alone
+           does not imply this: the guard passes everything that is not
+           SID Block destined, so an interface with guard_installed and
+           without classify_installed forwards Pod traffic through the
+           plain IPv6 FIB. Every interface with pod_facing or
+           trust == UNTRUSTED must report true; that is the classify
+           coverage the agent folds into D-58 FoundationReady and the
+           plugin folds into context_install_blocked.
+    @param pod_facing - a D-71 attachment binding was accepted for this
+           interface, which is the declaration that it is Pod-facing
+           (errata #34 item 195). Sticky for the interface lifetime: a
+           binding DELETE does not clear it, only the interface going away
+           does. It is set before the binding ADD is acknowledged, together
+           with classify_installed, so an ACKed ADD means the interface is
+           on the headend path.
     @param trusted_fabric_promotable - false for every interface whose
            device class is not physical/bond/uplink (tap family, memif,
            af-packet, vhost-user), which can never become TRUSTED_FABRIC
@@ -115,7 +137,8 @@ autoendian define srv6_acl_dump
     @param deadman_active - agent keepalive lapsed and the plugin
            quarantined every interface by itself (D-35)
     @param context_install_blocked - new Context install is refused
-           (D-35; also while guard coverage is incomplete)
+           (D-35; also while guard coverage or classify coverage is
+           incomplete, errata #34 item 196)
     @param n_quarantined_interfaces - gauge for acl_quarantined_interfaces
     @param deadman_activations - counter for guard_deadman_activations_total
 */
@@ -126,6 +149,8 @@ autoendian define srv6_acl_details
   u32 if_incarnation;
   vl_api_srv6_acl_trust_t trust;
   bool guard_installed;
+  bool classify_installed;
+  bool pod_facing;
   bool trusted_fabric_promotable;
   u32 quarantine_hold_remaining_ms;
   u32 withdraw_delay_remaining_ms;
@@ -756,6 +781,32 @@ enum srv6_program_action : u8
     the incarnation of a lifetime that has already ended is refused rather
     than allowed to give a new Pod the previous Pod's identity.
 
+    An ADD also names the CNI attachment the entry is for, and the plugin
+    accepts it only when its own attachment binding table (D-68,
+    srv6_if_attachment_add_del) holds exactly that
+    (attachment_id, sw_if_index, if_incarnation) [決定 (errata #34 項目 200)].
+    The key alone is not enough: a bare (sw_if_index, if_incarnation) tuple is
+    drawn from counters a restarting plugin restarts, so a caller that kept a
+    handle across a plugin instance replays a *valid-looking* tuple that names
+    whatever interface the new instance put in that slot. Issue #21 run 17 is
+    that case - the Pod interface lifecycle service recreated four TUNs in a
+    different order, two attachments swapped slots, and both tuples were live -
+    and it is why this is a cross-authority consistency check rather than
+    defence in depth: the writer's authority is the attachment, the binding
+    table's authority is which interface that attachment is behind, and the
+    write is refused when the two disagree. D-72 reconstructs the binding table
+    before any LocalEndpoint is installed, so there is no ordering in which a
+    legitimate ADD arrives before its binding.
+
+    A DELETE that carries an attachment_id removes the entry only when the
+    entry was installed for that same attachment, so a delete left over from a
+    previous attachment cannot remove the entry a new one installed. A DELETE
+    with an empty attachment_id is the unverified form, keyed by
+    (sw_if_index, if_incarnation) alone: it exists for the D-70 orphan sweep,
+    which names a lifetime it has just read out of srv6_local_ep_dump under the
+    current plugin instance and has no attachment identity to quote, because
+    srv6_local_ep_details does not carry one.
+
     Installing an entry also enables cilium-srv6-classify on that interface;
     removing it disables it again. An interface with no entry is therefore
     not part of the headend graph at all, which is why 02 §1 starts the chain
@@ -769,12 +820,33 @@ enum srv6_program_action : u8
                             (D-31)
       INVALID_VALUE_3     - ip is link-local; 02 §3 assumes one global
                             unicast address per endpoint
-      NO_SUCH_ENTRY       - delete of an entry that is not installed
+      INVALID_VALUE_4     - attachment_id is malformed: empty on an ADD, longer
+                            than 255 bytes, or outside printable ASCII. The
+                            same rule and the same bound as
+                            srv6_if_attachment_add_del
+      NO_SUCH_ENTRY       - ADD: the binding table holds no binding for
+                            sw_if_index, so no attachment claims this interface
+                            (D-68).
+                            DELETE: no entry is installed for this interface,
+                            or the installed entry belongs to a different
+                            attachment - which is the same answer, because the
+                            named attachment has no entry here
+      ENTRY_ALREADY_EXISTS - ADD: sw_if_index is bound to a *different*
+                            attachment. Nothing is replaced and nothing is
+                            installed; the writer withdraws the old binding
+                            first (D-68)
+      INVALID_INTERFACE   - ADD: the binding for sw_if_index was published for
+                            an if_incarnation other than the one on the wire
       UNSPECIFIED         - the classify feature could not be enabled, so the
                             endpoint would not be classified at all
 
     @param sw_if_index - the Pod interface
     @param if_incarnation - incarnation as reported by srv6_acl_dump (D-31)
+    @param attachment_id - the CNI attachment identity this entry is for,
+           verbatim, exactly as srv6_if_attachment_add_del carries it: same
+           type, same 255-byte bound, same character set. Required on an ADD;
+           on a DELETE it is either the identity the entry was installed for or
+           empty
     @param identity - the src identity every packet from this interface is
            classified with (02 §3: identity comes from the interface, never
            from the packet's source address)
@@ -796,6 +868,8 @@ autoendian autoreply define srv6_local_ep_add_del
   u32 local_context_id;
   u32 owner_quota_class;
   bool is_add;
+  /* Last, because a variable-length member has to be. */
+  string attachment_id[];
 };
 
 /** \brief Dump the LocalEndpointTable (02 §2). */

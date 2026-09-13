@@ -49,25 +49,17 @@ cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
    * interfaces are not on the headend path at all — which is what run 16
    * reported while same-node Pod-to-Pod traffic was being forwarded by the
    * plain IPv6 FIB. The line below is the one that answers "is Pod traffic
-   * being policy-evaluated at all": every interface classified UNTRUSTED
-   * (D-73, i.e. Pod-facing) must carry cilium-srv6-classify (02 §1).
+   * being policy-evaluated at all": every interface a D-71 attachment binding
+   * declared Pod-facing (errata #34 item 195) or D-73 classified UNTRUSTED
+   * must carry cilium-srv6-classify (02 §1). Since item 196 this is also a
+   * READY condition and a Context install precondition, not only a line to
+   * read: see cilium_srv6_guard_context_install_allowed().
    */
-  {
-    u32 n_unclassified = 0;
-
-    for (i = 0; i < vec_len (cm->ifs); i++)
-      {
-	e = vec_elt_at_index (cm->ifs, i);
-	if (e->valid && e->trust == CILIUM_SRV6_TRUST_UNTRUSTED && !e->classify_installed)
-	  n_unclassified++;
-      }
-
-    vlib_cli_output (vm,
-		     "classify coverage    : %s (%u Pod-facing interface%s "
-		     "not on the headend path)",
-		     n_unclassified == 0 ? "COMPLETE" : "INCOMPLETE", n_unclassified,
-		     n_unclassified == 1 ? "" : "s");
-  }
+  vlib_cli_output (vm,
+		   "classify coverage    : %s (%u Pod-facing interface%s "
+		   "not on the headend path)",
+		   cilium_srv6_classify_coverage_complete (cm) ? "COMPLETE" : "INCOMPLETE",
+		   cm->n_classify_uncovered, cm->n_classify_uncovered == 1 ? "" : "s");
   vlib_cli_output (vm, "context install      : %s",
 		   cilium_srv6_guard_context_install_allowed () ? "allowed" : "BLOCKED");
   vlib_cli_output (vm,
@@ -94,8 +86,8 @@ cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		     "inspected (offset-zero fragment must be fully inspectable)");
   vlib_cli_output (vm, "");
 
-  vlib_cli_output (vm, "%-30s %10s %-15s %6s %9s %6s %10s %10s", "interface", "incarn", "trust",
-		   "guard", "classify", "promo", "hold(ms)", "wdraw(ms)");
+  vlib_cli_output (vm, "%-30s %10s %-15s %6s %9s %6s %6s %10s %10s", "interface", "incarn",
+		   "trust", "guard", "classify", "podif", "promo", "hold(ms)", "wdraw(ms)");
 
   for (i = 0; i < vec_len (cm->ifs); i++)
     {
@@ -104,16 +96,20 @@ cilium_srv6_show_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (!e->valid)
 	continue;
 
-      vlib_cli_output (vm, "%-30U %10u %-15U %6s %9s %6s %10u %10u",
+      vlib_cli_output (vm, "%-30U %10u %-15U %6s %9s %6s %6s %10u %10u",
 		       format_vnet_sw_if_index_name, vnm, i, e->incarnation,
 		       format_cilium_srv6_trust, (u32) e->trust,
 		       e->guard_installed ? "yes" : "NO",
 		       /* item 191: "NO" only where 02 §1 requires it, so that the
 			  host TAP and the fabric uplinks do not read as a defect. */
-		       e->classify_installed		    ? "yes" :
-		       e->trust == CILIUM_SRV6_TRUST_UNTRUSTED ? "NO" :
-								 "-",
-		       e->promotable ? "yes" : "no",
+		       e->classify_installed ? "yes" :
+		       cilium_srv6_classify_required (e->trust, e->pod_facing) ? "NO" :
+										"-",
+		       /* errata #34 item 195: the D-71 binding's declaration,
+			  which is sticky for the interface lifetime and is what
+			  makes the classify column answerable without the
+			  agent. */
+		       e->pod_facing ? "yes" : "no", e->promotable ? "yes" : "no",
 		       cilium_srv6_quarantine_hold_remaining_ms (e),
 		       cilium_srv6_withdraw_delay_remaining_ms (e));
     }
@@ -765,6 +761,21 @@ VLIB_CLI_COMMAND (cilium_srv6_show_headend_command, static) = {
   .function = cilium_srv6_show_headend_command_fn,
 };
 
+/* One CNI attachment identity, or "-" when an entry carries none. It is a
+   byte vector of exactly the published length and is not NUL terminated, so
+   it is printed with %v and never with %s; the "-" is a literal and therefore
+   cannot be. */
+static u8 *
+format_cilium_srv6_attachment_id (u8 *s, va_list *args)
+{
+  const u8 *id = va_arg (*args, const u8 *);
+
+  if (id == 0 || vec_len (id) == 0)
+    return format (s, "-");
+
+  return format (s, "%v", id);
+}
+
 static clib_error_t *
 cilium_srv6_show_local_ep_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				      vlib_cli_command_t *cmd)
@@ -780,19 +791,37 @@ cilium_srv6_show_local_ep_command_fn (vlib_main_t *vm, unformat_input_t *input,
   for (i = 0; i < vec_len (hm->local_eps); i++)
     {
       const cilium_srv6_local_ep_t *e = hm->local_eps + i;
+      const u8 *attachment;
       u32 live;
 
       if (!e->valid)
 	continue;
 
       live = (i < vec_len (cm->ifs)) ? cm->ifs[i].incarnation : (u32) ~0;
+      attachment = cilium_srv6_local_ep_attachment (i);
 
+      /*
+       * The CNI attachment identity the entry was installed for (errata #34
+       * item 200) goes on the continuation line, between the incarnation and
+       * the policy revision. The runbook readers match that line as
+       * `incarnation N (live N).*policy revision N`
+       * (SRV6EC_LOCAL_ENDPOINT_ROW_RE in test/srv6ec/stage0/lib.sh), so a
+       * field added inside that span is read by the pattern that exists,
+       * while one on the header line or on a line of its own would not be.
+       * The identity cannot contain whitespace (cilium_srv6_ifbind_rules.h),
+       * so it cannot split the line either.
+       *
+       * `%v` prints a byte vector of exactly its own length, which is what
+       * the identity is; there is no NUL to stop at. An entry with no
+       * identity is one an older agent installed before the field existed.
+       */
       vlib_cli_output (vm,
 		       "%U: identity %u ip %U context %u owner %u\n"
-		       "  incarnation %u (live %u)%s, policy revision %llu",
+		       "  incarnation %u (live %u)%s, attachment %U, policy revision %llu",
 		       format_vnet_sw_if_index_name, vnm, i, e->identity, format_ip6_address, &e->ip,
 		       e->local_context_id, e->owner_quota_class, e->if_incarnation, live,
 		       (live == e->if_incarnation) ? "" : " STALE (D-31: will not resolve)",
+		       format_cilium_srv6_attachment_id, attachment,
 		       cilium_srv6_policy_revision (hm, e->policy_rev_slot));
     }
 

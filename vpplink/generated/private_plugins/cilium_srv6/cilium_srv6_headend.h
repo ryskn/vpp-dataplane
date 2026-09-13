@@ -1253,6 +1253,19 @@ typedef struct
      stored incarnation). Grown only under the worker barrier. */
   cilium_srv6_local_ep_t *local_eps;
 
+  /* The CNI attachment identity each installed entry was installed for
+     (errata #34 item 200), in a vector parallel to local_eps: a vector of the
+     published bytes, or NULL where local_eps has no entry.
+
+     It is kept out of cilium_srv6_local_ep_t on purpose. The entry is read on
+     every packet from a Pod interface and the identity is read by nothing on
+     the data path - only srv6_local_ep_add_del(DELETE) and the CLI compare it
+     - so storing it inline would put up to 255 bytes of control-plane data in
+     front of the fields the classify node reads. The two lifetimes are the
+     same one and every site that clears an entry clears this through
+     csh_local_ep_attachment_clear(). */
+  u8 **local_ep_attachments;
+
   /* ProgramCache: bihash_24_8 key -> pool index (02 §4.1). */
   clib_bihash_24_8_t program_table;
   cilium_srv6_program_t *programs; /* fixed size pool */
@@ -1929,9 +1942,24 @@ cilium_srv6_flow_label (const cilium_srv6_headend_main_t *hm, const ip6_address_
 /* control plane entry points (cilium_srv6_headend.c)                  */
 /* ------------------------------------------------------------------ */
 
-int cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, u32 identity,
-				  const ip6_address_t *ip, u32 local_context_id,
-				  u32 owner_quota_class, u8 is_add);
+/*
+ * srv6_local_ep_add_del (02 §8).
+ *
+ * attachment_id / id_len is the CNI attachment the entry is for (errata #34
+ * item 200). An ADD is accepted only when the D-68 binding table holds exactly
+ * that (attachment_id, sw_if_index, if_incarnation); a DELETE that names an
+ * attachment removes the entry only when the entry was installed for it, and
+ * a DELETE with id_len 0 is the unverified form the D-70 orphan sweep uses.
+ * The retvals are listed in cilium_srv6.api.
+ */
+int cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *attachment_id,
+				  u32 id_len, u32 identity, const ip6_address_t *ip,
+				  u32 local_context_id, u32 owner_quota_class, u8 is_add);
+
+/* The CNI attachment identity one installed LocalEndpointTable entry was
+   installed for, or NULL. The returned vector is owned by the table; it is not
+   NUL terminated, and vec_len() is its length. Control plane only. */
+const u8 *cilium_srv6_local_ep_attachment (u32 sw_if_index);
 
 /*
  * Re-evaluate cilium_srv6_classify_wanted() for one interface and install or

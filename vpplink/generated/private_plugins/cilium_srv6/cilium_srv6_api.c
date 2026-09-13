@@ -101,6 +101,10 @@ send_srv6_acl_details (u32 sw_if_index, vl_api_registration_t *rp, u32 context)
       rmp->if_incarnation = e->incarnation;
       rmp->trust = cilium_srv6_trust_encode (e->trust);
       rmp->guard_installed = e->guard_installed ? true : false;
+      /* errata #34 items 191/195/196: the two fields that answer "is this
+	 interface on the 02 §1 headend path, and who said it should be". */
+      rmp->classify_installed = e->classify_installed ? true : false;
+      rmp->pod_facing = e->pod_facing ? true : false;
       rmp->trusted_fabric_promotable = e->promotable ? true : false;
       rmp->quarantine_hold_remaining_ms = cilium_srv6_quarantine_hold_remaining_ms (e);
       rmp->withdraw_delay_remaining_ms = cilium_srv6_withdraw_delay_remaining_ms (e);
@@ -586,21 +590,48 @@ cilium_srv6_action_encode (u8 in)
 						    SRV6_PROGRAM_ACTION_API_ENCAP;
 }
 
+/* Defined with the rest of the CNI attachment binding handlers below; the
+   LocalEndpointTable carries the same identity in the same encoding
+   (errata #34 item 200) and decodes it with the same bounds. */
+static int cilium_srv6_attachment_id_from_api (void *mp, vl_api_string_t *astr, const u8 **id,
+					       u32 *id_len);
+
 static void
 vl_api_srv6_local_ep_add_del_t_handler (vl_api_srv6_local_ep_add_del_t *mp)
 {
   vl_api_srv6_local_ep_add_del_reply_t *rmp;
   ip6_address_t ip;
+  const u8 *id = 0;
+  u32 id_len = 0;
   int rv;
 
   VALIDATE_SW_IF_INDEX_END (mp);
 
+  /*
+   * Item 200: an ADD names the CNI attachment the entry is for. A DELETE may
+   * leave it empty, which is the unverified form the D-70 orphan sweep uses -
+   * that caller reads the lifetime out of srv6_local_ep_dump, which does not
+   * report an attachment. Everything else is decoded with the binding table's
+   * own bounds, and a malformed identity is INVALID_VALUE_4 rather than the
+   * INVALID_VALUE this message already gives to an unspecified endpoint
+   * address.
+   */
+  if (mp->is_add || vl_api_string_len (&mp->attachment_id) != 0)
+    {
+      if (cilium_srv6_attachment_id_from_api (mp, &mp->attachment_id, &id, &id_len) != 0)
+	{
+	  rv = VNET_API_ERROR_INVALID_VALUE_4;
+	  goto reply;
+	}
+    }
+
   ip6_address_decode (mp->ip, &ip);
 
-  rv = cilium_srv6_local_ep_add_del (mp->sw_if_index, mp->if_incarnation, mp->identity, &ip,
-				     mp->local_context_id, mp->owner_quota_class,
-				     mp->is_add ? 1 : 0);
+  rv = cilium_srv6_local_ep_add_del (mp->sw_if_index, mp->if_incarnation, id, id_len,
+				     mp->identity, &ip, mp->local_context_id,
+				     mp->owner_quota_class, mp->is_add ? 1 : 0);
 
+reply:
   BAD_SW_IF_INDEX_LABEL;
   REPLY_MACRO_END (VL_API_SRV6_LOCAL_EP_ADD_DEL_REPLY);
 }

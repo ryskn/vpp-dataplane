@@ -81,7 +81,13 @@ cilium_srv6_barrier_release (vlib_main_t *vm, int taken)
  * never used for delivery.
  *
  * `block_configured` records whether the value came from the configuration or
- * from the test default, so that `show cilium-srv6` can say so.
+ * from the test default, so that `show cilium-srv6` can say so. From errata #34
+ * item 198 it is also a term of cilium_srv6_guard_context_install_allowed():
+ * the test default keeps the guard's block comparison well defined, but it does
+ * not make the plugin ready, so no Context and no local SID is installed on a
+ * node whose startup configuration left `srv6-block` out. That is what confines
+ * the test default to unit and test use — a deployment that relies on it never
+ * reaches the state it wants.
  */
 #define CILIUM_SRV6_BLOCK_TEST_DEFAULT_B0  0xfd
 #define CILIUM_SRV6_BLOCK_TEST_DEFAULT_B1  0xbb
@@ -145,6 +151,22 @@ typedef struct
      because vnet_feature_enable_disable() is reference counted and must not
      be called twice for the same state. */
   u8 classify_installed;
+  /*
+   * errata #34 item 195: a D-71 attachment binding was accepted for this
+   * interface, i.e. the binding writer declared it Pod-facing. Sticky for the
+   * interface lifetime — set by srv6_if_attachment_add_del(ADD), *not* cleared
+   * by the matching DELETE, cleared only by the interface delete callback, so
+   * that the window between a binding withdrawal and the interface actually
+   * going away is not a window without classify.
+   */
+  u8 pod_facing;
+  /*
+   * Whether this entry is currently counted in
+   * cilium_srv6_main_t.n_classify_uncovered (errata #34 item 196). It is
+   * cached per entry rather than recomputed over the whole vector because the
+   * answer is read on the Context install path.
+   */
+  u8 classify_uncovered;
   u8 promotable; /* may become TRUSTED_FABRIC (D-31) */
   u32 incarnation;
   f64 quarantined_at; /* time of the last entry into QUARANTINED */
@@ -241,6 +263,13 @@ typedef struct
   /* coverage accounting */
   u32 n_valid;
   u32 n_uncovered; /* valid interfaces without the guard installed */
+  /*
+   * Valid interfaces that cilium_srv6_classify_required() selects and that do
+   * not carry cilium-srv6-classify (errata #34 item 196). Maintained by
+   * cilium_srv6_classify_coverage_account() from every site that can change
+   * `valid`, `trust`, `pod_facing` or `classify_installed`.
+   */
+  u32 n_classify_uncovered;
   u32 n_quarantined;
   u32 n_untrusted;
   u32 n_trusted_fabric;
@@ -311,20 +340,93 @@ cilium_srv6_guard_coverage_complete (const cilium_srv6_main_t *cm)
 }
 
 /*
+ * Classify coverage (errata #34 item 196): every interface that
+ * cilium_srv6_classify_required() selects — Pod-facing by a D-71 binding, or
+ * classified UNTRUSTED by D-73 — carries cilium-srv6-classify.
+ *
+ * Guard coverage does not imply this and item 191 is the demonstration: the
+ * guard passes everything that is not SID Block destined, so a node whose Pod
+ * interfaces are not on the 02 §1 headend path at all reports "guard coverage:
+ * COMPLETE" while forwarding same-node Pod traffic through the plain IPv6 FIB
+ * with no policy evaluation. This is the second half of the same READY
+ * question, and 196 makes it a formal condition rather than a CLI line.
+ */
+static_always_inline int
+cilium_srv6_classify_coverage_complete (const cilium_srv6_main_t *cm)
+{
+  return cm->initialised && cm->n_classify_uncovered == 0;
+}
+
+/*
+ * Recompute this entry's contribution to n_classify_uncovered.
+ *
+ * Idempotent, O(1) and safe to call after any mutation of `valid`, `trust`,
+ * `pod_facing` or `classify_installed`; callers call it unconditionally rather
+ * than reasoning about which way the state moved. The caller must hold the
+ * worker barrier, because it is called from the same sections that write those
+ * fields.
+ */
+static_always_inline void
+cilium_srv6_classify_coverage_account (cilium_srv6_main_t *cm, cilium_srv6_guard_if_t *e)
+{
+  u8 uncovered = (e->valid && cilium_srv6_classify_required (e->trust, e->pod_facing) &&
+		  !e->classify_installed) ?
+		   1 :
+		   0;
+
+  if (uncovered == e->classify_uncovered)
+    return;
+
+  if (uncovered)
+    cm->n_classify_uncovered++;
+  else if (cm->n_classify_uncovered > 0)
+    cm->n_classify_uncovered--;
+
+  e->classify_uncovered = uncovered;
+}
+
+/*
  * Gate consulted by the Context install path (C8-b). New Context install
- * is refused while guard coverage is incomplete (03 §1.1) or while the
- * dead-man switch is active (D-35). Existing ACTIVE delivery is not
+ * is refused while guard coverage is incomplete (03 §1.1), while classify
+ * coverage is incomplete (errata #34 item 196), while the block is the test
+ * default rather than a configured one (D-60, errata #34 item 198), or while
+ * the dead-man switch is active (D-35). Existing ACTIVE delivery is not
  * affected by this flag — see D-35 rationale.
+ *
+ * Classify coverage is a precondition of Context install for the same reason
+ * guard coverage is: a Context is the object that makes a delivery path exist,
+ * and a Pod interface that is not on the headend path is an injection path
+ * whose packets are never policy-evaluated. Item 195 puts the classify feature
+ * on the interface inside the binding ADD handler, before the ACK, so this
+ * gate is not a circular dependency: the declaration that creates the
+ * requirement also satisfies it.
+ *
+ * `block_configured` is part of the predicate because SRV6_BLOCK is what the
+ * whole SID structure of 01 §2.3 is built out of, and the plugin's default is
+ * a TEST value that exists only to give an unconfigured plugin a block of
+ * known extent (see CILIUM_SRV6_BLOCK_TEST_DEFAULT_* above). A plugin on that
+ * default has no relationship with the block the agent allocates out of: the
+ * two agreed in Stage 0 runs 16 and 17 only because the agent's --srv6-block
+ * happened to carry the same test value, and nothing on IF-2 publishes the
+ * block for them to be reconciled by. Refusing installation is the fail-closed
+ * reading of D-60: a node with no configured block forwards plainly and holds
+ * no SRv6 state, rather than installing a local SID whose Block bits nobody
+ * authorised.
  */
 static_always_inline int
 cilium_srv6_guard_context_install_allowed (void)
 {
   const cilium_srv6_main_t *cm = &cilium_srv6_main;
-  return cilium_srv6_guard_coverage_complete (cm) && !cm->deadman_active;
+  return cilium_srv6_guard_coverage_complete (cm) && cilium_srv6_classify_coverage_complete (cm) &&
+	 cm->block_configured && !cm->deadman_active;
 }
 
 /* Control plane entry points (cilium_srv6_guard.c). */
 int cilium_srv6_acl_interface_set (u32 sw_if_index, u32 if_incarnation, u8 trust);
+/* errata #34 item 195: the D-71 attachment binding ADD declares the interface
+   Pod-facing and installs cilium-srv6-classify on it, as one step, before the
+   ADD is acknowledged. Called from cilium_srv6_if_attachment_add_del(). */
+int cilium_srv6_guard_mark_pod_facing (u32 sw_if_index);
 void cilium_srv6_agent_keepalive (u32 client_index);
 void cilium_srv6_quarantine_all (const char *reason);
 void cilium_srv6_quarantine_all_except_fabric (const char *reason);
