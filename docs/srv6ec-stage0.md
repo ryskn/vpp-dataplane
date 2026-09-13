@@ -97,6 +97,62 @@ above rolls the whole thing back through the cleanup stack and fails the CNI
 ADD; a Pod-side sysctl or a device route that cannot be installed is a failure,
 not a warning.
 
+#### The rescan re-applies the Pod namespace side (errata #34 item 211)
+
+When the lifecycle service starts again it reconciles every durably stored pod
+spec against a fresh VPP dump (`rescanLifecycleState`). On the branch where the
+per-pod VRFs are gone — a VPP restart — the VPP interface is created again, and
+the netdev the Pod network namespace then holds is not guaranteed to be the one
+it had: `CreateOrAttachTapV2` creates the tun with `TAP_FLAG_PERSIST` and first
+tries `TAP_FLAG_ATTACH`, so it either re-attaches to the pre-restart netdev or
+creates a new one. A new netdev carries no address, no device route and default
+sysctls.
+
+**The rescan therefore runs the same Pod-namespace steps a `CreatePodInterface`
+runs, from the stored pod spec** (`addresses`, `routes`, MTU, `accept_ra=0`,
+`addr_gen_mode=none`, forwarding sysctls) — the row of the table above that says
+"Pod netns", in the same order. Before this, the rescan re-created the VPP
+interface and republished the IF-4 binding while the Pod namespace was left with
+only the kernel's `fe80::`: every IPv6 Pod lost its address and its routes on
+every VPP restart, and nothing above the service could see it, because the Cilium
+endpoint reads Ready and the binding table reads correct (Stage 0 run 19b:
+`H-1c FAIL fd00::51/128 is not configured in the Pod namespace`,
+`ping: connect: Network is unreachable`, `I-6` 6 × SKIP). The same code on the
+same path worked in run 18 — the difference is only whether the attach found the
+pre-restart netdev, which nothing verifies and which an IPv4 deployment would
+never notice.
+
+The steps are **reconciled, not re-applied**, under `LifecycleProfile`: the
+addresses and routes the namespace already has are read first, an interface that
+already carries exactly the stored configuration is left untouched, a missing
+address or device route is added, and a non-link-scope address the stored pod
+spec does not name is removed rather than left beside the right one — D-50 makes
+the attachment L3-only, so the interface carries exactly the addresses the CNI
+decided. Routes that are installed and not stored are left alone: the kernel put
+them there. The kernel's link-local address is also left alone; it is present on
+a healthy Pod interface too, because VPP brings the host side of the tun up when
+it creates it and the address is generated before `addr_gen_mode=none` is
+written, which prevents further generation rather than removing what exists. An
+observation that cannot be taken is a failure, not an empty observation — acting
+on an empty one would delete every address the interface has.
+
+The resulting order on the rescan path is the order of the table above: create
+the tun → VPP-side configuration (VRF, MTU, admin up) → the Pod-namespace L3
+configuration → VPP-side routing and uRPF → the IF-4 binding ADD, acknowledged
+→ the attachment is recorded and the durable state persisted. The D-71 binding
+is published only after the Pod side is configured, and a Pod-side failure fails
+the reconciliation of that attachment and leaves the service not ready rather
+than publishing a binding for an interface that cannot carry traffic.
+
+Errata #34 item 203 — creating the TUN administratively down, publishing the
+binding, and only then bringing it up — is **not** done here: `InterfaceAdminUp`
+sits inside `DoPodInterfaceConfiguration`, which the memif driver and the Calico
+CNI backend also call, so moving it would change paths outside the lifecycle
+create and rescan. It would also not close the window it appears to close: VPP
+sets the *host* side of the tun up when it creates it
+(`vnet_netlink_set_link_state (tif->ifindex, 1)` in VPP's tap plugin),
+independently of the VPP-side admin state.
+
 What it deliberately does **not** program, because Cilium owns NAT, policy and
 services in this profile and Calico's CNAT is not deployed at all:
 
@@ -585,6 +641,13 @@ Not part of this repository, listed because Stage 0 does not come up without it:
    crash-loops the DaemonSet. Check
    `vpplink/generated/private_plugins/CILIUM_SRV6_SOURCE_COMMIT` against the
    image being deployed (section 4.1).
+7. **A VPP restart re-creates the Pod-side netdev, and the Pod-side L3
+   configuration has to be re-applied with it** (errata #34 item 211). The rescan
+   does that from the durable pod spec now; see 2.1. A deployment that keeps its
+   own Pod-side configuration outside the pod spec would lose it here, and an
+   IPv4-only deployment would not notice the difference because
+   `CreateOrAttachTapV2` sometimes re-attaches to a netdev that kept its
+   configuration.
 
 ## 9. Open items
 

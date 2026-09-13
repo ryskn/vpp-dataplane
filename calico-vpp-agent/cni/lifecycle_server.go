@@ -157,7 +157,10 @@ func (s *Server) rescanLifecycleState() {
 		// describes are still there, and storedHandleStillLive says whether the
 		// stored sw_if_index still carries the incarnation the binding was
 		// published for.
-		vrfsExist := s.v4v6VrfsExistInVPP(&podSpecCopy)
+		// vrfsExistInVpp is v4v6VrfsExistInVPP behind the test seam of
+		// cni_server.go; production leaves the seam nil, so this is the same
+		// observation, taken from the same fresh dump.
+		vrfsExist := s.vrfsExistInVpp(&podSpecCopy)
 		handleStillLive := false
 		if vrfsExist {
 			live, err := s.storedHandleStillLive(&podSpecCopy)
@@ -187,7 +190,28 @@ func (s *Server) rescanLifecycleState() {
 		// as idempotent; rescanNewLifecycle withdraws the old tuple and creates
 		// a new interface that publishes a new binding. AddVppInterface does
 		// both, selected by the same VRF observation.
-		_, err := s.createVppInterface(&podSpecCopy, false /* doHostSideConf */)
+		//
+		// The Pod-namespace side is re-applied from the stored pod spec, which
+		// is what doHostSideConf asks for. It is not optional on this path
+		// (errata #34 item 211): on the rescanNewLifecycle branch the netdev in
+		// the Pod namespace may be a new one that VPP just created — bare, with
+		// no address, no device route and default sysctls — and re-creating the
+		// VPP interface without it published a D-71 binding for an attachment
+		// whose Pod could not send a packet. Upstream Calico's rescan passes
+		// false because it assumes CreateOrAttachTapV2 re-attached to a netdev
+		// that kept its configuration; nothing verifies that assumption, and
+		// when it does not hold there is no later step that repairs it.
+		//
+		// Only the rescanNewLifecycle branch reaches the Pod-side steps at all:
+		// rescanReplay returns from AddVppInterface before the dataplane is
+		// realized, because its interface — and with it the netdev in the Pod
+		// namespace — was never destroyed. Passing true is nevertheless safe
+		// wherever it is reached, because the Pod-side steps of LifecycleProfile
+		// reconcile rather than re-apply: an interface that already carries
+		// exactly the stored addresses and routes is left untouched, a missing
+		// one is added, and an address the stored pod spec does not name is
+		// removed (configureNamespaceSideTun).
+		_, err := s.createVppInterface(&podSpecCopy, true /* doHostSideConf */)
 		switch err.(type) {
 		case PodNSNotFoundErr:
 			// The Pod is gone. Its binding and its VPP interface are not: run

@@ -451,12 +451,28 @@ func (i *TunTapPodInterfaceDriver) addPodAddresses(contTun netlink.Link, podSpec
 // to install routes into. configureNamespaceSideTun passes netlink.RouteAdd,
 // and nothing in production passes anything else.
 func (i *TunTapPodInterfaceDriver) AddPodRoutes(routeAdd func(*netlink.Route) error, linkIndex int, podSpec *model.LocalPodSpec, swIfIndex uint32, hasv4 bool, hasv6 bool) error {
+	routes := make([]net.IPNet, 0, len(podSpec.Routes))
 	for _, route := range podSpec.Routes {
-		isV6 := route.IP.To4() == nil
-		if (isV6 && !hasv6) || (!isV6 && !hasv4) {
+		if !routeFamilyIsUsable(route, hasv4, hasv6) {
 			i.log.Infof("pod(add) Skipping tun swIfIndex=%d route=%s", swIfIndex, route.String())
 			continue
 		}
+		routes = append(routes, route)
+	}
+	return i.addPodRouteList(routeAdd, linkIndex, routes, podSpec, swIfIndex)
+}
+
+// addPodRouteList installs the given device routes out of the tun and applies
+// this driver's profile policy, exactly as documented on AddPodRoutes, to a
+// route that could not be installed.
+//
+// It exists so that the route list can be narrowed before it is installed
+// without duplicating that policy: AddPodRoutes narrows it by address family,
+// and the lifecycle profile's Pod-side reconciliation narrows it to the routes
+// the namespace does not already have (errata #34 item 211).
+func (i *TunTapPodInterfaceDriver) addPodRouteList(routeAdd func(*netlink.Route) error, linkIndex int, routes []net.IPNet, podSpec *model.LocalPodSpec, swIfIndex uint32) error {
+	for idx := range routes {
+		route := routes[idx]
 		i.log.Infof("pod(add) tun route swIfIndex=%d linux-ifIndex=%d route=%s", swIfIndex, linkIndex, route.String())
 		err := routeAdd(&netlink.Route{
 			LinkIndex: linkIndex,
@@ -488,6 +504,19 @@ func (i *TunTapPodInterfaceDriver) setPodMtu(contTun netlink.Link, podSpec *mode
 // configureNamespaceSideTun configures the Pod side of the tun, running the
 // steps this driver's profile prescribes in the order it prescribes them (see
 // namespaceSideSteps).
+//
+// Under LifecycleProfile the address and route steps are reconciled against
+// what the namespace already carries rather than applied blindly, because the
+// same steps run on two paths that start from different Pod-side states: a
+// CreatePodInterface, where the netdev is new and bare, and the rescan after a
+// VPP restart, where it may be new *or* the pre-restart one with part of its
+// configuration still on it (errata #34 item 211, see
+// tuntap_namespace_reconcile.go). The steps and their order are unchanged; only
+// the work each one finds left to do is.
+//
+// The Calico profile keeps applying what it always applied: what a Calico
+// deployment configures inside a Pod is a change to that product and is not made
+// here (Issue #135 pre-merge item 4).
 func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, podSpec *model.LocalPodSpec) func(hostNS ns.NetNS) error {
 	return func(hostNS ns.NetNS) error {
 		contTun, err := netlink.LinkByName(podSpec.InterfaceName)
@@ -497,6 +526,18 @@ func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, p
 		hasv4, hasv6 := podSpec.Hasv46()
 		isL3 := podSpec.IfSpec.IsL3 != nil && *podSpec.IfSpec.IsL3
 
+		reconcile := i.profile == LifecycleProfile
+		var delta namespaceSideDelta
+		if reconcile {
+			observed, obsErr := observeNamespaceSide(realNetlinkReader{}, contTun)
+			if obsErr != nil {
+				return obsErr
+			}
+			delta = planNamespaceSide(observed, podSpec)
+			i.log.Infof("pod(add) tun namespace side swIfIndex=%d linux-ifIndex=%d: %s",
+				swIfIndex, contTun.Attrs().Index, delta)
+		}
+
 		for _, step := range namespaceSideSteps(i.profile, hasv6, isL3) {
 			switch step {
 			case stepEnableIPv6:
@@ -505,9 +546,17 @@ func (i *TunTapPodInterfaceDriver) configureNamespaceSideTun(swIfIndex uint32, p
 			case stepSuppressIPv6Autoconf:
 				err = i.suppressIPv6Autoconfiguration(podSpec)
 			case stepAddresses:
-				err = i.addPodAddresses(contTun, podSpec, swIfIndex)
+				if reconcile {
+					err = i.reconcilePodAddresses(contTun, delta, swIfIndex)
+				} else {
+					err = i.addPodAddresses(contTun, podSpec, swIfIndex)
+				}
 			case stepRoutes:
-				err = i.AddPodRoutes(netlink.RouteAdd, contTun.Attrs().Index, podSpec, swIfIndex, hasv4, hasv6)
+				if reconcile {
+					err = i.addPodRouteList(netlink.RouteAdd, contTun.Attrs().Index, delta.RoutesToAdd, podSpec, swIfIndex)
+				} else {
+					err = i.AddPodRoutes(netlink.RouteAdd, contTun.Attrs().Index, podSpec, swIfIndex, hasv4, hasv6)
+				}
 			case stepMtu:
 				err = i.setPodMtu(contTun, podSpec)
 			case stepContainerSysctls:

@@ -826,6 +826,72 @@ func TestRescanLifecycleStateKeepsIncompatibleStateAndRefusesToServe(t *testing.
 	}
 }
 
+// The rescan must re-apply the Pod-namespace side of every attachment it
+// re-creates (errata #34 item 211).
+//
+// On the rescanNewLifecycle branch the VPP interface is created again, and the
+// netdev the Pod namespace then holds may be a new one: bare, with no address,
+// no device route and default sysctls. A rescan that asked for no Pod-side
+// configuration re-created the interface, published its D-71 binding and left
+// the Pod unable to send a packet — the Cilium endpoint reads Ready and the
+// binding table reads correct, so nothing above this service can see it. The
+// stored pod spec is the only record of what the Pod side must carry, so the
+// rescan applies it.
+func TestRescanLifecycleStateReappliesThePodNamespaceSide(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, fmt.Sprintf("calicovpp_state.v%d.json", config.CniServerStateFileVersion))
+	attachmentID := "a6a11a18fb47696e02238deb66b4a046fcdb80f59883fb66dae2cd340ef32b88:eth0"
+	stored := model.LocalPodSpec{
+		InterfaceName: "eth0",
+		NetnsName:     "/var/run/netns/pod",
+		AttachmentID:  attachmentID,
+		ContainerIPs:  []net.IP{net.ParseIP("fd00::51")},
+	}
+	// The binding that was published for the interface the restarted VPP no
+	// longer has.
+	stored.PublishedIfAttachment = &model.PublishedIfAttachment{
+		AttachmentID:  attachmentID,
+		SwIfIndex:     8,
+		IfIncarnation: 9,
+	}
+	state := model.NewCniServerState(map[string]model.LocalPodSpec{
+		"netns:/var/run/netns/pod,if:eth0": stored,
+	})
+	if err := model.PersistCniServerState(state, path); err != nil {
+		t.Fatalf("cannot write the state: %v", err)
+	}
+
+	writer := newFakeIfBindingWriter()
+	s := testLifecycleServer(writer)
+	s.stateFilename = path
+	// The VPP restart this rescan follows: the per-pod VRFs are gone, so the
+	// decision is rescanNewLifecycle and the interface is created again.
+	s.vrfsExistInVppFn = func(*model.LocalPodSpec) bool { return false }
+
+	hostSideConf := make([]bool, 0, 1)
+	s.createVppInterfaceFn = func(podSpec *model.LocalPodSpec, doHostSideConf bool) (uint32, error) {
+		hostSideConf = append(hostSideConf, doHostSideConf)
+		podSpec.TunTapSwIfIndex = 12
+		podSpec.PublishedIfAttachment = &model.PublishedIfAttachment{
+			AttachmentID: podSpec.AttachmentID, SwIfIndex: 12, IfIncarnation: 13,
+		}
+		return 12, nil
+	}
+
+	s.rescanLifecycleState()
+
+	if reason := s.LifecycleNotReadyReason(); reason != "" {
+		t.Fatalf("the rescan refused to serve: %s", reason)
+	}
+	if len(hostSideConf) != 1 {
+		t.Fatalf("the stored attachment was re-created %d times, want exactly 1", len(hostSideConf))
+	}
+	if !hostSideConf[0] {
+		t.Fatalf("the rescan re-created the interface without re-applying the Pod-namespace side: " +
+			"the Pod keeps a netdev with no address and no route while its D-71 binding is published")
+	}
+}
+
 func TestRescanLifecycleStateFailsClosedWithoutAStoredIdentity(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, fmt.Sprintf("calicovpp_state.v%d.json", config.CniServerStateFileVersion))
