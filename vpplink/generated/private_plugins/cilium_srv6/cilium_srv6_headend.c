@@ -44,6 +44,7 @@
 #include <cilium_srv6/cilium_srv6_ct.h>
 #include <cilium_srv6/cilium_srv6_ifbind.h>
 #include <cilium_srv6/cilium_srv6_localep_rules.h>
+#include <cilium_srv6/cilium_srv6_policyrev_rules.h>
 
 cilium_srv6_headend_main_t cilium_srv6_headend_main;
 
@@ -166,6 +167,12 @@ csh_policy_rev_slot_ref (cilium_srv6_headend_main_t *hm, u32 identity)
   r->identity = identity;
   r->refcount = 1;
   /*
+   * A brand new slot exists but publishes nothing, so it carries no
+   * publication reference. `published` is what names that reference, and only
+   * srv6_policy_revision_publish takes it (errata #34 item 222).
+   */
+  r->published = 0;
+  /*
    * A brand new slot starts at revision 0. An agent that installs an entry
    * carrying a different revision is refused (stale install) and republishes;
    * that is the same retry loop 02 §4.3 already prescribes.
@@ -204,6 +211,17 @@ csh_policy_rev_slot_unref (cilium_srv6_headend_main_t *hm, u32 slot)
   if (r->refcount != 0)
     return;
 
+  /*
+   * errata #34 item 222: a published identity owns one reference of its own,
+   * for as long as it is published, so reaching zero here means every entry
+   * reference *and* the publication reference are gone. An entry unref alone
+   * can therefore never release the slot of a published identity — which is
+   * what makes "a published identity keeps its slot even with no entries"
+   * (02 §4.3) true, and what a same-identity re-install used to break by
+   * dropping the only reference the key had.
+   */
+  ASSERT (cilium_srv6_policyrev_slot_invariant_ok (r->refcount, r->published));
+
   hash_unset (hm->policy_rev_by_identity, (uword) r->identity);
 
   /* A reader that still holds this slot index must not match a future
@@ -220,9 +238,15 @@ csh_policy_rev_slot_unref (cilium_srv6_headend_main_t *hm, u32 slot)
 /*
  * C10 needs the slot of an identity it does not hold a ProgramCache entry
  * for (the peer of a reply), so the slot is created on demand and then
- * retained, exactly like the slots srv6_policy_revision_publish creates. Retaining
- * rather than reference counting keeps the conntrack table out of this pool
- * entirely: no worker ever has to release a slot.
+ * retained. Retaining rather than reference counting keeps the conntrack
+ * table out of this pool entirely: no worker ever has to release a slot.
+ *
+ * The semantics are unchanged by errata #34 item 222 and are deliberately not
+ * the publication's: a pin that *creates* the slot leaves the created
+ * reference behind for good, and a pin that finds one takes nothing, because
+ * there is no pin release to pair a reference with. What item 222 changes is
+ * that the common case — a pin on an identity the agent publishes — now finds
+ * a slot the publication itself keeps alive.
  */
 u32
 cilium_srv6_policy_rev_slot_pin (u32 identity)
@@ -1951,6 +1975,26 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
 
   taken = cilium_srv6_barrier_acquire (vm);
 
+  /*
+   * Both key references are taken before anything is released, because the
+   * replace below and the eviction loop after it both drop the references of
+   * the entries they remove (errata #34 item 222). Taking them first is what
+   * keeps a re-install of the same key from carrying its own POLICY slot
+   * through refcount zero — which released the slot, and the revision in it,
+   * underneath the very entry being reinstalled.
+   *
+   * The keys are re-resolved rather than reused from the validation above:
+   * nothing between the two can change the answer (a published key holds the
+   * publication's own reference, so no eviction can free it), and resolving
+   * where the reference is taken keeps the two from drifting apart if that
+   * ever stops holding. The reference is what pins the key — and with it the
+   * D-83 high water mark — for as long as this entry quotes its revision.
+   */
+  slot = csh_policy_rev_slot_ref (hm, src_identity);
+  endpoint_slot = csh_endpoint_rev_resolve (hm, dst, NULL);
+  if (endpoint_slot != CSH_ENDPOINT_REV_SENTINEL)
+    hm->endpoint_rev[endpoint_slot].refcount++;
+
   /* Re-install of an existing key replaces the entry (02 §8: every message
      is idempotent, "同一 key への再 install は上書き"). */
   if (0 == clib_bihash_search_24_8 (&hm->program_table, &kv, &kv))
@@ -1970,21 +2014,12 @@ cilium_srv6_program_add_del (u32 src_identity, const ip6_address_t *dst, u8 prot
       if (!csh_program_evict_one (hm, budget))
 	{
 	  hm->n_program_quota_drops++;
+	  csh_policy_rev_slot_unref (hm, slot);
+	  csh_endpoint_rev_slot_unref (hm, endpoint_slot);
 	  cilium_srv6_barrier_release (vm, taken);
 	  return VNET_API_ERROR_LIMIT_EXCEEDED;
 	}
     }
-
-  slot = csh_policy_rev_slot_ref (hm, src_identity);
-  /* Re-resolved rather than reusing the index taken above: nothing between
-     the two can change the answer (a present key holds the publication's own
-     reference, so no eviction can free it), and resolving where the reference
-     is taken keeps the two from drifting apart if that ever stops holding.
-     The reference is what pins the key — and with it the D-83 high water mark
-     — for as long as this entry quotes its revision. */
-  endpoint_slot = csh_endpoint_rev_resolve (hm, dst, NULL);
-  if (endpoint_slot != CSH_ENDPOINT_REV_SENTINEL)
-    hm->endpoint_rev[endpoint_slot].refcount++;
 
   pool_get_zero (hm->programs, e);
   index = (u32) (e - hm->programs);
@@ -2203,12 +2238,13 @@ cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions
       u32 slot = csh_policy_rev_slot_find (hm, identities[i]);
       u64 current = CILIUM_SRV6_REV_ABSENT;
 
-      if (slot == CSH_POLICY_REV_SENTINEL)
-	{
-	  if (revisions[i] != CILIUM_SRV6_REV_ABSENT)
-	    n_new++;
-	}
-      else
+      /* Only a publication that has no slot to write into consumes pool
+	 capacity. Taking the publication's reference on a slot that already
+	 exists (errata #34 item 222) creates nothing and is not counted. */
+      n_new += (u32) cilium_srv6_policyrev_publish_allocates (
+	slot != CSH_POLICY_REV_SENTINEL, revisions[i] == CILIUM_SRV6_REV_ABSENT);
+
+      if (slot != CSH_POLICY_REV_SENTINEL)
 	current = hm->policy_rev[slot].policy_revision;
 
       if (csh_revision_incarnation_check (hm, revisions[i], &next_incarnation, &rv))
@@ -2226,29 +2262,38 @@ cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions
   for (i = 0; i < n_policy; i++)
     {
       u32 slot = csh_policy_rev_slot_find (hm, identities[i]);
+      cilium_srv6_policyrev_action_t action = cilium_srv6_policyrev_publish_action (
+	slot != CSH_POLICY_REV_SENTINEL,
+	slot != CSH_POLICY_REV_SENTINEL && hm->policy_rev[slot].published,
+	revisions[i] == CILIUM_SRV6_REV_ABSENT);
 
-      if (revisions[i] == CILIUM_SRV6_REV_ABSENT)
+      switch (action)
 	{
+	case CILIUM_SRV6_POLICYREV_WITHDRAW:
+	case CILIUM_SRV6_POLICYREV_WITHDRAW_NOTHING_HELD:
 	  /*
-	   * A withdrawn identity keeps neither a revision nor a lease. The
-	   * slot itself is left alone: it is reference counted by the entries
-	   * and the conntrack pins that still name it, and releasing it here
-	   * would hand its index to another identity while they still read it.
+	   * A withdrawn identity keeps neither a revision nor a lease, and the
+	   * publication gives back the reference it took. The slot survives
+	   * while entries and conntrack pins still name it — releasing it under
+	   * them would hand its index to another identity while they read it —
+	   * and is released with the last of them.
 	   */
 	  if (slot != CSH_POLICY_REV_SENTINEL)
 	    {
 	      hm->policy_rev[slot].policy_revision = CILIUM_SRV6_REV_ABSENT;
 	      hm->policy_rev[slot].lease_revision = CILIUM_SRV6_REV_INVALID;
 	      hm->policy_rev[slot].lease_valid_until = 0.0;
+
+	      if (action == CILIUM_SRV6_POLICYREV_WITHDRAW)
+		{
+		  hm->policy_rev[slot].published = 0;
+		  csh_policy_rev_slot_unref (hm, slot);
+		}
 	    }
 	  continue;
-	}
 
-      if (slot == CSH_POLICY_REV_SENTINEL)
-	{
-	  /* The reference taken here belongs to the publication itself: a
-	     published identity keeps its slot even with no entries, so that
-	     the next install compares against the revision the agent knows. */
+	case CILIUM_SRV6_POLICYREV_CREATE:
+	  /* Creating the slot takes the publication's reference. */
 	  slot = csh_policy_rev_slot_ref (hm, identities[i]);
 	  if (slot == CSH_POLICY_REV_SENTINEL)
 	    {
@@ -2257,8 +2302,30 @@ cilium_srv6_policy_revision_publish (const u32 *identities, const u64 *revisions
 	      rv = VNET_API_ERROR_LIMIT_EXCEEDED;
 	      continue;
 	    }
+	  break;
+
+	case CILIUM_SRV6_POLICYREV_ADOPT:
+	  /*
+	   * errata #34 item 222: the slot already existed — an entry installed
+	   * before the publication arrived created it, or a withdrawn identity
+	   * is coming back — so the reference the create would have taken is
+	   * taken here instead. Without it the publication owns nothing, and
+	   * the last entry unref releases the slot together with the revision
+	   * the agent's ledger already counts as acknowledged; every later
+	   * install for the identity is then refused for a missing key
+	   * (INVALID_VALUE_4) until the agent restarts.
+	   */
+	  hm->policy_rev[slot].refcount++;
+	  break;
+
+	case CILIUM_SRV6_POLICYREV_REPUBLISH:
+	  /* Already published: one reference per publication, not one per
+	     message, so a republish of an unchanged identity stays
+	     idempotent. */
+	  break;
 	}
 
+      hm->policy_rev[slot].published = 1;
       hm->policy_rev[slot].policy_revision = revisions[i];
     }
 
@@ -2876,10 +2943,22 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
   vec_validate_init_empty (hm->local_eps, sw_if_index, (cilium_srv6_local_ep_t){ 0 });
   e = hm->local_eps + sw_if_index;
 
+  /*
+   * errata #34 item 222: the new reference is taken before the old one is
+   * given back, so a re-install of the same identity never takes its slot
+   * through zero. Doing it the other way round made the D-72 replay of the
+   * only entry of an identity release the slot — with the revision the agent
+   * had already published into it — and recreate it at revision 0.
+   *
+   * The publication's own reference makes that ordering redundant for a
+   * published identity; it is kept because the slot of an identity that is
+   * not published yet (the LocalEndpointTable entry arriving before the seed,
+   * which is exactly the run-21 order) has no such protection.
+   */
+  slot = csh_policy_rev_slot_ref (hm, identity);
+
   if (e->valid)
     csh_policy_rev_slot_unref (hm, e->policy_rev_slot);
-
-  slot = csh_policy_rev_slot_ref (hm, identity);
 
   e->if_incarnation = if_incarnation;
   e->identity = identity;

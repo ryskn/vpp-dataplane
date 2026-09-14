@@ -58,6 +58,7 @@ add_vpp_plugin(cilium_srv6
   cilium_srv6_guard.h
   cilium_srv6_ifbind.h
   cilium_srv6_ifbind_rules.h
+  cilium_srv6_policyrev_rules.h
   cilium_srv6_context.h
   cilium_srv6_endcilium.h
   cilium_srv6_headend.h

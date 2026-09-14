@@ -598,11 +598,25 @@ typedef struct
  * srv6_fragment_verdict_add(ALLOW) (refresh of the exact revision they
  * committed under). Neither DENY form is a writer: a DENY is fail-safe and
  * consults no lease.
+ *
+ *   refcount   one reference per LocalEndpointTable / ProgramCache entry
+ *              resolved to this slot, plus one held by the publication itself
+ *              while the identity is published (`published`), plus the
+ *              permanent retain a conntrack pin takes when it is the creator
+ *              of the slot.
+ *   published  1 between a publish that carried a real revision and the
+ *              withdraw that takes it back. It is the POLICY namespace's
+ *              equivalent of `present` in cilium_srv6_endpoint_rev_t, and it
+ *              names the publication's own reference so that the publication
+ *              cannot take a second one, and so that a withdraw returns
+ *              exactly the one it took (errata #34 item 222).
  */
 typedef struct
 {
   u32 identity;
   u32 refcount;
+  u8 published; /* the publication holds one reference while this is 1 */
+  u8 pad[3];
   u64 policy_revision;
   u64 lease_revision;
   f64 lease_valid_until;
