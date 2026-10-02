@@ -16,20 +16,18 @@ name: VPP image (srv6ec, amd64)
 # byte-for-byte the pinned canonical commits. A hand-edited snapshot fails the
 # workflow rather than reaching an image.
 #
-# Note on the runner: the VPP build compiles the release and the debug packages
-# and needs tens of gigabytes of disk. A GitHub-hosted ubuntu-24.04 runner has
-# roughly 14 GB free after the standard image, so the free-disk step below is
-# required and may still not be enough. `runner` lets the build be sent to a
-# self-hosted Linux docker host instead.
+# Runner: both jobs run on the dedicated self-hosted builder (label
+# srv6ec-vpp-builder; GitHub-hosted runners do not start for this account, and
+# the VPP build needs tens of gigabytes of disk). This repository is public, so
+# the runner must never execute code from a fork: the workflow has no
+# pull_request trigger (only pushes to trusted branches and workflow_dispatch),
+# and the repository requires approval for every external contributor's
+# workflow run. The private canonical repository is read with a read-only
+# deploy key; the image is pushed with this run's GITHUB_TOKEN only.
 
 on:
   workflow_dispatch:
     inputs:
-      runner:
-        description: 'Runner label for the build job'
-        required: false
-        default: 'ubuntu-24.04'
-        type: string
       push:
         description: 'Push the image to the registry'
         required: false
@@ -59,9 +57,9 @@ env:
   REGISTRY: ghcr.io
   IMAGE_OWNER: ${{ github.repository_owner }}
   # Checkout of the canonical Cilium repository, needed by both snapshot gates.
-  # It is private, so a token with read access to it has to be configured as a
-  # repository secret; the workflow's own GITHUB_TOKEN is scoped to this
-  # repository and cannot read it.
+  # It is private, so it is read with a read-only deploy key of that
+  # repository (secret CILIUM_PRIVATE_DEPLOY_KEY); the workflow's own
+  # GITHUB_TOKEN is scoped to this repository and cannot read it.
   CILIUM_CHECKOUT: cilium-canonical
 
 jobs:
@@ -69,7 +67,7 @@ jobs:
     # The gates prove that what is about to be built matches the pinned
     # sources. They are a separate job so that a snapshot mismatch is reported
     # in seconds rather than after a multi-hour VPP compile.
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, srv6ec-vpp-builder]
     timeout-minutes: 15
     outputs:
       image_tag: ${{ steps.tag.outputs.IMAGE_TAG }}
@@ -110,7 +108,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.pins.outputs.repo_slug }}
-          token: ${{ secrets.CILIUM_PRIVATE_TOKEN }}
+          ssh-key: ${{ secrets.CILIUM_PRIVATE_DEPLOY_KEY }}
           path: ${{ env.CILIUM_CHECKOUT }}
           fetch-depth: 0
 
@@ -134,7 +132,7 @@ jobs:
 
   build:
     needs: snapshot-gate
-    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    runs-on: [self-hosted, linux, x64, srv6ec-vpp-builder]
     timeout-minutes: 360
     steps:
       - name: Checkout
@@ -142,15 +140,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Free disk space
-        run: |
-          set -euo pipefail
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          docker system prune -af || true
-          df -h /
-
+      - name: Disk space
+        run: df -h /
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
