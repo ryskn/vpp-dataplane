@@ -28,7 +28,18 @@
 /* 1.9.0: srv6_local_ep_add_del carries the CNI attachment identity
    [決定 (errata #34 項目 200)]. Unlike every change since 1.6.0 this one is not
    additive - it moves that message's CRC - so the minor version moves with it
-   and an agent built against 1.8.0 fails the plugin's CRC check by name. */
+   and an agent built against 1.8.0 fails the plugin's CRC check by name.
+
+   Still 1.9.0 after errata #34 item 202 (D-88), which moves the CRC of
+   srv6_local_ep_details only (it gains attachment_id); that is the precedent
+   of item 196, which moved srv6_acl_details without a version change.
+
+   Still 1.9.0 after errata #34 item 205 (D-90): srv6_sr_domain_prefix_add_del
+   is removed and replaced by the srv6_sr_domain_txn_* staged transaction and
+   srv6_sr_domain_status_get. No message that remains changes its layout, so no
+   existing CRC moves; the version is not bumped for semantic hardening (ruling
+   2026-10-03 4(b)), and an agent that still sends the removed message fails the
+   plugin's CRC check by name. */
 option version = "1.9.0";
 
 import "vnet/interface_types.api";
@@ -564,40 +575,195 @@ autoendian autoreply define srv6_uc_locator_set
   bool is_add;
 };
 
-/** \brief Add or remove one prefix of the SR domain node address set
-           (IF-2, D-32, 03 §3).
+/** \brief Open an SR domain node address set transaction (IF-2, D-32, D-90,
+           03 §3 / §7, errata #34 item 205).
 
-    DEVIATION from 03 §7: the IF-2 message table has no entry for this set,
-    but 03 §3 makes `outer.src ∈ SR_DOMAIN_NODE_SET` the first check of
-    cilium-end-cilium and D-32 makes it the second defence layer against
-    direct injection from a shared underlay. Without a way to configure the
-    set the check can only ever fail, so the set is expressed here as a
-    bounded list of prefixes covering the SR domain's node and transit
-    addresses. A /128 entry expresses a single node address.
+    DEVIATION from 03 §7 (as originally written): the IF-2 message table had
+    no entry for this set, but 03 §3 makes `outer.src ∈ SR_DOMAIN_NODE_SET`
+    the first check of cilium-end-cilium and D-32 makes it the second defence
+    layer against direct injection from a shared underlay. 03 §7 now lists
+    these messages.
 
-    The set is empty until the agent configures it, which is the
-    fail-closed state: every packet reaching the local SID then drops as
-    DROP_UNTRUSTED_SOURCE.
+    D-90: the set is all-or-nothing. It is never changed one prefix at a time;
+    it is replaced as a whole by a staged transaction:
 
-    Idempotent in both directions.
+      srv6_sr_domain_txn_begin    open the staging buffer (empty)
+      srv6_sr_domain_txn_put      stage one prefix of the complete replacement
+      srv6_sr_domain_txn_commit   validate, then make the staged set the
+                                  active one under one worker barrier
+      srv6_sr_domain_txn_abort    drop the staging buffer
 
-      INVALID_VALUE   - prefix length above 128
-      LIMIT_EXCEEDED  - the bounded set is full (16 prefixes)
-      NO_SUCH_ENTRY   - removing a prefix that is not in the set
+    Staging never alters the set the workers read. A successful commit
+    installs the complete replacement in one worker barrier section, so a
+    worker observes the previous complete set or the new complete set and
+    never a mixture. Any failure before a successful commit - a refused put,
+    a refused commit, an abort, an agent that disconnects or crashes - leaves
+    the previously committed set fully in force. A replacement that does not
+    fit the capacity is refused while staging (LIMIT_EXCEEDED) and is never
+    installed; the agent checks the capacity (srv6_sr_domain_status_get)
+    before it begins, and publishes nothing if the authoritative set is
+    larger.
+
+    The set is empty until the first commit, which is the fail-closed state:
+    every packet reaching the local SID then drops as DROP_UNTRUSTED_SOURCE.
+    An empty replacement is a legitimate publication (the synced-empty SR
+    domain of a single-node cluster).
+
+    txn_id is assigned by the agent and is an operation identity, not a
+    sequence number: the plugin recognises the transaction it holds open and
+    the one that committed last (so that a lost commit reply can be retried),
+    and infers nothing else from the value. Only one transaction is open at a
+    time and it belongs to the plugin, not to an API client. An abandoned one
+    is invisible to the dataplane; it is cleared by an exact abort of the
+    txn_id srv6_sr_domain_status_get reports. There is no wildcard abort.
+
+    Rejections (all fail-closed, no state change):
       INIT_FAILED     - plugin not initialised
+      INVALID_VALUE   - txn_id is 0, the reserved "no transaction"
+      INSTANCE_IN_USE - a different transaction is open; abort it first
+      VALUE_EXIST     - txn_id is the transaction that committed last
 
-    @param prefix - prefix to add to or remove from the set
-    @param is_add - add (true) or remove (false)
+    Re-sending begin for the transaction that is already open succeeds and
+    keeps its staging buffer.
+
+    @param txn_id - the agent's operation identity for this publication
 */
-autoendian autoreply define srv6_sr_domain_prefix_add_del
+autoendian autoreply define srv6_sr_domain_txn_begin
 {
   u32 client_index;
   u32 context;
-  vl_api_ip6_prefix_t prefix;
-  bool is_add;
+  u64 txn_id;
 };
 
-/** \brief Dump the SR domain node address set (D-32, 03 §3). */
+/** \brief Stage one prefix of the replacement SR domain node address set
+           (IF-2, D-32, D-90).
+
+    A /128 expresses a single node address. The prefix is stored with its
+    host bits masked off. Staging an identical prefix twice is an idempotent
+    success, so a lost reply is retryable.
+
+    Rejections (all fail-closed; the staging buffer is left as it was and the
+    transaction stays open):
+      INIT_FAILED     - plugin not initialised
+      INVALID_VALUE   - txn_id is 0, or the prefix length is 0 (::/0 would
+                        authorise every source with one put; there is no
+                        wildcard entry, D-90)
+      NO_SUCH_ENTRY   - no transaction is open, or txn_id names a different
+                        transaction than the open one
+      INVALID_VALUE_2 - prefix length above 128
+      LIMIT_EXCEEDED  - the staged set already holds `capacity` prefixes
+                        (srv6_sr_domain_status_get). Nothing is truncated:
+                        the replacement cannot be committed, and the caller
+                        aborts it.
+
+    @param txn_id - the open transaction
+    @param prefix - one prefix of the complete replacement set
+*/
+autoendian autoreply define srv6_sr_domain_txn_put
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+  vl_api_ip6_prefix_t prefix;
+};
+
+/** \brief Install a staged SR domain node address set (IF-2, D-32, D-90).
+
+    The staged set is validated as a whole - it is the open transaction, it
+    holds exactly n_prefixes distinct prefixes, and that fits the capacity -
+    and only then, inside one worker barrier section, does it become the set
+    cilium-end-cilium and the PTB reporter check read. The previous set stops
+    being consulted at the same instant.
+
+    n_prefixes is the number of distinct prefixes the caller staged. A staged
+    set that does not hold that many is not the complete replacement the
+    caller built (a put the caller believes succeeded is missing), so it is
+    not installed.
+
+    Committing closes the transaction. Re-sending commit for the transaction
+    that committed last, with the same n_prefixes, succeeds without changing
+    anything, so a lost reply does not force the caller to rebuild the set.
+
+    Rejections (all fail-closed; the previously committed set stays active and
+    the transaction stays open so it can be aborted):
+      INIT_FAILED     - plugin not initialised
+      INVALID_VALUE   - txn_id is 0
+      NO_SUCH_ENTRY   - no transaction is open and txn_id is not the one that
+                        committed last, or txn_id names a different
+                        transaction than the open one
+      INVALID_VALUE_3 - the staged set does not hold n_prefixes prefixes
+      LIMIT_EXCEEDED  - the staged set does not fit the capacity
+
+    @param txn_id - the transaction to install
+    @param n_prefixes - the number of distinct prefixes the caller staged
+*/
+autoendian autoreply define srv6_sr_domain_txn_commit
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+  u32 n_prefixes;
+};
+
+/** \brief Discard a staged SR domain node address set (IF-2, D-90).
+
+    Leaves the active set exactly as it was. Exact: txn_id must be the open
+    transaction. There is no wildcard form; an agent that does not know the
+    open txn_id reads it with srv6_sr_domain_status_get.
+
+    Rejections:
+      INIT_FAILED     - plugin not initialised
+      INVALID_VALUE   - txn_id is 0
+      NO_SUCH_ENTRY   - no transaction is open, or txn_id names a different
+                        transaction than the open one
+
+    @param txn_id - the transaction to discard
+*/
+autoendian autoreply define srv6_sr_domain_txn_abort
+{
+  u32 client_index;
+  u32 context;
+  u64 txn_id;
+};
+
+/** \brief Read the SR domain node address set capacity and transaction state
+           (IF-2, D-90). Read-only; changes no state.
+*/
+autoendian define srv6_sr_domain_status_get
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief Result of srv6_sr_domain_status_get.
+
+    @param retval - 0 on success, INIT_FAILED before main-loop-enter
+    @param capacity - the bound of the set (`cilium-srv6 {
+           sr-domain-capacity N }`). An authoritative set larger than this is
+           not published (D-90).
+    @param n_prefixes - size of the active set
+    @param open_txn_id - the open transaction, 0 when none is open
+    @param n_staged - prefixes staged in the open transaction
+    @param committed_txn_id - the transaction that committed last, 0 if none
+    @param commits - successful commits since the plugin started
+*/
+autoendian define srv6_sr_domain_status_get_reply
+{
+  u32 context;
+  i32 retval;
+  u32 capacity;
+  u32 n_prefixes;
+  u64 open_txn_id;
+  u32 n_staged;
+  u64 committed_txn_id;
+  u64 commits;
+};
+
+/** \brief Dump the active SR domain node address set (D-32, 03 §3).
+
+    Only the committed set is dumped; a staged replacement is not the set in
+    force (D-90).
+*/
 autoendian define srv6_sr_domain_dump
 {
   u32 client_index;
@@ -798,14 +964,29 @@ enum srv6_program_action : u8
     before any LocalEndpoint is installed, so there is no ordering in which a
     legitimate ADD arrives before its binding.
 
-    A DELETE that carries an attachment_id removes the entry only when the
-    entry was installed for that same attachment, so a delete left over from a
-    previous attachment cannot remove the entry a new one installed. A DELETE
-    with an empty attachment_id is the unverified form, keyed by
-    (sw_if_index, if_incarnation) alone: it exists for the D-70 orphan sweep,
-    which names a lifetime it has just read out of srv6_local_ep_dump under the
-    current plugin instance and has no attachment identity to quote, because
-    srv6_local_ep_details does not carry one.
+    Mutation is exact [決定 (errata #34 項目 202、D-88)]. An ADD is allowed in
+    three states only: nothing is installed on sw_if_index (the entry is
+    installed); exactly the requested semantic tuple is installed (idempotent
+    success: retval 0 and nothing is written - no field, no policy revision
+    slot reference, no classify change); anything else is installed (refused
+    with VALUE_EXIST, nothing is written). There is no implicit replace: an
+    identity change (D-69), an interface lifetime change (D-68) or an
+    attachment change is the writer's exact DELETE of the old entry, its ACK,
+    then the ADD of the new one. The semantic tuple is every field an ADD
+    writes and the key it writes it under: attachment_id, sw_if_index,
+    if_incarnation, identity, ip, local_context_id and owner_quota_class. The
+    binding check above runs first, so an idempotent success also means the
+    binding still holds.
+
+    LocalEndpoint DELETE MUST identify the exact currently installed semantic
+    endpoint instance. An empty attachment_id or wildcard delete MUST be
+    rejected. A DELETE therefore carries the whole semantic tuple of the entry
+    it removes, as srv6_local_ep_dump reports it, and the entry is removed only
+    when every field matches. A DELETE that names an instance which is not
+    installed - nothing is installed, or another attachment's entry is, or a
+    successor of the same attachment with another identity, Context, address
+    or quota class is - removes nothing and answers NO_SUCH_ENTRY: the named
+    instance is absent, which is the D-70 desired state of that DELETE.
 
     Installing an entry also enables cilium-srv6-classify on that interface;
     removing it disables it again. An interface with no entry is therefore
@@ -815,7 +996,9 @@ enum srv6_program_action : u8
     Rejections (all fail-closed, no state change):
       INVALID_SW_IF_INDEX - unknown sw_if_index, or one the guard does not
                             know about yet
-      INVALID_VALUE       - ip is the unspecified address
+      INVALID_VALUE       - ip is the unspecified address; or a DELETE with an
+                            empty attachment_id (the wildcard, refused before
+                            sw_if_index is looked at)
       INVALID_VALUE_2     - if_incarnation does not match the live interface
                             (D-31)
       INVALID_VALUE_3     - ip is link-local; 02 §3 assumes one global
@@ -827,14 +1010,18 @@ enum srv6_program_action : u8
       NO_SUCH_ENTRY       - ADD: the binding table holds no binding for
                             sw_if_index, so no attachment claims this interface
                             (D-68).
-                            DELETE: no entry is installed for this interface,
-                            or the installed entry belongs to a different
-                            attachment - which is the same answer, because the
-                            named attachment has no entry here
+                            DELETE: the exact instance the DELETE names is not
+                            installed - no entry is installed for this
+                            interface, or the installed entry differs in any
+                            field of the semantic tuple (D-88)
       ENTRY_ALREADY_EXISTS - ADD: sw_if_index is bound to a *different*
                             attachment. Nothing is replaced and nothing is
                             installed; the writer withdraws the old binding
                             first (D-68)
+      VALUE_EXIST         - ADD: an entry is installed on sw_if_index and it is
+                            not the requested semantic tuple (D-88). Nothing is
+                            replaced; the writer removes that entry with its
+                            exact DELETE first
       INVALID_INTERFACE   - ADD: the binding for sw_if_index was published for
                             an if_incarnation other than the one on the wire
       UNSPECIFIED         - the classify feature could not be enabled, so the
@@ -844,9 +1031,9 @@ enum srv6_program_action : u8
     @param if_incarnation - incarnation as reported by srv6_acl_dump (D-31)
     @param attachment_id - the CNI attachment identity this entry is for,
            verbatim, exactly as srv6_if_attachment_add_del carries it: same
-           type, same 255-byte bound, same character set. Required on an ADD;
-           on a DELETE it is either the identity the entry was installed for or
-           empty
+           type, same 255-byte bound, same character set. Required on an ADD
+           and on a DELETE (D-88); on a DELETE it is the identity the entry was
+           installed for, as srv6_local_ep_details reports it
     @param identity - the src identity every packet from this interface is
            classified with (02 §3: identity comes from the interface, never
            from the packet's source address)
@@ -856,6 +1043,8 @@ enum srv6_program_action : u8
            conntrack entry's local_context_id in 02 §7.2
     @param owner_quota_class - owner(namespace) quota class (D-42), used by
            the ProgramCache, fragment cache and punt quotas
+    On a DELETE every field above is compared against the installed entry
+    (D-88); none of them is ignored.
 */
 autoendian autoreply define srv6_local_ep_add_del
 {
@@ -885,6 +1074,13 @@ autoendian define srv6_local_ep_dump
     @param policy_revision - the revision currently published for this
            entry's identity (D-30). ~0 means the identity has no revision
            slot, in which case every flow of this endpoint punts.
+    @param attachment_id - the CNI attachment the entry was installed for
+           [決定 (errata #34 項目 202、D-88)]. Every other field of the semantic
+           tuple is already here; this one is what makes the details a
+           complete description of the instance, so that an exact DELETE - the
+           D-70 orphan sweep's included - can name it. Empty only for an entry
+           whose identity the plugin does not hold, which no ADD since item
+           200 can produce and no DELETE can remove.
 */
 autoendian define srv6_local_ep_details
 {
@@ -896,6 +1092,8 @@ autoendian define srv6_local_ep_details
   u32 local_context_id;
   u32 owner_quota_class;
   u64 policy_revision;
+  /* Last, because a variable-length member has to be. */
+  string attachment_id[];
 };
 
 /** \brief Install or remove one immutable PathCache entry (IF-2, 02 §8).

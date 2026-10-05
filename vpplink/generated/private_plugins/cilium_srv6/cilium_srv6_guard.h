@@ -260,6 +260,15 @@ typedef struct
    */
   u32 punt_queue_bytes;
 
+  /*
+   * Capacity of the SR domain node address set (`cilium-srv6 {
+   * sr-domain-capacity N }`, D-90, errata #34 item 205). Read once at
+   * main-loop-enter by cilium-end-cilium, which allocates both buffers of the
+   * set at this size. See CILIUM_SRV6_SR_DOMAIN_CAPACITY_* in
+   * cilium_srv6_srdomain_rules.h for the default and the accepted range.
+   */
+  u32 sr_domain_capacity;
+
   /* coverage accounting */
   u32 n_valid;
   u32 n_uncovered; /* valid interfaces without the guard installed */

@@ -1961,10 +1961,13 @@ cilium_srv6_flow_label (const cilium_srv6_headend_main_t *hm, const ip6_address_
  *
  * attachment_id / id_len is the CNI attachment the entry is for (errata #34
  * item 200). An ADD is accepted only when the D-68 binding table holds exactly
- * that (attachment_id, sw_if_index, if_incarnation); a DELETE that names an
- * attachment removes the entry only when the entry was installed for it, and
- * a DELETE with id_len 0 is the unverified form the D-70 orphan sweep uses.
- * The retvals are listed in cilium_srv6.api.
+ * that (attachment_id, sw_if_index, if_incarnation), and then only where
+ * nothing is installed; where exactly the requested tuple is installed it is
+ * an idempotent success that writes nothing, and where anything else is
+ * installed it is refused (errata #34 item 202, D-88: no implicit replace). A
+ * DELETE removes the entry only when it is the exact instance the DELETE
+ * names, and a DELETE with id_len 0 is refused. The retvals are listed in
+ * cilium_srv6.api.
  */
 int cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *attachment_id,
 				  u32 id_len, u32 identity, const ip6_address_t *ip,

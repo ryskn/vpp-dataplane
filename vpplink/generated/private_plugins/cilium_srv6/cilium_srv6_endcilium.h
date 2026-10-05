@@ -56,35 +56,26 @@
 /*
  * 03 §3 / D-32: the outer source address must belong to the SR domain node
  * set. The design specifies "node/transit address 集合との prefix/集合比較
- * 1 回" but 03 §7 lists no IF-2 message that carries the set, so this
- * plugin defines srv6_sr_domain_prefix_add_del (see the DEVIATION note in
+ * 1 回" but 03 §7 originally listed no IF-2 message that carries the set, so
+ * this plugin defines the srv6_sr_domain_* messages (see the DEVIATION note in
  * cilium_srv6.api).
  *
- * The set is held as pre-masked prefixes and scanned linearly. The bound
- * keeps the per-packet work constant; a deployment expresses the SR domain
- * as the one or two underlay prefixes the node addresses come from, so the
- * common case is a single comparison. An empty set matches nothing, which
- * is the fail-closed state before the agent has configured anything.
+ * D-90 (errata #34 item 205): the set has a configurable bounded capacity
+ * (`sr-domain-capacity` in the `cilium-srv6` startup stanza) and is replaced
+ * only as a whole, by the staged transaction of cilium_srv6_srdomain_rules.h.
+ * The prefix type, the hot path predicate and every transaction decision live
+ * there; this file holds the two buffers and takes the barrier.
+ *
+ * An empty set matches nothing, which is the fail-closed state before the
+ * agent has configured anything.
  */
-#define CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES 16
+#include <cilium_srv6/cilium_srv6_srdomain_rules.h>
 
 /* The bounded parser limits of 01 §3.1 / §3.2 live in
  * cilium_srv6_parse.h, together with the parser itself. */
 
 /* Interval at which the 03 §1.1 readiness monitor process runs. */
 #define CILIUM_SRV6_ENDCILIUM_TICK_INTERVAL 1.0
-
-/*
- * One SR domain prefix, pre-masked for the hot path comparison, in the same
- * form the guard uses for SRV6_BLOCK.
- */
-typedef struct
-{
-  u64 addr[2];
-  u64 mask[2];
-  u8 len;
-  u8 pad[7];
-} cilium_srv6_sr_domain_prefix_t;
 
 /*
  * Buffer metadata handed from cilium-end-cilium to cilium-ep-deliver.
@@ -150,10 +141,12 @@ typedef struct
 {
   /* ---- hot path ---- */
 
-  /* SR domain node address set (03 §3 / D-32). Grown only under the worker
-   * barrier, so a concurrent read of the vector and n_sr_domain is safe. */
-  cilium_srv6_sr_domain_prefix_t *sr_domain;
-  u32 n_sr_domain;
+  /* SR domain node address set (03 §3 / D-32), the active buffer of D-90.
+   * Its pointer and count change only in cilium_srv6_sr_domain_txn_install
+   * under the worker barrier, and its slots are never written while it is
+   * active, so a worker reads either the previous complete set or the next
+   * one. */
+  cilium_srv6_sr_domain_set_t sr_domain;
 
   /*
    * Graph arc from cilium-ep-deliver to the node of each ACTIVE entry's
@@ -185,6 +178,10 @@ typedef struct
   u64 n_delivery_suspends; /* 06 §3 acl_delivery_suspends_total */
   u64 n_localsid_installs;
 
+  /* D-90: the staging buffer and the transaction identities. Control plane
+   * only; no worker reads them. */
+  cilium_srv6_sr_domain_txn_t sr_domain_txn;
+
   u32 process_node_index;
 } cilium_srv6_endcilium_main_t;
 
@@ -194,32 +191,15 @@ extern vlib_node_registration_t cilium_srv6_end_cilium_node;
 extern vlib_node_registration_t cilium_srv6_ep_deliver_node;
 
 /*
- * 03 §3 / D-32: outer SA ∈ SR_DOMAIN_NODE_SET.
- *
- * Bounded linear scan over pre-masked prefixes. An empty set returns 0, so
- * a node that has not been told its SR domain drops every packet that
- * reaches the local SID as DROP_UNTRUSTED_SOURCE.
+ * 03 §3 / D-32: outer SA ∈ SR_DOMAIN_NODE_SET, read from the active buffer
+ * only (D-90). An empty set returns 0, so a node that has not been told its
+ * SR domain drops every packet that reaches the local SID as
+ * DROP_UNTRUSTED_SOURCE.
  */
 static_always_inline int
 cilium_srv6_sr_domain_contains (const cilium_srv6_endcilium_main_t *em, const ip6_address_t *a)
 {
-  u32 i;
-  u32 n = em->n_sr_domain;
-
-  if (PREDICT_FALSE (n > CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES))
-    n = CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES;
-
-  for (i = 0; i < n; i++)
-    {
-      const cilium_srv6_sr_domain_prefix_t *p = em->sr_domain + i;
-      u64 d0 = (a->as_u64[0] ^ p->addr[0]) & p->mask[0];
-      u64 d1 = (a->as_u64[1] ^ p->addr[1]) & p->mask[1];
-
-      if ((d0 | d1) == 0)
-	return 1;
-    }
-
-  return 0;
+  return cilium_srv6_sr_domain_set_contains (&em->sr_domain, a);
 }
 
 /*
@@ -250,7 +230,10 @@ u32 cilium_srv6_delivery_resolve (const dpo_id_t *dpo);
 void cilium_srv6_delivery_set (u32 pool_index, u32 next_index);
 
 /* Control plane entry points (cilium_srv6_endcilium.c). */
-int cilium_srv6_sr_domain_prefix_add_del (const ip6_address_t *prefix, u8 len, u8 is_add);
+int cilium_srv6_sr_domain_publish_begin (u64 txn_id);
+int cilium_srv6_sr_domain_publish_put (u64 txn_id, const ip6_address_t *prefix, u32 len);
+int cilium_srv6_sr_domain_publish_commit (u64 txn_id, u32 n_prefixes);
+int cilium_srv6_sr_domain_publish_abort (u64 txn_id);
 int cilium_srv6_uc_locator_set (u32 table_id, u16 un_node, u16 uc, u8 is_add);
 
 u8 *format_cilium_srv6_sr_domain (u8 *s, va_list *args);

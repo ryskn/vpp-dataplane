@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Cilium Authors
  *
- * Host-side check of the LocalEndpointTable attachment identity rules
- * (cilium_srv6_localep_rules.h) — Issue #21 Stage 0 run 17 OP-17-1,
- * errata #34 item 200.
+ * Host-side check of the LocalEndpointTable attachment identity and exact
+ * mutation rules (cilium_srv6_localep_rules.h) — Issue #21 Stage 0 run 17
+ * OP-17-1, errata #34 items 200 and 202 (D-88).
  *
  * What this file is for
  *
@@ -25,6 +25,14 @@
  *   checked here the way the D-85 fence is checked in ../hotpath and the
  *   classify scope in ../classify-scope: compiled against the byte-level stubs
  *   of ../fuzz/stub, with no vlib, no vnet and no plugin state.
+ *
+ *   Item 202 (D-88) makes the mutation exact. An ADD installs where nothing
+ *   is installed, is an idempotent success where exactly its tuple is
+ *   installed, and is a conflict where anything else is - there is no
+ *   implicit replace. A DELETE must name the exact installed instance
+ *   (attachment, interface lifetime, address, identity, Context, quota
+ *   class), and an empty attachment_id is refused. check_add_is_exact and
+ *   check_delete_is_exact walk every field of the tuple one at a time.
  *
  * What it cannot check
  *
@@ -86,27 +94,103 @@ add (const char *id, u32 if_incarnation, cilium_srv6_localep_binding_t b)
   return cilium_srv6_localep_decide_add ((const u8 *) id, (u32) strlen (id), if_incarnation, b);
 }
 
-static cilium_srv6_localep_entry_t
-installed_for (const char *id)
-{
-  cilium_srv6_localep_entry_t e = { 0 };
-
-  e.present = 1;
-  e.attachment_id = (const u8 *) id;
-  e.id_len = (u32) strlen (id);
-  return e;
-}
-
-static cilium_srv6_localep_verdict_t
-del (const char *id, cilium_srv6_localep_entry_t e)
-{
-  return cilium_srv6_localep_decide_del ((const u8 *) id, (u32) strlen (id), e);
-}
-
 /* The two attachments of run 17, as the binding table held them after the
    restart: the lifecycle service recreated them in the other order. */
 #define ATT_A "c0ffee0000000000000000000000000000000000000000000000000000000001:eth0"
 #define ATT_B "c0ffee0000000000000000000000000000000000000000000000000000000002:eth0"
+
+/*
+ * One semantic tuple (errata #34 item 202, D-88): attachment A's endpoint on
+ * the interface lifetime (8, 9), with one identity, one Context, one quota
+ * class and one address. Every exact-mutation check below starts from it and
+ * changes one field.
+ */
+static cilium_srv6_localep_tuple_t
+tuple_a (void)
+{
+  cilium_srv6_localep_tuple_t t = { 0 };
+
+  t.attachment_id = (const u8 *) ATT_A;
+  t.id_len = (u32) strlen (ATT_A);
+  t.sw_if_index = 8;
+  t.if_incarnation = 9;
+  t.identity = 4242;
+  t.local_context_id = 0x01000abc;
+  t.owner_quota_class = 3;
+  t.ip[0] = 0xfd;
+  t.ip[15] = 0x0a;
+  return t;
+}
+
+static cilium_srv6_localep_entry_t
+installed (cilium_srv6_localep_tuple_t t)
+{
+  cilium_srv6_localep_entry_t e = { 0 };
+
+  e.present = 1;
+  e.tuple = t;
+  return e;
+}
+
+static cilium_srv6_localep_entry_t
+nothing_installed (void)
+{
+  cilium_srv6_localep_entry_t e = { 0 };
+  return e;
+}
+
+static cilium_srv6_localep_verdict_t
+add_exact (cilium_srv6_localep_tuple_t req, cilium_srv6_localep_binding_t b,
+	   cilium_srv6_localep_entry_t e)
+{
+  return cilium_srv6_localep_decide_add_exact (&req, b, e);
+}
+
+static cilium_srv6_localep_verdict_t
+del (cilium_srv6_localep_tuple_t req, cilium_srv6_localep_entry_t e)
+{
+  return cilium_srv6_localep_decide_del (&req, e);
+}
+
+/* The fields of the semantic tuple, in the order mutate() changes them. */
+static const char *const tuple_fields[] = {
+  "attachment_id", "sw_if_index",	"if_incarnation", "identity",
+  "local_context_id", "owner_quota_class", "ip",
+};
+
+#define N_TUPLE_FIELDS (sizeof (tuple_fields) / sizeof (tuple_fields[0]))
+
+/* t with one field changed to another value, and nothing else. */
+static cilium_srv6_localep_tuple_t
+mutate (cilium_srv6_localep_tuple_t t, unsigned field)
+{
+  switch (field)
+    {
+    case 0:
+      t.attachment_id = (const u8 *) ATT_B;
+      t.id_len = (u32) strlen (ATT_B);
+      break;
+    case 1:
+      t.sw_if_index++;
+      break;
+    case 2:
+      t.if_incarnation++;
+      break;
+    case 3:
+      t.identity++;
+      break;
+    case 4:
+      t.local_context_id++;
+      break;
+    case 5:
+      t.owner_quota_class++;
+      break;
+    default:
+      t.ip[15]++;
+      break;
+    }
+  return t;
+}
 
 static void
 check_the_run_17_shape (void)
@@ -221,47 +305,206 @@ check_the_comparison_is_exact (void)
 }
 
 static void
-check_the_delete_identity (void)
+check_add_is_exact (void)
 {
-  /*
-   * The stale DELETE: attachment A's endpoint was installed on a handle that
-   * now carries attachment B's endpoint. Removing it would be A's teardown
-   * deleting B's endpoint, which is the same misdelivery as the ADD, one
-   * direction later.
-   */
-  expect ("a delete from the previous attachment does not remove the new entry",
-	  del (ATT_A, installed_for (ATT_B)),
-	  CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT_ENTRY);
+  cilium_srv6_localep_tuple_t a = tuple_a ();
+  cilium_srv6_localep_binding_t b = bound (ATT_A, 9);
+  char copy[sizeof (ATT_A)];
+  unsigned f;
 
-  /* The ordinary teardown. */
-  expect ("an attachment removes its own entry", del (ATT_A, installed_for (ATT_A)),
+  /* State 1 of D-88: nothing is installed, so the ADD installs. */
+  expect ("an ADD onto an empty interface installs", add_exact (a, b, nothing_installed ()),
 	  CILIUM_SRV6_LOCALEP_ACCEPT);
 
   /*
-   * The unverified form: the D-70 orphan sweep reads a lifetime out of
-   * srv6_local_ep_dump, which does not report an attachment, so it has none to
-   * quote. It is not a way around the check above — a stale writer removes the
-   * entries it *has* an identity for.
+   * State 2: exactly this tuple is installed. The retry of an install whose
+   * ACK was lost, the restart adoption of errata #34 item 217 and the D-72
+   * recovery publication all re-send it, and all three must be a success that
+   * writes nothing - not a refusal, and not a second install.
    */
-  expect ("an empty identity deletes by lifetime alone",
-	  cilium_srv6_localep_decide_del ((const u8 *) "", 0, installed_for (ATT_B)),
-	  CILIUM_SRV6_LOCALEP_ACCEPT);
+  expect ("an exact replay is an idempotent success", add_exact (a, b, installed (a)),
+	  CILIUM_SRV6_LOCALEP_ACCEPT_IDEMPOTENT);
 
-  /* A malformed non-empty identity is not the empty one. */
-  expect ("a malformed identity is refused on a DELETE too", del ("a b", installed_for (ATT_A)),
-	  CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID);
+  /* The comparison is of bytes, not of where they are: the installed identity
+     is the table's own copy, never the API message's buffer. */
+  memcpy (copy, ATT_A, sizeof (copy));
+  {
+    cilium_srv6_localep_tuple_t stored = a;
+
+    stored.attachment_id = (const u8 *) copy;
+    expect ("an exact replay compares the identity's bytes, not its address",
+	    add_exact (a, b, installed (stored)), CILIUM_SRV6_LOCALEP_ACCEPT_IDEMPOTENT);
+  }
 
   /*
-   * An entry that carries no identity at all: the caller answers the absence
-   * with its own NO_SUCH_ENTRY, so the rules do not invent a second answer for
-   * it.
+   * State 3: anything else is installed. One field at a time, so that a field
+   * the comparison forgot shows up by name. The attachment case is the
+   * binding having moved to A while B's entry is still installed: the binding
+   * check passes, and the entry is still not A's to overwrite.
+   */
+  for (f = 0; f < N_TUPLE_FIELDS; f++)
+    {
+      char what[128];
+
+      snprintf (what, sizeof (what),
+		"an ADD over an entry that differs in %s is a conflict, not a replace",
+		tuple_fields[f]);
+      expect (what, add_exact (a, b, installed (mutate (a, f))),
+	      CILIUM_SRV6_LOCALEP_REJECT_CONFLICT);
+    }
+
+  /*
+   * The identity change of D-69, which is the replacement D-88 is about: the
+   * attachment, the interface and the address stay, the identity and the
+   * Context move. It is refused until the old entry has been deleted, and
+   * then it is an ordinary install.
    */
   {
-    cilium_srv6_localep_entry_t none = { 0 };
+    cilium_srv6_localep_tuple_t next = a;
 
-    expect ("a delete against no entry is left to the caller", del (ATT_A, none),
-	    CILIUM_SRV6_LOCALEP_ACCEPT);
+    next.identity = 5151;
+    next.local_context_id = 0x01000abd;
+    expect ("an identity change on top of the old entry is refused",
+	    add_exact (next, b, installed (a)), CILIUM_SRV6_LOCALEP_REJECT_CONFLICT);
+    expect ("the identity change after the old entry's DELETE installs",
+	    add_exact (next, b, nothing_installed ()), CILIUM_SRV6_LOCALEP_ACCEPT);
   }
+
+  /*
+   * An installed entry whose identity the table does not hold equals no
+   * request: the table broke its own invariant (every entry has one since
+   * item 200), and the fail-closed reading is "something else is installed".
+   */
+  {
+    cilium_srv6_localep_tuple_t anonymous = a;
+
+    anonymous.attachment_id = 0;
+    anonymous.id_len = 0;
+    expect ("an entry with no recorded attachment is not an exact match",
+	    add_exact (a, b, installed (anonymous)), CILIUM_SRV6_LOCALEP_REJECT_CONFLICT);
+  }
+
+  /*
+   * The binding check runs first, so a replay is not a way to have an entry
+   * confirmed whose binding has moved: the exact tuple is installed, and the
+   * interface is now bound to B, or to nobody.
+   */
+  expect ("an exact replay whose binding has moved is refused by the binding",
+	  add_exact (a, bound (ATT_B, 9), installed (a)),
+	  CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT);
+  expect ("an exact replay with no binding is refused by the binding",
+	  add_exact (a, unbound (), installed (a)), CILIUM_SRV6_LOCALEP_REJECT_NO_BINDING);
+  expect ("an exact replay against a binding of another lifetime is refused",
+	  add_exact (a, bound (ATT_A, 8), installed (a)),
+	  CILIUM_SRV6_LOCALEP_REJECT_BINDING_INCARNATION);
+
+  /* And the identity is still checked before anything else. */
+  {
+    cilium_srv6_localep_tuple_t unnamed = a;
+
+    unnamed.attachment_id = (const u8 *) "";
+    unnamed.id_len = 0;
+    expect ("an ADD with no attachment is refused before the entry is looked at",
+	    add_exact (unnamed, b, nothing_installed ()), CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID);
+  }
+}
+
+static void
+check_delete_is_exact (void)
+{
+  cilium_srv6_localep_tuple_t a = tuple_a ();
+  unsigned f;
+
+  /* The ordinary teardown: the DELETE names exactly what is installed. */
+  expect ("a DELETE of the exact installed instance removes it", del (a, installed (a)),
+	  CILIUM_SRV6_LOCALEP_ACCEPT);
+
+  /*
+   * D-88: there is no wildcard DELETE. An empty attachment_id is refused
+   * whatever is installed, and by the request check alone, which the plugin
+   * runs before it consults the interface.
+   */
+  {
+    cilium_srv6_localep_tuple_t wildcard = a;
+
+    wildcard.attachment_id = (const u8 *) "";
+    wildcard.id_len = 0;
+    expect ("an empty attachment_id is refused on a DELETE", del (wildcard, installed (a)),
+	    CILIUM_SRV6_LOCALEP_REJECT_ID_EMPTY);
+    expect ("an empty attachment_id is refused with nothing installed too",
+	    del (wildcard, nothing_installed ()), CILIUM_SRV6_LOCALEP_REJECT_ID_EMPTY);
+    expect ("an empty attachment_id is refused by the request check alone",
+	    cilium_srv6_localep_check_del_request (&wildcard), CILIUM_SRV6_LOCALEP_REJECT_ID_EMPTY);
+  }
+
+  /* A malformed non-empty identity is not the empty one. */
+  {
+    cilium_srv6_localep_tuple_t malformed = a;
+
+    malformed.attachment_id = (const u8 *) "a b";
+    malformed.id_len = 3;
+    expect ("a malformed identity is refused on a DELETE", del (malformed, installed (a)),
+	    CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID);
+  }
+
+  /*
+   * The pre-D-88 handle-only DELETE: the key and the attachment, every other
+   * field zero. No entry can have the unspecified address, so the request
+   * names no instance and is refused as malformed rather than answered as an
+   * absence a caller would read as "already gone".
+   */
+  {
+    cilium_srv6_localep_tuple_t handle_only = { 0 };
+
+    handle_only.attachment_id = a.attachment_id;
+    handle_only.id_len = a.id_len;
+    handle_only.sw_if_index = a.sw_if_index;
+    handle_only.if_incarnation = a.if_incarnation;
+    expect ("a handle-only DELETE is refused", del (handle_only, installed (a)),
+	    CILIUM_SRV6_LOCALEP_REJECT_ADDRESS_UNSPECIFIED);
+  }
+
+  expect ("a DELETE with nothing installed is an absence", del (a, nothing_installed ()),
+	  CILIUM_SRV6_LOCALEP_REJECT_NO_ENTRY);
+
+  /*
+   * The stale DELETE with another attachment: A's teardown arrives after the
+   * handle was given to B and B installed on it. Removing B's entry would be
+   * the run-17 swap one direction later.
+   */
+  {
+    cilium_srv6_localep_tuple_t b_entry = mutate (a, 0);
+
+    expect ("a stale DELETE from another attachment does not remove the new entry",
+	    del (a, installed (b_entry)), CILIUM_SRV6_LOCALEP_REJECT_OTHER_INSTANCE);
+  }
+
+  /*
+   * The stale DELETE of the same attachment: the old identity's DELETE arrives
+   * after the D-69 replacement installed the successor. Attachment, handle
+   * and address all match, which is why identity and Context are in the
+   * match: without them this DELETE would remove the successor.
+   */
+  {
+    cilium_srv6_localep_tuple_t successor = a;
+
+    successor.identity = 5151;
+    successor.local_context_id = 0x01000abd;
+    expect ("a stale DELETE of a previous identity does not remove the successor",
+	    del (a, installed (successor)), CILIUM_SRV6_LOCALEP_REJECT_OTHER_INSTANCE);
+  }
+
+  /* Every field, one at a time. */
+  for (f = 0; f < N_TUPLE_FIELDS; f++)
+    {
+      char what[128];
+
+      snprintf (what, sizeof (what),
+		"a DELETE that differs from the installed entry in %s removes nothing",
+		tuple_fields[f]);
+      expect (what, del (mutate (a, f), installed (a)),
+	      CILIUM_SRV6_LOCALEP_REJECT_OTHER_INSTANCE);
+    }
 }
 
 static void
@@ -269,24 +512,32 @@ check_nothing_accepts_by_default (void)
 {
   /*
    * ACCEPT is the zero value of the enum, which is convenient to compare
-   * against and dangerous to reach by accident. Every rejection is therefore
-   * non-zero, and this pins that the four ADD rejections and the DELETE one
-   * are five distinct values: the handler maps each to its own retval and two
-   * that collapsed would make one of them unreportable.
+   * against and dangerous to reach by accident. Every other verdict is
+   * therefore non-zero - ACCEPT_IDEMPOTENT included, which is a success the
+   * caller must recognise by name because it must not write - and every pair
+   * is distinct, so that no verdict can be mistaken for another one.
    */
   int v[] = {
-    CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID,	    CILIUM_SRV6_LOCALEP_REJECT_NO_BINDING,
-    CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT,    CILIUM_SRV6_LOCALEP_REJECT_BINDING_INCARNATION,
-    CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT_ENTRY,
+    CILIUM_SRV6_LOCALEP_ACCEPT_IDEMPOTENT,
+    CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID,
+    CILIUM_SRV6_LOCALEP_REJECT_NO_BINDING,
+    CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT,
+    CILIUM_SRV6_LOCALEP_REJECT_BINDING_INCARNATION,
+    CILIUM_SRV6_LOCALEP_REJECT_CONFLICT,
+    CILIUM_SRV6_LOCALEP_REJECT_ID_EMPTY,
+    CILIUM_SRV6_LOCALEP_REJECT_ADDRESS_UNSPECIFIED,
+    CILIUM_SRV6_LOCALEP_REJECT_NO_ENTRY,
+    CILIUM_SRV6_LOCALEP_REJECT_OTHER_INSTANCE,
   };
   unsigned i, j;
 
   for (i = 0; i < sizeof (v) / sizeof (v[0]); i++)
     {
-      expect ("a rejection is never the accept value", v[i] != CILIUM_SRV6_LOCALEP_ACCEPT, 1);
+      expect ("a verdict other than ACCEPT is never the accept value",
+	      v[i] != CILIUM_SRV6_LOCALEP_ACCEPT, 1);
 
       for (j = i + 1; j < sizeof (v) / sizeof (v[0]); j++)
-	expect ("two rejections are never the same value", v[i] != v[j], 1);
+	expect ("two verdicts are never the same value", v[i] != v[j], 1);
     }
 }
 
@@ -298,7 +549,8 @@ main (void)
   check_the_incarnation_of_the_binding ();
   check_the_identity_is_well_formed ();
   check_the_comparison_is_exact ();
-  check_the_delete_identity ();
+  check_add_is_exact ();
+  check_delete_is_exact ();
   check_nothing_accepts_by_default ();
 
   printf ("\n%d checks, %d failures\n", checks, failures);

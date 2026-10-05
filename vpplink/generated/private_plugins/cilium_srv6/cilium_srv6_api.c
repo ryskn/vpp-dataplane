@@ -447,26 +447,85 @@ vl_api_srv6_uc_locator_set_t_handler (vl_api_srv6_uc_locator_set_t *mp)
   REPLY_MACRO_END (VL_API_SRV6_UC_LOCATOR_SET_REPLY);
 }
 
+/*
+ * D-90 (errata #34 item 205): the SR domain node address set is replaced only
+ * as a whole, through a staged transaction. begin / put / abort touch the
+ * staging buffer only; commit validates it and swaps it in under one worker
+ * barrier. There is no per-prefix add or delete.
+ */
 static void
-vl_api_srv6_sr_domain_prefix_add_del_t_handler (vl_api_srv6_sr_domain_prefix_add_del_t *mp)
+vl_api_srv6_sr_domain_txn_begin_t_handler (vl_api_srv6_sr_domain_txn_begin_t *mp)
 {
-  vl_api_srv6_sr_domain_prefix_add_del_reply_t *rmp;
+  vl_api_srv6_sr_domain_txn_begin_reply_t *rmp;
+  int rv;
+
+  rv = cilium_srv6_sr_domain_publish_begin (mp->txn_id);
+
+  REPLY_MACRO_END (VL_API_SRV6_SR_DOMAIN_TXN_BEGIN_REPLY);
+}
+
+static void
+vl_api_srv6_sr_domain_txn_put_t_handler (vl_api_srv6_sr_domain_txn_put_t *mp)
+{
+  vl_api_srv6_sr_domain_txn_put_reply_t *rmp;
   ip6_address_t prefix;
   int rv;
 
   /* 00 §4.1: validate the declared length before it is used. */
   if (mp->prefix.len > 128)
     {
-      rv = VNET_API_ERROR_INVALID_VALUE;
+      rv = VNET_API_ERROR_INVALID_VALUE_2;
       goto reply;
     }
 
   ip6_address_decode (mp->prefix.address, &prefix);
 
-  rv = cilium_srv6_sr_domain_prefix_add_del (&prefix, mp->prefix.len, mp->is_add ? 1 : 0);
+  rv = cilium_srv6_sr_domain_publish_put (mp->txn_id, &prefix, mp->prefix.len);
 
 reply:
-  REPLY_MACRO_END (VL_API_SRV6_SR_DOMAIN_PREFIX_ADD_DEL_REPLY);
+  REPLY_MACRO_END (VL_API_SRV6_SR_DOMAIN_TXN_PUT_REPLY);
+}
+
+static void
+vl_api_srv6_sr_domain_txn_commit_t_handler (vl_api_srv6_sr_domain_txn_commit_t *mp)
+{
+  vl_api_srv6_sr_domain_txn_commit_reply_t *rmp;
+  int rv;
+
+  rv = cilium_srv6_sr_domain_publish_commit (mp->txn_id, mp->n_prefixes);
+
+  REPLY_MACRO_END (VL_API_SRV6_SR_DOMAIN_TXN_COMMIT_REPLY);
+}
+
+static void
+vl_api_srv6_sr_domain_txn_abort_t_handler (vl_api_srv6_sr_domain_txn_abort_t *mp)
+{
+  vl_api_srv6_sr_domain_txn_abort_reply_t *rmp;
+  int rv;
+
+  rv = cilium_srv6_sr_domain_publish_abort (mp->txn_id);
+
+  REPLY_MACRO_END (VL_API_SRV6_SR_DOMAIN_TXN_ABORT_REPLY);
+}
+
+static void
+vl_api_srv6_sr_domain_status_get_t_handler (vl_api_srv6_sr_domain_status_get_t *mp)
+{
+  cilium_srv6_endcilium_main_t *em = &cilium_srv6_endcilium_main;
+  vl_api_srv6_sr_domain_status_get_reply_t *rmp;
+  int rv = 0;
+
+  if (!em->initialised)
+    rv = VNET_API_ERROR_INIT_FAILED;
+
+  REPLY_MACRO2_END (VL_API_SRV6_SR_DOMAIN_STATUS_GET_REPLY, ({
+		      rmp->capacity = em->sr_domain.capacity;
+		      rmp->n_prefixes = em->sr_domain.n;
+		      rmp->open_txn_id = em->sr_domain_txn.open_txn_id;
+		      rmp->n_staged = em->sr_domain_txn.staged.n;
+		      rmp->committed_txn_id = em->sr_domain_txn.committed_txn_id;
+		      rmp->commits = em->sr_domain_txn.n_commits;
+		    }));
 }
 
 static void
@@ -496,8 +555,9 @@ vl_api_srv6_sr_domain_dump_t_handler (vl_api_srv6_sr_domain_dump_t *mp)
   if (rp == 0 || !em->initialised)
     return;
 
-  for (i = 0; i < em->n_sr_domain; i++)
-    send_srv6_sr_domain_details (em->sr_domain + i, rp, mp->context);
+  /* The active set only: a staged replacement is not the set in force. */
+  for (i = 0; i < em->sr_domain.n && i < em->sr_domain.capacity; i++)
+    send_srv6_sr_domain_details (em->sr_domain.prefixes + i, rp, mp->context);
 }
 
 static void
@@ -519,7 +579,7 @@ vl_api_srv6_endcilium_status_get_t_handler (vl_api_srv6_endcilium_status_get_t *
 		      rmp->uc = em->uc;
 		      ip6_address_encode (&em->localsid, rmp->localsid);
 		      rmp->localsid_prefix_len = CILIUM_SRV6_LOCALSID_PREFIX_LEN;
-		      rmp->n_sr_domain_prefixes = em->n_sr_domain;
+		      rmp->n_sr_domain_prefixes = em->sr_domain.n;
 		      rmp->delivery_suspends = em->n_delivery_suspends;
 		      rmp->localsid_installs = em->n_localsid_installs;
 		    }));
@@ -605,16 +665,29 @@ vl_api_srv6_local_ep_add_del_t_handler (vl_api_srv6_local_ep_add_del_t *mp)
   u32 id_len = 0;
   int rv;
 
+  /*
+   * Item 202 (D-88): there is no wildcard DELETE. A DELETE with an empty
+   * attachment_id is refused before anything else is looked at - in
+   * particular before the sw_if_index check below, so that it is never
+   * answered with INVALID_SW_IF_INDEX, which a caller normalizes into "the
+   * entry is already gone" (D-70). cilium_srv6_local_ep_add_del refuses it
+   * again for any other caller.
+   */
+  if (!mp->is_add && vl_api_string_len (&mp->attachment_id) == 0)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto reply;
+    }
+
   VALIDATE_SW_IF_INDEX_END (mp);
 
   /*
-   * Item 200: an ADD names the CNI attachment the entry is for. A DELETE may
-   * leave it empty, which is the unverified form the D-70 orphan sweep uses -
-   * that caller reads the lifetime out of srv6_local_ep_dump, which does not
-   * report an attachment. Everything else is decoded with the binding table's
-   * own bounds, and a malformed identity is INVALID_VALUE_4 rather than the
-   * INVALID_VALUE this message already gives to an unspecified endpoint
-   * address.
+   * Item 200: an ADD names the CNI attachment the entry is for, and since
+   * item 202 a DELETE names the attachment of the exact instance it removes.
+   * The identity is decoded with the binding table's own bounds, and a
+   * malformed one is INVALID_VALUE_4 rather than the INVALID_VALUE this
+   * message already gives to an unspecified endpoint address and to a
+   * DELETE with no attachment.
    */
   if (mp->is_add || vl_api_string_len (&mp->attachment_id) != 0)
     {
@@ -642,8 +715,13 @@ send_srv6_local_ep_details (u32 sw_if_index, const cilium_srv6_local_ep_t *e,
 {
   const cilium_srv6_headend_main_t *hm = &cilium_srv6_headend_main;
   vl_api_srv6_local_ep_details_t *rmp;
+  /* The attachment the entry was installed for (errata #34 item 202). It is
+     what an exact DELETE of this entry has to quote, so the dump reports it;
+     an entry that has none reports an empty string. */
+  const u8 *attachment = cilium_srv6_local_ep_attachment (sw_if_index);
+  u32 id_len = vec_len (attachment);
 
-  REPLY_MACRO_DETAILS4_END (VL_API_SRV6_LOCAL_EP_DETAILS, rp, context, ({
+  REPLY_MACRO_DETAILS5_END (VL_API_SRV6_LOCAL_EP_DETAILS, id_len, rp, context, ({
 			      rmp->sw_if_index = sw_if_index;
 			      rmp->if_incarnation = e->if_incarnation;
 			      rmp->identity = e->identity;
@@ -652,6 +730,7 @@ send_srv6_local_ep_details (u32 sw_if_index, const cilium_srv6_local_ep_t *e,
 			      rmp->owner_quota_class = e->owner_quota_class;
 			      rmp->policy_revision =
 				cilium_srv6_policy_revision (hm, e->policy_rev_slot);
+			      vl_api_vec_to_api_string (attachment, &rmp->attachment_id);
 			    }));
 }
 

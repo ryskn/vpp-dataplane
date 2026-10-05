@@ -25,6 +25,7 @@
 #include <vnet/ip/format.h>
 
 #include <cilium_srv6/cilium_srv6_guard.h>
+#include <cilium_srv6/cilium_srv6_srdomain_rules.h>
 /* cilium_srv6_headend_classify_refresh(): accepting a classification is what
    decides whether the interface is on the 02 §1 headend path (item 191). */
 #include <cilium_srv6/cilium_srv6_headend.h>
@@ -722,6 +723,7 @@ cilium_srv6_config (vlib_main_t *vm, unformat_input_t *input)
   u8 *path = 0;
   u32 block_len;
   u32 bytes;
+  u32 capacity;
   f64 v;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -781,6 +783,20 @@ cilium_srv6_config (vlib_main_t *vm, unformat_input_t *input)
 				      (u32) CILIUM_SRV6_IF3_QUEUE_BYTES_MIN,
 				      (u32) CILIUM_SRV6_IF3_QUEUE_BYTES_MAX);
 	  cm->punt_queue_bytes = bytes;
+	}
+      /*
+       * D-90 (errata #34 item 205): the bound of the SR domain node address
+       * set. An authoritative set larger than this is not published at all
+       * (the agent reports the SR domain not ready), so the value is a
+       * deployment size limit, not a truncation point. It is bounded above
+       * because the hot path scans the published prefixes linearly.
+       */
+      else if (unformat (input, "sr-domain-capacity %u", &capacity))
+	{
+	  if (capacity < 1 || capacity > CILIUM_SRV6_SR_DOMAIN_CAPACITY_MAX)
+	    return clib_error_return (0, "sr-domain-capacity must be between 1 and %u",
+				      (u32) CILIUM_SRV6_SR_DOMAIN_CAPACITY_MAX);
+	  cm->sr_domain_capacity = capacity;
 	}
       else
 	return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
@@ -874,6 +890,8 @@ cilium_srv6_guard_init (vlib_main_t *vm)
   /* `00` §2.18.7. There is deliberately no default for `punt_socket_path`:
      see the note on the field. */
   cm->punt_queue_bytes = CILIUM_SRV6_IF3_QUEUE_BYTES_DEFAULT;
+  /* D-90: see the note on the field. */
+  cm->sr_domain_capacity = CILIUM_SRV6_SR_DOMAIN_CAPACITY_DEFAULT;
 
   /*
    * D-35: arm the dead-man switch from init. Until the agent has sent its

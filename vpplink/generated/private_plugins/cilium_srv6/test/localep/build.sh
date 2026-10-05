@@ -9,8 +9,10 @@
 # own — no VPP tree, no CMake, no vlib — against the byte-level stubs of
 # ../fuzz/stub, and checks the rule srv6_local_ep_add_del applies to the CNI
 # attachment identity: an ADD is accepted only when the D-68 binding table
-# binds that attachment to that interface lifetime, and a DELETE that names an
-# attachment removes only that attachment's entry.
+# binds that attachment to that interface lifetime - and, since errata #34
+# item 202 (D-88), only where nothing is installed or exactly its tuple is
+# (idempotent), never over another entry - and a DELETE removes only the exact
+# installed instance it names, never by an empty attachment_id.
 #
 # policyrev_slot_test — the POLICY revision key ownership rules (Issue #21
 # Stage 0 run 21 OP-21-2, errata #34 item 222). Same stubs, compiling
@@ -72,9 +74,10 @@ cmd_build () {
 
 cmd_check () {
   cmd_build
-  info "running localep_rules_test against the D-68 / item 200 acceptance rules"
+  info "running localep_rules_test against the D-68 / item 200 acceptance rules and the D-88 / item 202 exact mutation rules"
   "$OUT/localep_rules_test" || fail "localep_rules_test failed"
   info "an endpoint is installed on the interface its own attachment is bound to, or on none"
+  info "an ADD never replaces an entry, and a DELETE removes only the exact instance it names"
   info "running policyrev_slot_test against the D-83 / item 222 ownership rules"
   "$OUT/policyrev_slot_test" || fail "policyrev_slot_test failed"
   info "a published POLICY key outlives every entry that happens to name it"

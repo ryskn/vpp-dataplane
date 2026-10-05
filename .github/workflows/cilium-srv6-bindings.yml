@@ -1,0 +1,74 @@
+name: cilium_srv6 bindings match the vendored snapshot
+
+# Regenerates the Go bindings of the vendored cilium_srv6 plugin
+# (vpplink/generated/bindings/cilium_srv6) from its .api with
+# `make gen-cilium-srv6-binapi` and fails, uploading the regenerated files as
+# an artifact, when the committed bindings differ. Bindings are generated in
+# CI rather than on a developer machine; the artifact is what gets committed.
+#
+# Runs on the dedicated self-hosted builder. This repository is public: there
+# is no pull_request trigger, only pushes to trusted branches and
+# workflow_dispatch, and external contributors' workflow runs need approval.
+
+on:
+  push:
+    branches:
+      - 'ci/**'
+      - 'feat/**'
+      - 'srv6/**'
+      - 'dev/**'
+    paths:
+      - 'vpplink/generated/private_plugins/**'
+      - 'vpplink/generated/bindings/cilium_srv6/**'
+      - '.github/workflows/cilium-srv6-bindings.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bindings:
+    runs-on: [self-hosted, linux, x64, srv6ec-vpp-builder]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Fetch vppapigen and the imported .api files from the pinned VPP base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "import ply" 2>/dev/null || { sudo apt-get update; sudo apt-get install -y --no-install-recommends python3-ply; }
+          base="$(sed -n 's/^BASE="${BASE:-"\([0-9a-f]*\)"}"/\1/p' vpplink/generated/vpp_clone_current.sh)"
+          test -n "$base"
+          rm -rf vpp-upstream
+          git init -q vpp-upstream
+          git -C vpp-upstream remote add origin https://github.com/FDio/vpp.git
+          git -C vpp-upstream fetch --depth 1 origin "$base"
+          git -C vpp-upstream checkout -q FETCH_HEAD -- src/tools/vppapigen src/vnet src/vlibmemory src/vpp/api
+      - name: Regenerate and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          make gen-cilium-srv6-binapi CILIUM_SRV6_VPP_SRC="${GITHUB_WORKSPACE}/vpp-upstream/src"
+          if ! git diff --exit-code --stat -- vpplink/generated/bindings/cilium_srv6; then
+            echo "the cilium_srv6 bindings are stale against the vendored .api; the regenerated files are in the artifact" >&2
+            exit 1
+          fi
+      - name: Upload the regenerated bindings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cilium-srv6-bindings-regenerated
+          path: vpplink/generated/bindings/cilium_srv6/
+          retention-days: 30

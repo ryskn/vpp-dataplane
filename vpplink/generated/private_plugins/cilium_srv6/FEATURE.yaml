@@ -23,6 +23,14 @@ features:
     bounded outer / SRH / inner header parsing that requires Segments Left
     to be zero before decapsulating, and inner destination equality against
     the Context's endpoint address"
+  - "SR domain node address set (D-32, D-90): a configurable bounded capacity
+    (`cilium-srv6 { sr-domain-capacity N }`) and atomic set replacement only.
+    srv6_sr_domain_txn_begin / put / commit / abort stage the complete
+    replacement in a second preallocated buffer and swap it in under one
+    worker barrier, so that cilium-end-cilium and the PTB reporter check only
+    ever read a complete committed set; a replacement above the capacity is
+    refused, never truncated, and any failure before commit leaves the
+    previous set in force"
   - "cilium-ep-deliver: versioned handle re-check, a hook for the node-local
     connection tracker, and transmission through the Context's forwarding
     object without a lookup of the inner destination"

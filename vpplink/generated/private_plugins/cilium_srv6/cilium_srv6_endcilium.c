@@ -7,7 +7,8 @@
  * Responsibilities of this file:
  *
  *   - the SR domain node address set consulted by cilium-end-cilium
- *     (03 §3 / D-32),
+ *     (03 §3 / D-32), replaced only as a whole by a staged transaction
+ *     (D-90, cilium_srv6_srdomain_rules.h),
  *   - the Block:uN_B:uC::/64 End.Cilium local SID: a plugin DPO type bound
  *     to a single /64 FIB entry, installed once at start up and independent
  *     of the number of Pods (03 §1, D-10),
@@ -75,102 +76,116 @@ cilium_srv6_ct_register (cilium_srv6_ct_create_fn fn)
 /* SR domain node address set (03 §3 / D-32)                           */
 /* ------------------------------------------------------------------ */
 
-static void
-cse_prefix_mask (cilium_srv6_sr_domain_prefix_t *p, const ip6_address_t *a, u8 len)
-{
-  int i;
-
-  p->len = len;
-
-  for (i = 0; i < 2; i++)
-    {
-      u32 bits = 0;
-
-      if (len > (u32) (i * 64))
-	{
-	  bits = (u32) len - (u32) (i * 64);
-	  if (bits > 64)
-	    bits = 64;
-	}
-
-      p->mask[i] = bits ? clib_host_to_net_u64 (~(u64) 0 << (64 - bits)) : 0;
-      p->addr[i] = a->as_u64[i] & p->mask[i];
-    }
-}
-
-static int
-cse_prefix_find (const cilium_srv6_endcilium_main_t *em, const ip6_address_t *a, u8 len)
-{
-  cilium_srv6_sr_domain_prefix_t probe;
-  u32 i;
-
-  clib_memset (&probe, 0, sizeof (probe));
-  cse_prefix_mask (&probe, a, len);
-
-  for (i = 0; i < em->n_sr_domain; i++)
-    {
-      const cilium_srv6_sr_domain_prefix_t *p = em->sr_domain + i;
-
-      if (p->len == len && p->addr[0] == probe.addr[0] && p->addr[1] == probe.addr[1])
-	return (int) i;
-    }
-
-  return -1;
-}
-
 /*
- * srv6_sr_domain_prefix_add_del. Idempotent; every rejection is
- * side-effect free (D-27 / 00 §4.1).
+ * D-90 (errata #34 item 205): the set is replaced only as a whole. Every
+ * decision is made by cilium_srv6_srdomain_rules.h; this file maps the
+ * verdicts to API errors and takes the worker barrier around the one call
+ * that changes what the workers read.
  */
+static int
+cse_sr_domain_verdict_to_api_error (cilium_srv6_sr_domain_verdict_t v)
+{
+  switch (v)
+    {
+    case CILIUM_SRV6_SR_DOMAIN_OK:
+    case CILIUM_SRV6_SR_DOMAIN_OK_REPLAY:
+      return 0;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_TXN_ZERO:
+      return VNET_API_ERROR_INVALID_VALUE;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_BUSY:
+      return VNET_API_ERROR_INSTANCE_IN_USE;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_TXN_REUSED:
+      return VNET_API_ERROR_VALUE_EXIST;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_NO_TXN:
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_PREFIX:
+      return VNET_API_ERROR_INVALID_VALUE_2;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_WILDCARD:
+      return VNET_API_ERROR_INVALID_VALUE;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_CAPACITY:
+      return VNET_API_ERROR_LIMIT_EXCEEDED;
+    case CILIUM_SRV6_SR_DOMAIN_REJECT_COUNT:
+      return VNET_API_ERROR_INVALID_VALUE_3;
+    }
+
+  /* An unknown verdict is a refusal. */
+  return VNET_API_ERROR_INVALID_VALUE;
+}
+
+/* srv6_sr_domain_txn_begin. Touches the staging buffer only. */
 int
-cilium_srv6_sr_domain_prefix_add_del (const ip6_address_t *prefix, u8 len, u8 is_add)
+cilium_srv6_sr_domain_publish_begin (u64 txn_id)
 {
   cilium_srv6_endcilium_main_t *em = &cilium_srv6_endcilium_main;
-  vlib_main_t *vm = vlib_get_main ();
-  int index;
-  int taken;
-
-  if (prefix == NULL || len > 128)
-    return VNET_API_ERROR_INVALID_VALUE;
 
   if (!em->initialised)
     return VNET_API_ERROR_INIT_FAILED;
 
-  index = cse_prefix_find (em, prefix, len);
+  return cse_sr_domain_verdict_to_api_error (
+    cilium_srv6_sr_domain_txn_begin (&em->sr_domain_txn, txn_id));
+}
 
-  if (!is_add)
-    {
-      if (index < 0)
-	return VNET_API_ERROR_NO_SUCH_ENTRY;
+/* srv6_sr_domain_txn_put. Touches the staging buffer only. */
+int
+cilium_srv6_sr_domain_publish_put (u64 txn_id, const ip6_address_t *prefix, u32 len)
+{
+  cilium_srv6_endcilium_main_t *em = &cilium_srv6_endcilium_main;
 
-      taken = cilium_srv6_barrier_acquire (vm);
-      /* Order matters for a lock-free reader: shrink the visible count
-       * first, then compact, so that no packet ever reads a slot that is
-       * being rewritten. */
-      em->n_sr_domain--;
-      CLIB_MEMORY_STORE_BARRIER ();
-      if ((u32) index < em->n_sr_domain)
-	em->sr_domain[index] = em->sr_domain[em->n_sr_domain];
-      clib_memset (em->sr_domain + em->n_sr_domain, 0, sizeof (em->sr_domain[0]));
-      cilium_srv6_barrier_release (vm, taken);
+  if (prefix == NULL)
+    return VNET_API_ERROR_INVALID_VALUE_2;
 
-      return 0;
-    }
+  if (!em->initialised)
+    return VNET_API_ERROR_INIT_FAILED;
 
-  if (index >= 0)
-    return 0; /* idempotent */
+  return cse_sr_domain_verdict_to_api_error (
+    cilium_srv6_sr_domain_txn_put (&em->sr_domain_txn, txn_id, prefix, len));
+}
 
-  if (em->n_sr_domain >= CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES)
-    return VNET_API_ERROR_LIMIT_EXCEEDED;
+/*
+ * srv6_sr_domain_txn_commit. The staged set is validated as a whole first;
+ * only then, inside one worker barrier section, does it become the active
+ * set. A refused commit changes nothing and leaves the transaction open.
+ */
+int
+cilium_srv6_sr_domain_publish_commit (u64 txn_id, u32 n_prefixes)
+{
+  cilium_srv6_endcilium_main_t *em = &cilium_srv6_endcilium_main;
+  vlib_main_t *vm = vlib_get_main ();
+  cilium_srv6_sr_domain_verdict_t v;
+  u32 previous;
+  int taken;
+
+  if (!em->initialised)
+    return VNET_API_ERROR_INIT_FAILED;
+
+  v = cilium_srv6_sr_domain_txn_commit_check (&em->sr_domain_txn, &em->sr_domain, txn_id,
+					      n_prefixes);
+  if (v != CILIUM_SRV6_SR_DOMAIN_OK)
+    return cse_sr_domain_verdict_to_api_error (v);
+
+  previous = em->sr_domain.n;
 
   taken = cilium_srv6_barrier_acquire (vm);
-  /* Fill the slot before it becomes visible. */
-  cse_prefix_mask (em->sr_domain + em->n_sr_domain, prefix, len);
-  CLIB_MEMORY_STORE_BARRIER ();
-  em->n_sr_domain++;
+  cilium_srv6_sr_domain_txn_install (&em->sr_domain_txn, &em->sr_domain);
   cilium_srv6_barrier_release (vm, taken);
 
+  CSE_LOG_NOTICE ("SR domain node address set replaced: %u -> %u prefixes (capacity %u)",
+		  previous, em->sr_domain.n, em->sr_domain.capacity);
+
   return 0;
+}
+
+/* srv6_sr_domain_txn_abort. Touches the staging buffer only. */
+int
+cilium_srv6_sr_domain_publish_abort (u64 txn_id)
+{
+  cilium_srv6_endcilium_main_t *em = &cilium_srv6_endcilium_main;
+
+  if (!em->initialised)
+    return VNET_API_ERROR_INIT_FAILED;
+
+  return cse_sr_domain_verdict_to_api_error (
+    cilium_srv6_sr_domain_txn_abort (&em->sr_domain_txn, txn_id));
 }
 
 u8 *
@@ -573,11 +588,10 @@ cilium_srv6_endcilium_init (vlib_main_t *vm)
 
   em->process_node_index = cilium_srv6_endcilium_process_node.index;
 
-  /* 03 §9: no hot path allocation. The SR domain set is bounded and the
-   * whole vector exists from init. */
-  vec_validate_aligned (em->sr_domain, CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES - 1,
-			CLIB_CACHE_LINE_BYTES);
-  em->n_sr_domain = 0;
+  /* The SR domain buffers are sized from the startup configuration
+   * (D-90), so they are allocated at main-loop-enter. Until then both sets
+   * have no slots, the hot path predicate matches nothing, and the API
+   * refuses every transaction with INIT_FAILED. */
 
   return 0;
 }
@@ -597,6 +611,9 @@ cilium_srv6_endcilium_main_loop_enter (vlib_main_t *vm)
   cilium_srv6_endcilium_main_t *em = &cilium_srv6_endcilium_main;
   const cilium_srv6_context_main_t *cxm = &cilium_srv6_context_main;
   u32 capacity = cxm->active_capacity ? cxm->active_capacity : CILIUM_SRV6_ACTIVE_CAPACITY_DEFAULT;
+  u32 sr_capacity = cilium_srv6_main.sr_domain_capacity;
+  cilium_srv6_sr_domain_prefix_t *active = 0;
+  cilium_srv6_sr_domain_prefix_t *staged = 0;
   u32 i;
 
   if (em->initialised)
@@ -606,11 +623,35 @@ cilium_srv6_endcilium_main_loop_enter (vlib_main_t *vm)
   for (i = 0; i < vec_len (em->delivery_next); i++)
     em->delivery_next[i] = ~0;
 
+  /*
+   * D-90: both buffers of the SR domain set exist from here on, at the
+   * configured capacity, and are never reallocated (03 §9: no hot path
+   * allocation). The configuration parser bounds the value; an out-of-range
+   * value here can only mean the stanza was never parsed, so it falls back to
+   * the default rather than allocating something unbounded.
+   */
+  if (sr_capacity < 1 || sr_capacity > CILIUM_SRV6_SR_DOMAIN_CAPACITY_MAX)
+    sr_capacity = CILIUM_SRV6_SR_DOMAIN_CAPACITY_DEFAULT;
+
+  vec_validate_aligned (active, sr_capacity - 1, CLIB_CACHE_LINE_BYTES);
+  vec_validate_aligned (staged, sr_capacity - 1, CLIB_CACHE_LINE_BYTES);
+
+  em->sr_domain.prefixes = active;
+  em->sr_domain.n = 0;
+  em->sr_domain.capacity = sr_capacity;
+
+  em->sr_domain_txn.staged.prefixes = staged;
+  em->sr_domain_txn.staged.n = 0;
+  em->sr_domain_txn.staged.capacity = sr_capacity;
+  em->sr_domain_txn.open_txn_id = 0;
+  em->sr_domain_txn.committed_txn_id = 0;
+  em->sr_domain_txn.n_commits = 0;
+
   em->initialised = 1;
 
   CSE_LOG_NOTICE ("End.Cilium ready: delivery arc table for %u pool indices, "
-		  "SR domain set bounded at %u prefixes",
-		  capacity, (u32) CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES);
+		  "SR domain set capacity %u prefixes (D-90)",
+		  capacity, sr_capacity);
 
   return 0;
 }

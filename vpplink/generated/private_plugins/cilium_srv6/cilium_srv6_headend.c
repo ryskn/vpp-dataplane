@@ -2723,28 +2723,54 @@ cilium_srv6_headend_classify_refresh (u32 sw_if_index)
 }
 
 /*
- * The CNI attachment identity an installed entry was installed for, as the
- * rules header wants to see it (errata #34 item 200).
+ * The semantic tuple of one srv6_local_ep_add_del request, as the rules header
+ * compares it (errata #34 item 202, D-88). The identity is borrowed from the
+ * API message, which outlives this call.
+ */
+static cilium_srv6_localep_tuple_t
+csh_local_ep_request_tuple (u32 sw_if_index, u32 if_incarnation, const u8 *attachment_id,
+			    u32 id_len, u32 identity, const ip6_address_t *ip,
+			    u32 local_context_id, u32 owner_quota_class)
+{
+  cilium_srv6_localep_tuple_t t = { 0 };
+
+  t.attachment_id = attachment_id;
+  t.id_len = id_len;
+  t.sw_if_index = sw_if_index;
+  t.if_incarnation = if_incarnation;
+  t.identity = identity;
+  t.local_context_id = local_context_id;
+  t.owner_quota_class = owner_quota_class;
+  if (ip != NULL)
+    clib_memcpy_fast (t.ip, ip->as_u8, sizeof (t.ip));
+  return t;
+}
+
+/*
+ * The entry installed on sw_if_index, with the CNI attachment identity it was
+ * installed for, as the rules header compares it (errata #34 items 200 and
+ * 202). `present` follows the entry alone: an entry whose identity is missing
+ * is still an entry, and it is reported with an empty identity so that it
+ * equals no request rather than looking absent.
  */
 static cilium_srv6_localep_entry_t
-csh_local_ep_attachment_obs (const cilium_srv6_headend_main_t *hm, u32 sw_if_index)
+csh_local_ep_entry_obs (const cilium_srv6_headend_main_t *hm, u32 sw_if_index)
 {
   cilium_srv6_localep_entry_t obs = { 0 };
-  const u8 *id;
+  const cilium_srv6_local_ep_t *e;
+  const u8 *id = 0;
 
   if (sw_if_index >= vec_len (hm->local_eps) || !hm->local_eps[sw_if_index].valid)
     return obs;
 
-  if (sw_if_index >= vec_len (hm->local_ep_attachments))
-    return obs;
-
-  id = hm->local_ep_attachments[sw_if_index];
-  if (id == 0)
-    return obs;
+  e = hm->local_eps + sw_if_index;
+  if (sw_if_index < vec_len (hm->local_ep_attachments))
+    id = hm->local_ep_attachments[sw_if_index];
 
   obs.present = 1;
-  obs.attachment_id = id;
-  obs.id_len = vec_len (id);
+  obs.tuple = csh_local_ep_request_tuple (sw_if_index, e->if_incarnation, id, vec_len (id),
+					  e->identity, &e->ip, e->local_context_id,
+					  e->owner_quota_class);
   return obs;
 }
 
@@ -2791,6 +2817,7 @@ csh_local_ep_verdict_to_api_error (cilium_srv6_localep_verdict_t v)
   switch (v)
     {
     case CILIUM_SRV6_LOCALEP_ACCEPT:
+    case CILIUM_SRV6_LOCALEP_ACCEPT_IDEMPOTENT:
       return 0;
     case CILIUM_SRV6_LOCALEP_REJECT_ID_INVALID:
       return VNET_API_ERROR_INVALID_VALUE_4;
@@ -2800,10 +2827,24 @@ csh_local_ep_verdict_to_api_error (cilium_srv6_localep_verdict_t v)
       return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
     case CILIUM_SRV6_LOCALEP_REJECT_BINDING_INCARNATION:
       return VNET_API_ERROR_INVALID_INTERFACE;
-    /* The attachment that is installed here is another one, so this
-       attachment has no entry on this interface: an absence, reported the
-       same way an absent entry is. */
-    case CILIUM_SRV6_LOCALEP_REJECT_OTHER_ATTACHMENT_ENTRY:
+    /* D-88: an entry is installed and it is not the requested tuple. Not
+       ENTRY_ALREADY_EXISTS, which this message already answers "the interface
+       is bound to another attachment" with: the two refusals need different
+       actions from the writer (re-resolve the attachment, against remove the
+       installed entry first), so they get different retvals. */
+    case CILIUM_SRV6_LOCALEP_REJECT_CONFLICT:
+      return VNET_API_ERROR_VALUE_EXIST;
+    /* D-88: a DELETE that does not name an installed instance at all - no
+       attachment, or the unspecified address - is a malformed request. */
+    case CILIUM_SRV6_LOCALEP_REJECT_ID_EMPTY:
+    case CILIUM_SRV6_LOCALEP_REJECT_ADDRESS_UNSPECIFIED:
+      return VNET_API_ERROR_INVALID_VALUE;
+    /* The instance the DELETE names is not installed here: either nothing is,
+       or something else is. Both are the absence of the named instance, which
+       is what NO_SUCH_ENTRY reports and what D-70 normalizes as the desired
+       state. */
+    case CILIUM_SRV6_LOCALEP_REJECT_NO_ENTRY:
+    case CILIUM_SRV6_LOCALEP_REJECT_OTHER_INSTANCE:
       return VNET_API_ERROR_NO_SUCH_ENTRY;
     }
 
@@ -2821,6 +2862,7 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
   vnet_main_t *vnm = vnet_get_main ();
   const cilium_srv6_if_binding_t *binding;
   cilium_srv6_localep_binding_t binding_obs = { 0 };
+  cilium_srv6_localep_tuple_t req;
   cilium_srv6_localep_verdict_t verdict;
   cilium_srv6_local_ep_t *e;
   u32 slot;
@@ -2830,6 +2872,22 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
 
   if (!hm->initialised)
     return VNET_API_ERROR_INIT_FAILED;
+
+  req = csh_local_ep_request_tuple (sw_if_index, if_incarnation, attachment_id, id_len, identity,
+				    ip, local_context_id, owner_quota_class);
+
+  /*
+   * D-88: a DELETE that does not name an installed instance - an empty
+   * attachment_id, the wildcard - is refused as what it is before the
+   * interface is consulted, so that it can never be answered with an interface
+   * error a caller might normalize into "already gone".
+   */
+  if (!is_add)
+    {
+      verdict = cilium_srv6_localep_check_del_request (&req);
+      if (verdict != CILIUM_SRV6_LOCALEP_ACCEPT)
+	return csh_local_ep_verdict_to_api_error (verdict);
+    }
 
   if (vnet_get_sw_interface_or_null (vnm, sw_if_index) == NULL)
     return VNET_API_ERROR_INVALID_SW_IF_INDEX;
@@ -2848,26 +2906,21 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
 
   if (!is_add)
     {
-      if (sw_if_index >= vec_len (hm->local_eps) || !hm->local_eps[sw_if_index].valid)
-	return VNET_API_ERROR_NO_SUCH_ENTRY;
-
       /*
-       * Item 200: a delete that names an attachment removes the entry only if
-       * the entry was installed for that attachment, so a delete left over
-       * from a previous attachment cannot remove the one a new attachment
-       * installed. An empty identity is the unverified form the D-70 orphan
-       * sweep uses; see cilium_srv6_localep_rules.h for why that is not a way
-       * around this check.
+       * D-88 (errata #34 item 202): the entry is removed only if it is the exact
+       * instance the DELETE names - attachment, interface lifetime, address,
+       * identity, Context and quota class. A DELETE left over from a previous
+       * attachment, or from a previous identity of this one, therefore cannot
+       * remove the successor that is installed now.
        */
-      verdict = cilium_srv6_localep_decide_del (attachment_id, id_len,
-						csh_local_ep_attachment_obs (hm, sw_if_index));
+      verdict = cilium_srv6_localep_decide_del (&req, csh_local_ep_entry_obs (hm, sw_if_index));
+      if (verdict == CILIUM_SRV6_LOCALEP_REJECT_OTHER_INSTANCE)
+	CSH_LOG_ERR ("refusing to remove the local endpoint on sw_if_index %u: the "
+		     "installed entry is not the instance the delete names (errata #34 "
+		     "item 202)",
+		     sw_if_index);
       if (verdict != CILIUM_SRV6_LOCALEP_ACCEPT)
-	{
-	  CSH_LOG_ERR ("refusing to remove the local endpoint on sw_if_index %u: it was "
-		       "installed for a different CNI attachment (errata #34 item 200)",
-		       sw_if_index);
-	  return csh_local_ep_verdict_to_api_error (verdict);
-	}
+	return csh_local_ep_verdict_to_api_error (verdict);
 
       taken = cilium_srv6_barrier_acquire (vm);
 
@@ -2916,8 +2969,14 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
    * attachments swapped sw_if_index slots across a VPP restart and both stale
    * handles were live.
    *
-   * The binding is read before the barrier is taken, with nothing mutated
-   * either way: a rejection here leaves the table exactly as it was.
+   * Item 202 (D-88): an ADD installs where nothing is installed, is an
+   * idempotent success where exactly this tuple is installed, and is refused
+   * where anything else is. There is no implicit replace: a replacement is the
+   * writer's exact DELETE, its ACK, then this ADD.
+   *
+   * The binding and the entry are read before the barrier is taken, with
+   * nothing mutated either way: a rejection here, and an idempotent success,
+   * leave the table exactly as it was.
    */
   binding = cilium_srv6_ifbind_by_sw_if_index (sw_if_index);
   if (binding != 0)
@@ -2928,7 +2987,18 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
       binding_obs.if_incarnation = binding->if_incarnation;
     }
 
-  verdict = cilium_srv6_localep_decide_add (attachment_id, id_len, if_incarnation, binding_obs);
+  verdict = cilium_srv6_localep_decide_add_exact (&req, binding_obs,
+						  csh_local_ep_entry_obs (hm, sw_if_index));
+  if (verdict == CILIUM_SRV6_LOCALEP_ACCEPT_IDEMPOTENT)
+    return 0;
+  if (verdict == CILIUM_SRV6_LOCALEP_REJECT_CONFLICT)
+    {
+      CSH_LOG_ERR ("refusing to install a local endpoint on sw_if_index %u "
+		   "(incarnation %u): a different entry is installed there and an ADD "
+		   "does not replace it (errata #34 item 202)",
+		   sw_if_index, if_incarnation);
+      return csh_local_ep_verdict_to_api_error (verdict);
+    }
   if (verdict != CILIUM_SRV6_LOCALEP_ACCEPT)
     {
       CSH_LOG_ERR ("refusing to install a local endpoint on sw_if_index %u "
@@ -2944,21 +3014,26 @@ cilium_srv6_local_ep_add_del (u32 sw_if_index, u32 if_incarnation, const u8 *att
   e = hm->local_eps + sw_if_index;
 
   /*
-   * errata #34 item 222: the new reference is taken before the old one is
-   * given back, so a re-install of the same identity never takes its slot
-   * through zero. Doing it the other way round made the D-72 replay of the
-   * only entry of an identity release the slot — with the revision the agent
-   * had already published into it — and recreate it at revision 0.
-   *
-   * The publication's own reference makes that ordering redundant for a
-   * published identity; it is kept because the slot of an identity that is
-   * not published yet (the LocalEndpointTable entry arriving before the seed,
-   * which is exactly the run-21 order) has no such protection.
+   * ACCEPT means nothing is installed here; the verdict was taken on the main
+   * thread, which is the only thread that writes this table, so nothing can
+   * have been installed since. Checked anyway, because the alternative to
+   * refusing is overwriting a live entry - the one thing D-88 forbids.
+   */
+  if (PREDICT_FALSE (e->valid))
+    {
+      cilium_srv6_barrier_release (vm, taken);
+      return VNET_API_ERROR_VALUE_EXIST;
+    }
+
+  /*
+   * errata #34 item 222 is kept by construction: an ADD never replaces an
+   * entry, so no reference is ever given back here, and the replay that used
+   * to take the slot of the only entry of an identity through zero (the D-72
+   * replay of run 21) is now the idempotent success above, which touches no
+   * reference at all. A replacement goes through DELETE, which returns the
+   * old identity's reference, and then this ADD, which takes the new one.
    */
   slot = csh_policy_rev_slot_ref (hm, identity);
-
-  if (e->valid)
-    csh_policy_rev_slot_unref (hm, e->policy_rev_slot);
 
   e->if_incarnation = if_incarnation;
   e->identity = identity;

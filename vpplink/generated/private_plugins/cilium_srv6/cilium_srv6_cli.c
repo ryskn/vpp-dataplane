@@ -448,12 +448,18 @@ cilium_srv6_show_endcilium_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   cilium_srv6_ct_create_hook ? "registered" : "not registered (skipped)");
   vlib_cli_output (vm, "");
 
-  vlib_cli_output (vm, "SR domain node set  : %u/%u prefix%s%s", em->n_sr_domain,
-		   (u32) CILIUM_SRV6_SR_DOMAIN_MAX_PREFIXES, em->n_sr_domain == 1 ? "" : "es",
-		   em->n_sr_domain == 0 ? " — every packet drops as DROP_UNTRUSTED_SOURCE" : "");
+  vlib_cli_output (vm, "SR domain node set  : %u/%u prefix%s%s", em->sr_domain.n,
+		   em->sr_domain.capacity, em->sr_domain.n == 1 ? "" : "es",
+		   em->sr_domain.n == 0 ? " — every packet drops as DROP_UNTRUSTED_SOURCE" : "");
+  vlib_cli_output (vm,
+		   "  transaction       : %s0x%llx (%u staged), last commit 0x%llx, %llu commit%s",
+		   em->sr_domain_txn.open_txn_id ? "OPEN " : "none ",
+		   em->sr_domain_txn.open_txn_id, em->sr_domain_txn.staged.n,
+		   em->sr_domain_txn.committed_txn_id, em->sr_domain_txn.n_commits,
+		   em->sr_domain_txn.n_commits == 1 ? "" : "s");
 
-  for (i = 0; i < em->n_sr_domain; i++)
-    vlib_cli_output (vm, "  %U", format_cilium_srv6_sr_domain, em->sr_domain + i);
+  for (i = 0; i < em->sr_domain.n && i < em->sr_domain.capacity; i++)
+    vlib_cli_output (vm, "  %U", format_cilium_srv6_sr_domain, em->sr_domain.prefixes + i);
 
   return 0;
 }
@@ -464,53 +470,13 @@ VLIB_CLI_COMMAND (cilium_srv6_show_endcilium_command, static) = {
   .function = cilium_srv6_show_endcilium_command_fn,
 };
 
-static clib_error_t *
-cilium_srv6_set_sr_domain_command_fn (vlib_main_t *vm, unformat_input_t *input,
-				      vlib_cli_command_t *cmd)
-{
-  unformat_input_t _line_input, *line_input = &_line_input;
-  clib_error_t *error = 0;
-  ip6_address_t prefix;
-  u32 len = ~0;
-  u8 is_add = 1;
-  int rv;
-
-  if (!unformat_user (input, unformat_line_input, line_input))
-    return clib_error_return (0, "expected a prefix");
-
-  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
-    {
-      if (unformat (line_input, "%U/%u", unformat_ip6_address, &prefix, &len))
-	;
-      else if (unformat (line_input, "del"))
-	is_add = 0;
-      else
-	{
-	  error = clib_error_return (0, "unknown input `%U'", format_unformat_error, line_input);
-	  goto done;
-	}
-    }
-
-  if (len == (u32) ~0 || len > 128)
-    {
-      error = clib_error_return (0, "expected <prefix>/<len>");
-      goto done;
-    }
-
-  rv = cilium_srv6_sr_domain_prefix_add_del (&prefix, (u8) len, is_add);
-  if (rv)
-    error = clib_error_return (0, "rejected (%d)", rv);
-
-done:
-  unformat_free (line_input);
-  return error;
-}
-
-VLIB_CLI_COMMAND (cilium_srv6_set_sr_domain_command, static) = {
-  .path = "set cilium srv6 sr-domain",
-  .short_help = "set cilium srv6 sr-domain <prefix>/<len> [del]",
-  .function = cilium_srv6_set_sr_domain_command_fn,
-};
+/*
+ * There is no `set cilium srv6 sr-domain` command (D-90, errata #34 item 205).
+ * The set is the Stage 2 source authority of cilium-end-cilium and is
+ * replaced only as a whole, from the D-63 node inventory, by the agent's
+ * srv6_sr_domain_txn_* transaction. A per-prefix add or delete from the CLI
+ * would be a second writer that publishes a set no authority stated.
+ */
 
 static clib_error_t *
 cilium_srv6_set_uc_locator_command_fn (vlib_main_t *vm, unformat_input_t *input,
