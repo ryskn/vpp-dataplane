@@ -51,11 +51,14 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_OWNER: ${{ github.repository_owner }}
+  # The image carries the cilium_srv6 plugin built from the private canonical
+  # repository, so it is pushed to the test bed's private registry on the
+  # builder, never to this public repository's packages. The Stage 0 node
+  # pulls the VPP image from that registry.
+  REGISTRY: 192.168.1.19:5000
+  IMAGE_OWNER: calicovpp
   # Checkout of the canonical Cilium repository, needed by both snapshot gates.
   # It is private, so it is read with a read-only deploy key of that
   # repository (secret CILIUM_PRIVATE_DEPLOY_KEY); the workflow's own
@@ -160,14 +163,6 @@ jobs:
           make -C vpp-manager vpp-image "TAG=${IMAGE_TAG}"
           docker image ls | grep calicovpp/vpp
 
-      - name: Log in to ghcr.io
-        if: ${{ inputs.push == null || inputs.push }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Push under the immutable tag
         if: ${{ inputs.push == null || inputs.push }}
         id: push
@@ -175,7 +170,7 @@ jobs:
           IMAGE_TAG: ${{ needs.snapshot-gate.outputs.image_tag }}
         run: |
           set -euo pipefail
-          repo="${REGISTRY}/${IMAGE_OWNER}/calicovpp/vpp"
+          repo="${REGISTRY}/${IMAGE_OWNER}/vpp"
           docker tag "calicovpp/vpp:${IMAGE_TAG}"     "${repo}:${IMAGE_TAG}"
           docker tag "calicovpp/vpp:dbg-${IMAGE_TAG}" "${repo}:dbg-${IMAGE_TAG}"
           docker push "${repo}:${IMAGE_TAG}"

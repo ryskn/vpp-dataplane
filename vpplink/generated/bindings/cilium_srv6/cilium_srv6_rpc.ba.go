@@ -49,7 +49,11 @@ type RPCService interface {
 	Srv6ProgramAddDel(ctx context.Context, in *Srv6ProgramAddDel) (*Srv6ProgramAddDelReply, error)
 	Srv6ProgramDump(ctx context.Context, in *Srv6ProgramDump) (RPCService_Srv6ProgramDumpClient, error)
 	Srv6SrDomainDump(ctx context.Context, in *Srv6SrDomainDump) (RPCService_Srv6SrDomainDumpClient, error)
-	Srv6SrDomainPrefixAddDel(ctx context.Context, in *Srv6SrDomainPrefixAddDel) (*Srv6SrDomainPrefixAddDelReply, error)
+	Srv6SrDomainStatusGet(ctx context.Context, in *Srv6SrDomainStatusGet) (*Srv6SrDomainStatusGetReply, error)
+	Srv6SrDomainTxnAbort(ctx context.Context, in *Srv6SrDomainTxnAbort) (*Srv6SrDomainTxnAbortReply, error)
+	Srv6SrDomainTxnBegin(ctx context.Context, in *Srv6SrDomainTxnBegin) (*Srv6SrDomainTxnBeginReply, error)
+	Srv6SrDomainTxnCommit(ctx context.Context, in *Srv6SrDomainTxnCommit) (*Srv6SrDomainTxnCommitReply, error)
+	Srv6SrDomainTxnPut(ctx context.Context, in *Srv6SrDomainTxnPut) (*Srv6SrDomainTxnPutReply, error)
 	Srv6UcLocatorSet(ctx context.Context, in *Srv6UcLocatorSet) (*Srv6UcLocatorSetReply, error)
 }
 
@@ -725,8 +729,44 @@ func (c *serviceClient_Srv6SrDomainDumpClient) Recv() (*Srv6SrDomainDetails, err
 	}
 }
 
-func (c *serviceClient) Srv6SrDomainPrefixAddDel(ctx context.Context, in *Srv6SrDomainPrefixAddDel) (*Srv6SrDomainPrefixAddDelReply, error) {
-	out := new(Srv6SrDomainPrefixAddDelReply)
+func (c *serviceClient) Srv6SrDomainStatusGet(ctx context.Context, in *Srv6SrDomainStatusGet) (*Srv6SrDomainStatusGetReply, error) {
+	out := new(Srv6SrDomainStatusGetReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) Srv6SrDomainTxnAbort(ctx context.Context, in *Srv6SrDomainTxnAbort) (*Srv6SrDomainTxnAbortReply, error) {
+	out := new(Srv6SrDomainTxnAbortReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) Srv6SrDomainTxnBegin(ctx context.Context, in *Srv6SrDomainTxnBegin) (*Srv6SrDomainTxnBeginReply, error) {
+	out := new(Srv6SrDomainTxnBeginReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) Srv6SrDomainTxnCommit(ctx context.Context, in *Srv6SrDomainTxnCommit) (*Srv6SrDomainTxnCommitReply, error) {
+	out := new(Srv6SrDomainTxnCommitReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) Srv6SrDomainTxnPut(ctx context.Context, in *Srv6SrDomainTxnPut) (*Srv6SrDomainTxnPutReply, error) {
+	out := new(Srv6SrDomainTxnPutReply)
 	err := c.conn.Invoke(ctx, in, out)
 	if err != nil {
 		return nil, err

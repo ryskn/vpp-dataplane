@@ -5,7 +5,7 @@
 // Contents:
 // -  6 enums
 // -  3 structs
-// - 76 messages
+// - 84 messages
 package cilium_srv6
 
 import (
@@ -26,7 +26,7 @@ const _ = api.GoVppAPIPackageIsVersion2
 const (
 	APIFile    = "cilium_srv6"
 	APIVersion = "1.9.0"
-	VersionCrc = 0x79736e70
+	VersionCrc = 0x154cbd5b
 )
 
 // Srv6ACLTrust defines enum 'srv6_acl_trust'.
@@ -3597,14 +3597,28 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	write is refused when the two disagree. D-72 reconstructs the binding table
 //	before any LocalEndpoint is installed, so there is no ordering in which a
 //	legitimate ADD arrives before its binding.
-//	A DELETE that carries an attachment_id removes the entry only when the
-//	entry was installed for that same attachment, so a delete left over from a
-//	previous attachment cannot remove the entry a new one installed. A DELETE
-//	with an empty attachment_id is the unverified form, keyed by
-//	(sw_if_index, if_incarnation) alone: it exists for the D-70 orphan sweep,
-//	which names a lifetime it has just read out of srv6_local_ep_dump under the
-//	current plugin instance and has no attachment identity to quote, because
-//	srv6_local_ep_details does not carry one.
+//	Mutation is exact [決定 (errata #34 項目 202、D-88)]. An ADD is allowed in
+//	three states only: nothing is installed on sw_if_index (the entry is
+//	installed); exactly the requested semantic tuple is installed (idempotent
+//	success: retval 0 and nothing is written - no field, no policy revision
+//	slot reference, no classify change); anything else is installed (refused
+//	with VALUE_EXIST, nothing is written). There is no implicit replace: an
+//	identity change (D-69), an interface lifetime change (D-68) or an
+//	attachment change is the writer's exact DELETE of the old entry, its ACK,
+//	then the ADD of the new one. The semantic tuple is every field an ADD
+//	writes and the key it writes it under: attachment_id, sw_if_index,
+//	if_incarnation, identity, ip, local_context_id and owner_quota_class. The
+//	binding check above runs first, so an idempotent success also means the
+//	binding still holds.
+//	LocalEndpoint DELETE MUST identify the exact currently installed semantic
+//	endpoint instance. An empty attachment_id or wildcard delete MUST be
+//	rejected. A DELETE therefore carries the whole semantic tuple of the entry
+//	it removes, as srv6_local_ep_dump reports it, and the entry is removed only
+//	when every field matches. A DELETE that names an instance which is not
+//	installed - nothing is installed, or another attachment's entry is, or a
+//	successor of the same attachment with another identity, Context, address
+//	or quota class is - removes nothing and answers NO_SUCH_ENTRY: the named
+//	instance is absent, which is the D-70 desired state of that DELETE.
 //	Installing an entry also enables cilium-srv6-classify on that interface;
 //	removing it disables it again. An interface with no entry is therefore
 //	not part of the headend graph at all, which is why 02 §1 starts the chain
@@ -3612,7 +3626,9 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	Rejections (all fail-closed, no state change):
 //	  INVALID_SW_IF_INDEX - unknown sw_if_index, or one the guard does not
 //	                        know about yet
-//	  INVALID_VALUE       - ip is the unspecified address
+//	  INVALID_VALUE       - ip is the unspecified address; or a DELETE with an
+//	                        empty attachment_id (the wildcard, refused before
+//	                        sw_if_index is looked at)
 //	  INVALID_VALUE_2     - if_incarnation does not match the live interface
 //	                        (D-31)
 //	  INVALID_VALUE_3     - ip is link-local; 02 §3 assumes one global
@@ -3624,14 +3640,18 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	  NO_SUCH_ENTRY       - ADD: the binding table holds no binding for
 //	                        sw_if_index, so no attachment claims this interface
 //	                        (D-68).
-//	                        DELETE: no entry is installed for this interface,
-//	                        or the installed entry belongs to a different
-//	                        attachment - which is the same answer, because the
-//	                        named attachment has no entry here
+//	                        DELETE: the exact instance the DELETE names is not
+//	                        installed - no entry is installed for this
+//	                        interface, or the installed entry differs in any
+//	                        field of the semantic tuple (D-88)
 //	  ENTRY_ALREADY_EXISTS - ADD: sw_if_index is bound to a *different*
 //	                        attachment. Nothing is replaced and nothing is
 //	                        installed; the writer withdraws the old binding
 //	                        first (D-68)
+//	  VALUE_EXIST         - ADD: an entry is installed on sw_if_index and it is
+//	                        not the requested semantic tuple (D-88). Nothing is
+//	                        replaced; the writer removes that entry with its
+//	                        exact DELETE first
 //	  INVALID_INTERFACE   - ADD: the binding for sw_if_index was published for
 //	                        an if_incarnation other than the one on the wire
 //	  UNSPECIFIED         - the classify feature could not be enabled, so the
@@ -3640,9 +3660,9 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	- if_incarnation - incarnation as reported by srv6_acl_dump (D-31)
 //	- attachment_id - the CNI attachment identity this entry is for,
 //	       verbatim, exactly as srv6_if_attachment_add_del carries it: same
-//	       type, same 255-byte bound, same character set. Required on an ADD;
-//	       on a DELETE it is either the identity the entry was installed for or
-//	       empty
+//	       type, same 255-byte bound, same character set. Required on an ADD
+//	       and on a DELETE (D-88); on a DELETE it is the identity the entry was
+//	       installed for, as srv6_local_ep_details reports it
 //	- identity - the src identity every packet from this interface is
 //	       classified with (02 §3: identity comes from the interface, never
 //	       from the packet's source address)
@@ -3652,6 +3672,8 @@ func (m *Srv6LeaseExtendReply) Unmarshal(b []byte) error {
 //	       conntrack entry's local_context_id in 02 §7.2
 //	- owner_quota_class - owner(namespace) quota class (D-42), used by
 //	       the ProgramCache, fragment cache and punt quotas
+//	On a DELETE every field above is compared against the installed entry
+//	(D-88); none of them is ignored.
 //
 // Srv6LocalEpAddDel defines message 'srv6_local_ep_add_del'.
 type Srv6LocalEpAddDel struct {
@@ -3751,6 +3773,13 @@ func (m *Srv6LocalEpAddDelReply) Unmarshal(b []byte) error {
 //   - policy_revision - the revision currently published for this
 //     entry's identity (D-30). ~0 means the identity has no revision
 //     slot, in which case every flow of this endpoint punts.
+//   - attachment_id - the CNI attachment the entry was installed for
+//     [決定 (errata #34 項目 202、D-88)]. Every other field of the semantic
+//     tuple is already here; this one is what makes the details a
+//     complete description of the instance, so that an exact DELETE - the
+//     D-70 orphan sweep's included - can name it. Empty only for an entry
+//     whose identity the plugin does not hold, which no ADD since item
+//     200 can produce and no DELETE can remove.
 //
 // Srv6LocalEpDetails defines message 'srv6_local_ep_details'.
 type Srv6LocalEpDetails struct {
@@ -3761,11 +3790,12 @@ type Srv6LocalEpDetails struct {
 	LocalContextID  uint32                         `binapi:"u32,name=local_context_id" json:"local_context_id,omitempty"`
 	OwnerQuotaClass uint32                         `binapi:"u32,name=owner_quota_class" json:"owner_quota_class,omitempty"`
 	PolicyRevision  uint64                         `binapi:"u64,name=policy_revision" json:"policy_revision,omitempty"`
+	AttachmentID    string                         `binapi:"string[],name=attachment_id" json:"attachment_id,omitempty"`
 }
 
 func (m *Srv6LocalEpDetails) Reset()               { *m = Srv6LocalEpDetails{} }
 func (*Srv6LocalEpDetails) GetMessageName() string { return "srv6_local_ep_details" }
-func (*Srv6LocalEpDetails) GetCrcString() string   { return "4f128cbb" }
+func (*Srv6LocalEpDetails) GetCrcString() string   { return "e5a179a5" }
 func (*Srv6LocalEpDetails) GetMessageType() api.MessageType {
 	return api.ReplyMessage
 }
@@ -3774,13 +3804,14 @@ func (m *Srv6LocalEpDetails) Size() (size int) {
 	if m == nil {
 		return 0
 	}
-	size += 4      // m.SwIfIndex
-	size += 4      // m.IfIncarnation
-	size += 4      // m.Identity
-	size += 1 * 16 // m.IP
-	size += 4      // m.LocalContextID
-	size += 4      // m.OwnerQuotaClass
-	size += 8      // m.PolicyRevision
+	size += 4                       // m.SwIfIndex
+	size += 4                       // m.IfIncarnation
+	size += 4                       // m.Identity
+	size += 1 * 16                  // m.IP
+	size += 4                       // m.LocalContextID
+	size += 4                       // m.OwnerQuotaClass
+	size += 8                       // m.PolicyRevision
+	size += 4 + len(m.AttachmentID) // m.AttachmentID
 	return size
 }
 func (m *Srv6LocalEpDetails) Marshal(b []byte) ([]byte, error) {
@@ -3795,6 +3826,7 @@ func (m *Srv6LocalEpDetails) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeUint32(m.LocalContextID)
 	buf.EncodeUint32(m.OwnerQuotaClass)
 	buf.EncodeUint64(m.PolicyRevision)
+	buf.EncodeString(m.AttachmentID, 0)
 	return buf.Bytes(), nil
 }
 func (m *Srv6LocalEpDetails) Unmarshal(b []byte) error {
@@ -3806,6 +3838,7 @@ func (m *Srv6LocalEpDetails) Unmarshal(b []byte) error {
 	m.LocalContextID = buf.DecodeUint32()
 	m.OwnerQuotaClass = buf.DecodeUint32()
 	m.PolicyRevision = buf.DecodeUint64()
+	m.AttachmentID = buf.DecodeString(0)
 	return nil
 }
 
@@ -5256,7 +5289,11 @@ func (m *Srv6SrDomainDetails) Unmarshal(b []byte) error {
 	return nil
 }
 
-// Dump the SR domain node address set (D-32, 03 §3).
+// Dump the active SR domain node address set (D-32, 03 §3).
+//
+//	Only the committed set is dumped; a staged replacement is not the set in
+//	force (D-90).
+//
 // Srv6SrDomainDump defines message 'srv6_sr_domain_dump'.
 type Srv6SrDomainDump struct{}
 
@@ -5284,89 +5321,170 @@ func (m *Srv6SrDomainDump) Unmarshal(b []byte) error {
 	return nil
 }
 
-// Add or remove one prefix of the SR domain node address set
+// Read the SR domain node address set capacity and transaction state
 //
-//	       (IF-2, D-32, 03 §3).
-//	DEVIATION from 03 §7: the IF-2 message table has no entry for this set,
-//	but 03 §3 makes `outer.src ∈ SR_DOMAIN_NODE_SET` the first check of
-//	cilium-end-cilium and D-32 makes it the second defence layer against
-//	direct injection from a shared underlay. Without a way to configure the
-//	set the check can only ever fail, so the set is expressed here as a
-//	bounded list of prefixes covering the SR domain's node and transit
-//	addresses. A /128 entry expresses a single node address.
-//	The set is empty until the agent configures it, which is the
-//	fail-closed state: every packet reaching the local SID then drops as
-//	DROP_UNTRUSTED_SOURCE.
-//	Idempotent in both directions.
-//	  INVALID_VALUE   - prefix length above 128
-//	  LIMIT_EXCEEDED  - the bounded set is full (16 prefixes)
-//	  NO_SUCH_ENTRY   - removing a prefix that is not in the set
-//	  INIT_FAILED     - plugin not initialised
-//	- prefix - prefix to add to or remove from the set
-//	- is_add - add (true) or remove (false)
+//	(IF-2, D-90). Read-only; changes no state.
 //
-// Srv6SrDomainPrefixAddDel defines message 'srv6_sr_domain_prefix_add_del'.
-type Srv6SrDomainPrefixAddDel struct {
-	Prefix ip_types.IP6Prefix `binapi:"ip6_prefix,name=prefix" json:"prefix,omitempty"`
-	IsAdd  bool               `binapi:"bool,name=is_add" json:"is_add,omitempty"`
-}
+// Srv6SrDomainStatusGet defines message 'srv6_sr_domain_status_get'.
+type Srv6SrDomainStatusGet struct{}
 
-func (m *Srv6SrDomainPrefixAddDel) Reset()               { *m = Srv6SrDomainPrefixAddDel{} }
-func (*Srv6SrDomainPrefixAddDel) GetMessageName() string { return "srv6_sr_domain_prefix_add_del" }
-func (*Srv6SrDomainPrefixAddDel) GetCrcString() string   { return "7259da77" }
-func (*Srv6SrDomainPrefixAddDel) GetMessageType() api.MessageType {
+func (m *Srv6SrDomainStatusGet) Reset()               { *m = Srv6SrDomainStatusGet{} }
+func (*Srv6SrDomainStatusGet) GetMessageName() string { return "srv6_sr_domain_status_get" }
+func (*Srv6SrDomainStatusGet) GetCrcString() string   { return "51077d14" }
+func (*Srv6SrDomainStatusGet) GetMessageType() api.MessageType {
 	return api.RequestMessage
 }
 
-func (m *Srv6SrDomainPrefixAddDel) Size() (size int) {
+func (m *Srv6SrDomainStatusGet) Size() (size int) {
 	if m == nil {
 		return 0
 	}
-	size += 1 * 16 // m.Prefix.Address
-	size += 1      // m.Prefix.Len
-	size += 1      // m.IsAdd
 	return size
 }
-func (m *Srv6SrDomainPrefixAddDel) Marshal(b []byte) ([]byte, error) {
+func (m *Srv6SrDomainStatusGet) Marshal(b []byte) ([]byte, error) {
 	if b == nil {
 		b = make([]byte, m.Size())
 	}
 	buf := codec.NewBuffer(b)
-	buf.EncodeBytes(m.Prefix.Address[:], 16)
-	buf.EncodeUint8(m.Prefix.Len)
-	buf.EncodeBool(m.IsAdd)
 	return buf.Bytes(), nil
 }
-func (m *Srv6SrDomainPrefixAddDel) Unmarshal(b []byte) error {
-	buf := codec.NewBuffer(b)
-	copy(m.Prefix.Address[:], buf.DecodeBytes(16))
-	m.Prefix.Len = buf.DecodeUint8()
-	m.IsAdd = buf.DecodeBool()
+func (m *Srv6SrDomainStatusGet) Unmarshal(b []byte) error {
 	return nil
 }
 
-// Srv6SrDomainPrefixAddDelReply defines message 'srv6_sr_domain_prefix_add_del_reply'.
-type Srv6SrDomainPrefixAddDelReply struct {
-	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+// Result of srv6_sr_domain_status_get.
+//   - retval - 0 on success, INIT_FAILED before main-loop-enter
+//   - capacity - the bound of the set (`cilium-srv6 {
+//     sr-domain-capacity N }`). An authoritative set larger than this is
+//     not published (D-90).
+//   - n_prefixes - size of the active set
+//   - open_txn_id - the open transaction, 0 when none is open
+//   - n_staged - prefixes staged in the open transaction
+//   - committed_txn_id - the transaction that committed last, 0 if none
+//   - commits - successful commits since the plugin started
+//
+// Srv6SrDomainStatusGetReply defines message 'srv6_sr_domain_status_get_reply'.
+type Srv6SrDomainStatusGetReply struct {
+	Retval         int32  `binapi:"i32,name=retval" json:"retval,omitempty"`
+	Capacity       uint32 `binapi:"u32,name=capacity" json:"capacity,omitempty"`
+	NPrefixes      uint32 `binapi:"u32,name=n_prefixes" json:"n_prefixes,omitempty"`
+	OpenTxnID      uint64 `binapi:"u64,name=open_txn_id" json:"open_txn_id,omitempty"`
+	NStaged        uint32 `binapi:"u32,name=n_staged" json:"n_staged,omitempty"`
+	CommittedTxnID uint64 `binapi:"u64,name=committed_txn_id" json:"committed_txn_id,omitempty"`
+	Commits        uint64 `binapi:"u64,name=commits" json:"commits,omitempty"`
 }
 
-func (m *Srv6SrDomainPrefixAddDelReply) Reset() { *m = Srv6SrDomainPrefixAddDelReply{} }
-func (*Srv6SrDomainPrefixAddDelReply) GetMessageName() string {
-	return "srv6_sr_domain_prefix_add_del_reply"
-}
-func (*Srv6SrDomainPrefixAddDelReply) GetCrcString() string { return "e8d4e804" }
-func (*Srv6SrDomainPrefixAddDelReply) GetMessageType() api.MessageType {
+func (m *Srv6SrDomainStatusGetReply) Reset()               { *m = Srv6SrDomainStatusGetReply{} }
+func (*Srv6SrDomainStatusGetReply) GetMessageName() string { return "srv6_sr_domain_status_get_reply" }
+func (*Srv6SrDomainStatusGetReply) GetCrcString() string   { return "a5ba6566" }
+func (*Srv6SrDomainStatusGetReply) GetMessageType() api.MessageType {
 	return api.ReplyMessage
 }
 
-func (m *Srv6SrDomainPrefixAddDelReply) Size() (size int) {
+func (m *Srv6SrDomainStatusGetReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	size += 4 // m.Capacity
+	size += 4 // m.NPrefixes
+	size += 8 // m.OpenTxnID
+	size += 4 // m.NStaged
+	size += 8 // m.CommittedTxnID
+	size += 8 // m.Commits
+	return size
+}
+func (m *Srv6SrDomainStatusGetReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	buf.EncodeUint32(m.Capacity)
+	buf.EncodeUint32(m.NPrefixes)
+	buf.EncodeUint64(m.OpenTxnID)
+	buf.EncodeUint32(m.NStaged)
+	buf.EncodeUint64(m.CommittedTxnID)
+	buf.EncodeUint64(m.Commits)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainStatusGetReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
+	m.Capacity = buf.DecodeUint32()
+	m.NPrefixes = buf.DecodeUint32()
+	m.OpenTxnID = buf.DecodeUint64()
+	m.NStaged = buf.DecodeUint32()
+	m.CommittedTxnID = buf.DecodeUint64()
+	m.Commits = buf.DecodeUint64()
+	return nil
+}
+
+// Discard a staged SR domain node address set (IF-2, D-90).
+//
+//	Leaves the active set exactly as it was. Exact: txn_id must be the open
+//	transaction. There is no wildcard form; an agent that does not know the
+//	open txn_id reads it with srv6_sr_domain_status_get.
+//	Rejections:
+//	  INIT_FAILED     - plugin not initialised
+//	  INVALID_VALUE   - txn_id is 0
+//	  NO_SUCH_ENTRY   - no transaction is open, or txn_id names a different
+//	                    transaction than the open one
+//	- txn_id - the transaction to discard
+//
+// Srv6SrDomainTxnAbort defines message 'srv6_sr_domain_txn_abort'.
+type Srv6SrDomainTxnAbort struct {
+	TxnID uint64 `binapi:"u64,name=txn_id" json:"txn_id,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnAbort) Reset()               { *m = Srv6SrDomainTxnAbort{} }
+func (*Srv6SrDomainTxnAbort) GetMessageName() string { return "srv6_sr_domain_txn_abort" }
+func (*Srv6SrDomainTxnAbort) GetCrcString() string   { return "4598a445" }
+func (*Srv6SrDomainTxnAbort) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6SrDomainTxnAbort) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 8 // m.TxnID
+	return size
+}
+func (m *Srv6SrDomainTxnAbort) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint64(m.TxnID)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnAbort) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.TxnID = buf.DecodeUint64()
+	return nil
+}
+
+// Srv6SrDomainTxnAbortReply defines message 'srv6_sr_domain_txn_abort_reply'.
+type Srv6SrDomainTxnAbortReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnAbortReply) Reset()               { *m = Srv6SrDomainTxnAbortReply{} }
+func (*Srv6SrDomainTxnAbortReply) GetMessageName() string { return "srv6_sr_domain_txn_abort_reply" }
+func (*Srv6SrDomainTxnAbortReply) GetCrcString() string   { return "e8d4e804" }
+func (*Srv6SrDomainTxnAbortReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6SrDomainTxnAbortReply) Size() (size int) {
 	if m == nil {
 		return 0
 	}
 	size += 4 // m.Retval
 	return size
 }
-func (m *Srv6SrDomainPrefixAddDelReply) Marshal(b []byte) ([]byte, error) {
+func (m *Srv6SrDomainTxnAbortReply) Marshal(b []byte) ([]byte, error) {
 	if b == nil {
 		b = make([]byte, m.Size())
 	}
@@ -5374,7 +5492,309 @@ func (m *Srv6SrDomainPrefixAddDelReply) Marshal(b []byte) ([]byte, error) {
 	buf.EncodeInt32(m.Retval)
 	return buf.Bytes(), nil
 }
-func (m *Srv6SrDomainPrefixAddDelReply) Unmarshal(b []byte) error {
+func (m *Srv6SrDomainTxnAbortReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
+	return nil
+}
+
+// Open an SR domain node address set transaction (IF-2, D-32, D-90,
+//
+//	       03 §3 / §7, errata #34 item 205).
+//	DEVIATION from 03 §7 (as originally written): the IF-2 message table had
+//	no entry for this set, but 03 §3 makes `outer.src ∈ SR_DOMAIN_NODE_SET`
+//	the first check of cilium-end-cilium and D-32 makes it the second defence
+//	layer against direct injection from a shared underlay. 03 §7 now lists
+//	these messages.
+//	D-90: the set is all-or-nothing. It is never changed one prefix at a time;
+//	it is replaced as a whole by a staged transaction:
+//	  srv6_sr_domain_txn_begin    open the staging buffer (empty)
+//	  srv6_sr_domain_txn_put      stage one prefix of the complete replacement
+//	  srv6_sr_domain_txn_commit   validate, then make the staged set the
+//	                              active one under one worker barrier
+//	  srv6_sr_domain_txn_abort    drop the staging buffer
+//	Staging never alters the set the workers read. A successful commit
+//	installs the complete replacement in one worker barrier section, so a
+//	worker observes the previous complete set or the new complete set and
+//	never a mixture. Any failure before a successful commit - a refused put,
+//	a refused commit, an abort, an agent that disconnects or crashes - leaves
+//	the previously committed set fully in force. A replacement that does not
+//	fit the capacity is refused while staging (LIMIT_EXCEEDED) and is never
+//	installed; the agent checks the capacity (srv6_sr_domain_status_get)
+//	before it begins, and publishes nothing if the authoritative set is
+//	larger.
+//	The set is empty until the first commit, which is the fail-closed state:
+//	every packet reaching the local SID then drops as DROP_UNTRUSTED_SOURCE.
+//	An empty replacement is a legitimate publication (the synced-empty SR
+//	domain of a single-node cluster).
+//	txn_id is assigned by the agent and is an operation identity, not a
+//	sequence number: the plugin recognises the transaction it holds open and
+//	the one that committed last (so that a lost commit reply can be retried),
+//	and infers nothing else from the value. Only one transaction is open at a
+//	time and it belongs to the plugin, not to an API client. An abandoned one
+//	is invisible to the dataplane; it is cleared by an exact abort of the
+//	txn_id srv6_sr_domain_status_get reports. There is no wildcard abort.
+//	Rejections (all fail-closed, no state change):
+//	  INIT_FAILED     - plugin not initialised
+//	  INVALID_VALUE   - txn_id is 0, the reserved "no transaction"
+//	  INSTANCE_IN_USE - a different transaction is open; abort it first
+//	  VALUE_EXIST     - txn_id is the transaction that committed last
+//	Re-sending begin for the transaction that is already open succeeds and
+//	keeps its staging buffer.
+//	- txn_id - the agent's operation identity for this publication
+//
+// Srv6SrDomainTxnBegin defines message 'srv6_sr_domain_txn_begin'.
+type Srv6SrDomainTxnBegin struct {
+	TxnID uint64 `binapi:"u64,name=txn_id" json:"txn_id,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnBegin) Reset()               { *m = Srv6SrDomainTxnBegin{} }
+func (*Srv6SrDomainTxnBegin) GetMessageName() string { return "srv6_sr_domain_txn_begin" }
+func (*Srv6SrDomainTxnBegin) GetCrcString() string   { return "4598a445" }
+func (*Srv6SrDomainTxnBegin) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6SrDomainTxnBegin) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 8 // m.TxnID
+	return size
+}
+func (m *Srv6SrDomainTxnBegin) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint64(m.TxnID)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnBegin) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.TxnID = buf.DecodeUint64()
+	return nil
+}
+
+// Srv6SrDomainTxnBeginReply defines message 'srv6_sr_domain_txn_begin_reply'.
+type Srv6SrDomainTxnBeginReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnBeginReply) Reset()               { *m = Srv6SrDomainTxnBeginReply{} }
+func (*Srv6SrDomainTxnBeginReply) GetMessageName() string { return "srv6_sr_domain_txn_begin_reply" }
+func (*Srv6SrDomainTxnBeginReply) GetCrcString() string   { return "e8d4e804" }
+func (*Srv6SrDomainTxnBeginReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6SrDomainTxnBeginReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	return size
+}
+func (m *Srv6SrDomainTxnBeginReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnBeginReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
+	return nil
+}
+
+// Install a staged SR domain node address set (IF-2, D-32, D-90).
+//
+//	The staged set is validated as a whole - it is the open transaction, it
+//	holds exactly n_prefixes distinct prefixes, and that fits the capacity -
+//	and only then, inside one worker barrier section, does it become the set
+//	cilium-end-cilium and the PTB reporter check read. The previous set stops
+//	being consulted at the same instant.
+//	n_prefixes is the number of distinct prefixes the caller staged. A staged
+//	set that does not hold that many is not the complete replacement the
+//	caller built (a put the caller believes succeeded is missing), so it is
+//	not installed.
+//	Committing closes the transaction. Re-sending commit for the transaction
+//	that committed last, with the same n_prefixes, succeeds without changing
+//	anything, so a lost reply does not force the caller to rebuild the set.
+//	Rejections (all fail-closed; the previously committed set stays active and
+//	the transaction stays open so it can be aborted):
+//	  INIT_FAILED     - plugin not initialised
+//	  INVALID_VALUE   - txn_id is 0
+//	  NO_SUCH_ENTRY   - no transaction is open and txn_id is not the one that
+//	                    committed last, or txn_id names a different
+//	                    transaction than the open one
+//	  INVALID_VALUE_3 - the staged set does not hold n_prefixes prefixes
+//	  LIMIT_EXCEEDED  - the staged set does not fit the capacity
+//	- txn_id - the transaction to install
+//	- n_prefixes - the number of distinct prefixes the caller staged
+//
+// Srv6SrDomainTxnCommit defines message 'srv6_sr_domain_txn_commit'.
+type Srv6SrDomainTxnCommit struct {
+	TxnID     uint64 `binapi:"u64,name=txn_id" json:"txn_id,omitempty"`
+	NPrefixes uint32 `binapi:"u32,name=n_prefixes" json:"n_prefixes,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnCommit) Reset()               { *m = Srv6SrDomainTxnCommit{} }
+func (*Srv6SrDomainTxnCommit) GetMessageName() string { return "srv6_sr_domain_txn_commit" }
+func (*Srv6SrDomainTxnCommit) GetCrcString() string   { return "d63a004f" }
+func (*Srv6SrDomainTxnCommit) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6SrDomainTxnCommit) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 8 // m.TxnID
+	size += 4 // m.NPrefixes
+	return size
+}
+func (m *Srv6SrDomainTxnCommit) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint64(m.TxnID)
+	buf.EncodeUint32(m.NPrefixes)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnCommit) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.TxnID = buf.DecodeUint64()
+	m.NPrefixes = buf.DecodeUint32()
+	return nil
+}
+
+// Srv6SrDomainTxnCommitReply defines message 'srv6_sr_domain_txn_commit_reply'.
+type Srv6SrDomainTxnCommitReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnCommitReply) Reset()               { *m = Srv6SrDomainTxnCommitReply{} }
+func (*Srv6SrDomainTxnCommitReply) GetMessageName() string { return "srv6_sr_domain_txn_commit_reply" }
+func (*Srv6SrDomainTxnCommitReply) GetCrcString() string   { return "e8d4e804" }
+func (*Srv6SrDomainTxnCommitReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6SrDomainTxnCommitReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	return size
+}
+func (m *Srv6SrDomainTxnCommitReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnCommitReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.Retval = buf.DecodeInt32()
+	return nil
+}
+
+// Stage one prefix of the replacement SR domain node address set
+//
+//	       (IF-2, D-32, D-90).
+//	A /128 expresses a single node address. The prefix is stored with its
+//	host bits masked off. Staging an identical prefix twice is an idempotent
+//	success, so a lost reply is retryable.
+//	Rejections (all fail-closed; the staging buffer is left as it was and the
+//	transaction stays open):
+//	  INIT_FAILED     - plugin not initialised
+//	  INVALID_VALUE   - txn_id is 0, or the prefix length is 0 (::/0 would
+//	                    authorise every source with one put; there is no
+//	                    wildcard entry, D-90)
+//	  NO_SUCH_ENTRY   - no transaction is open, or txn_id names a different
+//	                    transaction than the open one
+//	  INVALID_VALUE_2 - prefix length above 128
+//	  LIMIT_EXCEEDED  - the staged set already holds `capacity` prefixes
+//	                    (srv6_sr_domain_status_get). Nothing is truncated:
+//	                    the replacement cannot be committed, and the caller
+//	                    aborts it.
+//	- txn_id - the open transaction
+//	- prefix - one prefix of the complete replacement set
+//
+// Srv6SrDomainTxnPut defines message 'srv6_sr_domain_txn_put'.
+type Srv6SrDomainTxnPut struct {
+	TxnID  uint64             `binapi:"u64,name=txn_id" json:"txn_id,omitempty"`
+	Prefix ip_types.IP6Prefix `binapi:"ip6_prefix,name=prefix" json:"prefix,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnPut) Reset()               { *m = Srv6SrDomainTxnPut{} }
+func (*Srv6SrDomainTxnPut) GetMessageName() string { return "srv6_sr_domain_txn_put" }
+func (*Srv6SrDomainTxnPut) GetCrcString() string   { return "177cbf1e" }
+func (*Srv6SrDomainTxnPut) GetMessageType() api.MessageType {
+	return api.RequestMessage
+}
+
+func (m *Srv6SrDomainTxnPut) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 8      // m.TxnID
+	size += 1 * 16 // m.Prefix.Address
+	size += 1      // m.Prefix.Len
+	return size
+}
+func (m *Srv6SrDomainTxnPut) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeUint64(m.TxnID)
+	buf.EncodeBytes(m.Prefix.Address[:], 16)
+	buf.EncodeUint8(m.Prefix.Len)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnPut) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	m.TxnID = buf.DecodeUint64()
+	copy(m.Prefix.Address[:], buf.DecodeBytes(16))
+	m.Prefix.Len = buf.DecodeUint8()
+	return nil
+}
+
+// Srv6SrDomainTxnPutReply defines message 'srv6_sr_domain_txn_put_reply'.
+type Srv6SrDomainTxnPutReply struct {
+	Retval int32 `binapi:"i32,name=retval" json:"retval,omitempty"`
+}
+
+func (m *Srv6SrDomainTxnPutReply) Reset()               { *m = Srv6SrDomainTxnPutReply{} }
+func (*Srv6SrDomainTxnPutReply) GetMessageName() string { return "srv6_sr_domain_txn_put_reply" }
+func (*Srv6SrDomainTxnPutReply) GetCrcString() string   { return "e8d4e804" }
+func (*Srv6SrDomainTxnPutReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+
+func (m *Srv6SrDomainTxnPutReply) Size() (size int) {
+	if m == nil {
+		return 0
+	}
+	size += 4 // m.Retval
+	return size
+}
+func (m *Srv6SrDomainTxnPutReply) Marshal(b []byte) ([]byte, error) {
+	if b == nil {
+		b = make([]byte, m.Size())
+	}
+	buf := codec.NewBuffer(b)
+	buf.EncodeInt32(m.Retval)
+	return buf.Bytes(), nil
+}
+func (m *Srv6SrDomainTxnPutReply) Unmarshal(b []byte) error {
 	buf := codec.NewBuffer(b)
 	m.Retval = buf.DecodeInt32()
 	return nil
@@ -5539,7 +5959,7 @@ func file_cilium_srv6_binapi_init() {
 	api.RegisterMessage((*Srv6LeaseExtendReply)(nil), "srv6_lease_extend_reply_0b8a79de")
 	api.RegisterMessage((*Srv6LocalEpAddDel)(nil), "srv6_local_ep_add_del_fbb7541c")
 	api.RegisterMessage((*Srv6LocalEpAddDelReply)(nil), "srv6_local_ep_add_del_reply_e8d4e804")
-	api.RegisterMessage((*Srv6LocalEpDetails)(nil), "srv6_local_ep_details_4f128cbb")
+	api.RegisterMessage((*Srv6LocalEpDetails)(nil), "srv6_local_ep_details_e5a179a5")
 	api.RegisterMessage((*Srv6LocalEpDump)(nil), "srv6_local_ep_dump_f9e6675e")
 	api.RegisterMessage((*Srv6PathAddDel)(nil), "srv6_path_add_del_9628daa3")
 	api.RegisterMessage((*Srv6PathAddDelReply)(nil), "srv6_path_add_del_reply_50c4d274")
@@ -5563,8 +5983,16 @@ func file_cilium_srv6_binapi_init() {
 	api.RegisterMessage((*Srv6ProgramDump)(nil), "srv6_program_dump_af97c185")
 	api.RegisterMessage((*Srv6SrDomainDetails)(nil), "srv6_sr_domain_details_2e62ff03")
 	api.RegisterMessage((*Srv6SrDomainDump)(nil), "srv6_sr_domain_dump_51077d14")
-	api.RegisterMessage((*Srv6SrDomainPrefixAddDel)(nil), "srv6_sr_domain_prefix_add_del_7259da77")
-	api.RegisterMessage((*Srv6SrDomainPrefixAddDelReply)(nil), "srv6_sr_domain_prefix_add_del_reply_e8d4e804")
+	api.RegisterMessage((*Srv6SrDomainStatusGet)(nil), "srv6_sr_domain_status_get_51077d14")
+	api.RegisterMessage((*Srv6SrDomainStatusGetReply)(nil), "srv6_sr_domain_status_get_reply_a5ba6566")
+	api.RegisterMessage((*Srv6SrDomainTxnAbort)(nil), "srv6_sr_domain_txn_abort_4598a445")
+	api.RegisterMessage((*Srv6SrDomainTxnAbortReply)(nil), "srv6_sr_domain_txn_abort_reply_e8d4e804")
+	api.RegisterMessage((*Srv6SrDomainTxnBegin)(nil), "srv6_sr_domain_txn_begin_4598a445")
+	api.RegisterMessage((*Srv6SrDomainTxnBeginReply)(nil), "srv6_sr_domain_txn_begin_reply_e8d4e804")
+	api.RegisterMessage((*Srv6SrDomainTxnCommit)(nil), "srv6_sr_domain_txn_commit_d63a004f")
+	api.RegisterMessage((*Srv6SrDomainTxnCommitReply)(nil), "srv6_sr_domain_txn_commit_reply_e8d4e804")
+	api.RegisterMessage((*Srv6SrDomainTxnPut)(nil), "srv6_sr_domain_txn_put_177cbf1e")
+	api.RegisterMessage((*Srv6SrDomainTxnPutReply)(nil), "srv6_sr_domain_txn_put_reply_e8d4e804")
 	api.RegisterMessage((*Srv6UcLocatorSet)(nil), "srv6_uc_locator_set_d21d234e")
 	api.RegisterMessage((*Srv6UcLocatorSetReply)(nil), "srv6_uc_locator_set_reply_e8d4e804")
 }
@@ -5644,8 +6072,16 @@ func AllMessages() []api.Message {
 		(*Srv6ProgramDump)(nil),
 		(*Srv6SrDomainDetails)(nil),
 		(*Srv6SrDomainDump)(nil),
-		(*Srv6SrDomainPrefixAddDel)(nil),
-		(*Srv6SrDomainPrefixAddDelReply)(nil),
+		(*Srv6SrDomainStatusGet)(nil),
+		(*Srv6SrDomainStatusGetReply)(nil),
+		(*Srv6SrDomainTxnAbort)(nil),
+		(*Srv6SrDomainTxnAbortReply)(nil),
+		(*Srv6SrDomainTxnBegin)(nil),
+		(*Srv6SrDomainTxnBeginReply)(nil),
+		(*Srv6SrDomainTxnCommit)(nil),
+		(*Srv6SrDomainTxnCommitReply)(nil),
+		(*Srv6SrDomainTxnPut)(nil),
+		(*Srv6SrDomainTxnPutReply)(nil),
 		(*Srv6UcLocatorSet)(nil),
 		(*Srv6UcLocatorSetReply)(nil),
 	}
